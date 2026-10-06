@@ -25,6 +25,7 @@ from typing import Any, Literal, Protocol
 
 from . import __version__
 from . import protocol as P
+from .config import DEFAULT_MODE, MODES, mode_rank, normalize_mode
 
 log = logging.getLogger("vlcsubsync.daemon")
 
@@ -426,6 +427,15 @@ def resolve_source(
     )
 
 
+def effective_mode(request: P.Request, config: Any) -> str:
+    """Sync mode of a job: the request's ``mode=`` if valid, else the config's."""
+    return (
+        normalize_mode(request.mode)
+        or normalize_mode(getattr(config, "mode", None))
+        or DEFAULT_MODE
+    )
+
+
 def load_config() -> Any:
     """Load the user's Config (lazy import of the engine's config module)."""
     try:
@@ -735,7 +745,10 @@ class Daemon:
                     self._running = None
                 self.jobs_completed += 1
 
-    def cache_key(self, job: _Job, source: ResolvedSource, config: Any) -> str:
+    def cache_key(
+        self, job: _Job, source: ResolvedSource, config: Any, mode: str | None = None
+    ) -> str:
+        """Result-cache key; ``mode`` defaults to the job's effective sync mode."""
         r = job.request
         media = os.path.abspath(r.media)
         st = os.stat(media)
@@ -748,8 +761,19 @@ class Daemon:
             str(getattr(config, "model_en", "")),
             str(getattr(config, "model_multi", "")),
             self.version,
+            mode or effective_mode(r, config),
         ]
         return hashlib.sha1("\0".join(parts).encode("utf-8")).hexdigest()
+
+    def cache_lookup_keys(self, job: _Job, source: ResolvedSource, config: Any) -> list[str]:
+        """Keys whose results satisfy this job: the most thorough mode first, down to
+        the job's own mode. A result of a more thorough mode is at least as good, so an
+        exhaustive result also answers a later fast/thorough request (never the other
+        way round)."""
+        want = mode_rank(effective_mode(job.request, config))
+        return [
+            self.cache_key(job, source, config, m) for m in reversed(MODES) if mode_rank(m) >= want
+        ]
 
     def _cache_lookup(self, key: str) -> tuple[Path, dict[str, str]] | None:
         meta = P.read_kv(self.cache_dir / f"{key}.meta")
@@ -798,11 +822,19 @@ class Daemon:
                 raise JobError(f"Media file not found: {r.media}")
             source = self.resolver(r)
             config = self.config_loader()
-            key = self.cache_key(job, source, config)
+            mode = effective_mode(r, config)
+            if r.mode and hasattr(config, "with_mode"):
+                config = config.with_mode(r.mode)
+            key = self.cache_key(job, source, config, mode)
             out_dir = job.queue_dir / P.OUT_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            cached = None if r.force else self._cache_lookup(key)
+            cached = None
+            if not r.force:
+                for k in self.cache_lookup_keys(job, source, config):
+                    cached = self._cache_lookup(k)
+                    if cached is not None:
+                        break
             if cached is not None:
                 cached_file, meta = cached
                 dest = out_dir / f"{r.id}{cached_file.suffix}"
@@ -813,7 +845,7 @@ class Daemon:
                 done.progress = 1.0
                 done.output = str(dest)
                 done.time = None
-                log.info("job %s: cache hit (%s)", r.id, key[:12])
+                log.info("job %s: cache hit (mode %s)", r.id, mode)
                 writer.write(done, force=True)
                 return done
 
@@ -863,9 +895,10 @@ class Daemon:
             writer.write(done, force=True)
             self._cache_store(key, output, done)
             log.info(
-                "job %s done in %.1fs: %s (applied=%s)",
+                "job %s done in %.1fs (mode %s): %s (applied=%s)",
                 r.id,
                 time.monotonic() - started,
+                mode,
                 done.message,
                 done.applied,
             )

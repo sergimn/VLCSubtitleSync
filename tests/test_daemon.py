@@ -283,6 +283,60 @@ def test_cache_hit_and_force(env):
         assert len(runner.calls) == 4
 
 
+def test_cache_key_includes_mode(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    d = D.Daemon(
+        [env.queue], use_default_queues=False, runner=FakeRunner(),
+        resolver=external_resolver, cache_dir=env.tmp / "c",
+        lock_path=env.tmp / "state" / "daemon.lock",
+    )  # fmt: skip
+    src = D.ResolvedSource("embedded", index=0)
+
+    def key(cfg_mode="fast", req_mode=""):
+        job = D._Job(P.Request(id="k", media=media, sub_index=0, mode=req_mode), env.queue)
+        return d.cache_key(job, src, Config(mode=cfg_mode))
+
+    keys = {m: key(m) for m in ("fast", "thorough", "exhaustive")}
+    assert len(set(keys.values())) == 3
+    # the request's mode wins over the config's; an unknown config mode means fast
+    assert key("fast", "exhaustive") == keys["exhaustive"]
+    assert key("bogus") == keys["fast"]
+    # lookup order: most thorough first, never a less thorough result
+    job = D._Job(P.Request(id="k", media=media, sub_index=0, mode="thorough"), env.queue)
+    assert d.cache_lookup_keys(job, src, Config()) == [keys["exhaustive"], keys["thorough"]]
+
+
+def test_request_mode_reaches_runner_and_cache(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    runner = FakeRunner()
+    with Harness(env, runner) as h:
+        h.daemon.config_loader = lambda: Config(mode="fast")
+        h.submit("m_1", media, sub_index=0)
+        h.wait_state("m_1", "done")
+        assert runner.calls[-1].config.mode == "fast"
+        # an exhaustive request does not reuse the fast result
+        h.submit("m_2", media, sub_index=0, mode="exhaustive")
+        h.wait_state("m_2", "done")
+        assert len(runner.calls) == 2
+        assert runner.calls[-1].config.mode == "exhaustive"
+        # ... but a later fast or thorough request reuses the exhaustive one
+        h.submit("m_3", media, sub_index=0, mode="thorough")
+        h.wait_state("m_3", "done")
+        h.submit("m_4", media, sub_index=0)
+        h.wait_state("m_4", "done")
+        assert len(runner.calls) == 2
+        # a thorough result does not satisfy an exhaustive request
+        h.submit("m_5", media, sub_index=1, mode="thorough")
+        h.wait_state("m_5", "done")
+        h.submit("m_6", media, sub_index=1, mode="exhaustive")
+        h.wait_state("m_6", "done")
+        assert [c.config.mode for c in runner.calls[2:]] == ["thorough", "exhaustive"]
+
+
 def test_stale_lock_is_taken_over(env):
     lock = env.tmp / "state" / "daemon.lock"
     lock.parent.mkdir(parents=True)

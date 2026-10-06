@@ -233,6 +233,20 @@ def test_audio_assembler_trims_before_zero_and_pads_after():
     assert a[8000] == pytest.approx(0.0, abs=1e-3) and a[16000] == pytest.approx(0.5, abs=1e-3)
 
 
+def test_audio_assembler_ignores_huge_pts_jumps(caplog):
+    one = np.full(16000, 0.5, dtype=np.float32)  # 1 s
+    asm = media._AudioAssembler(16000)
+    asm.feed(_frame(one), 0.0)
+    asm.feed(_frame(one), 1.0 + 3600.0)  # e.g. MPEG-TS rollover: no hour of zeros
+    asm.feed(_frame(one), 2.0)  # back to the original clock
+    asm.feed(_frame(one), 3.0 - 7200.0)  # huge backwards jump: audio is not dropped
+    asm.feed(_frame(one), 4.0)
+    a = asm.result()
+    assert a.shape[0] == 5 * 16000
+    assert np.all(np.abs(a - 0.5) < 1e-3)
+    assert sum("timestamp jump" in r.getMessage() for r in caplog.records) >= 2
+
+
 # --- subtitle text cleanup -------------------------------------------------------------
 
 

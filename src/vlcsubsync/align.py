@@ -1573,10 +1573,14 @@ def retime(
     Afterwards, in original start order:
 
     * start order is preserved: a cue mapped after a later cue (backwards cut) is
-      pulled to ``min_duration`` before it;
-    * nothing starts before 0: cues mapped before 0 get ordered slots from 0 on
-      (up to ``min_duration`` apart); a cue straddling 0 keeps its duration, one
-      entirely before 0 gets a minimal one;
+      pulled to ``min_duration`` before it. This cascades, so the cues before the
+      cut that land in the region claimed by the next segment become ~0.2 s flashes;
+      that only happens where the mapping itself has a backwards cut, i.e. the
+      subtitle has content the audio lacks (or the cut was misplaced);
+    * nothing starts before 0, and cues mapped to >= 0 are never moved: cues mapped
+      before 0 get ordered slots in [0, first non-negative start), at most
+      ``min_duration`` apart. A cue straddling 0 keeps its true end; one entirely
+      before 0 gets a minimal duration (both are extended to that minimum only);
     * a cue ends at or before the next cue's start unless the two overlapped in the
       original (those overlaps are intentional), and every duration is positive.
     """
@@ -1597,25 +1601,22 @@ def retime(
         if starts[k] > starts[k + 1]:
             starts[k] = starts[k + 1] - min_duration
 
-    # Negative starts (a prefix, starts are non-decreasing now): give each one an
-    # ordered slot from 0 on, squeezed before the first non-negative cue if there is
-    # room, else ``min_duration`` wide (pushing later cues just as far as needed).
+    # Negative starts (a prefix, starts are non-decreasing now): squeeze them into
+    # ordered slots in [0, first non-negative start), at most ``min_duration`` apart.
+    # Cues mapped to >= 0 are never moved; with no room the prefix collapses (tiny
+    # durations / overlapping each other) instead.
     m = 0
     while m < n and starts[m] < 0.0:
         m += 1
     if m:
         room = starts[m] if m < n else math.inf
         step = min(min_duration, room / m)
-        if step < 0.01:
-            step = min_duration
-        floor = 0.0
-        for k in range(n):
-            if k >= m and starts[k] >= floor:
-                break
-            if k < m and starts[k] + durs[k] <= 0.0:
-                durs[k] = step
-            starts[k] = max(starts[k], floor)
-            floor = starts[k] + step
+        minimal = step if step > 0.0 else min_duration
+        for k in range(m):
+            true_end = starts[k] + durs[k]
+            starts[k] = k * step
+            # keep the true end (straddling 0); only extend up to the minimal duration
+            durs[k] = max(true_end - starts[k], minimal)
 
     out: list[tuple[float, float]] = [(0.0, 0.0)] * n
     for k, i in enumerate(order):

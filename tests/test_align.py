@@ -335,7 +335,7 @@ def test_retime_negative_times_keep_order():
     _check_retimed(times, out)
     assert [s for s, _e in out[:3]] == pytest.approx([0.0, 0.2, 0.4])
     assert out[0][1] == pytest.approx(0.2)  # entirely before 0: minimal duration
-    assert out[2][1] == pytest.approx(2.0)  # straddles 0: keeps its duration, clamped
+    assert out[2] == pytest.approx((0.4, 1.0))  # straddles 0: keeps its true end
     assert out[3] == (2.0, 3.0)  # untouched
 
 
@@ -346,6 +346,31 @@ def test_retime_negative_times_squeeze_before_first_good_cue():
     _check_retimed(times, out)
     assert out[4] == pytest.approx((0.3, 1.0))  # not pushed
     assert all(e <= 0.3 + 1e-9 for _s, e in out[:4])
+
+
+def test_retime_straddling_cue_is_only_extended_to_the_minimum():
+    out = retime([(9.0, 10.1), (20.0, 21.0)], Mapping.linear(1.0, -10.0))
+    assert out[0] == pytest.approx((0.0, 0.2))  # true end 0.1, extended to 0.2
+    assert out[1] == (10.0, 11.0)
+
+
+def test_retime_dense_negative_prefix_never_moves_real_cues():
+    m = Mapping.linear(1.0, -10.0)
+    neg = [(i * 0.09, i * 0.09 + 0.08) for i in range(100)]  # all map below 0
+    good = [(10.5 + i, 11.2 + i) for i in range(20)]  # first good cue at 0.5 s
+    times = neg + good
+    out = retime(times, m)
+    _check_retimed(times, out)
+    assert out[100:] == pytest.approx([(s - 10.0, e - 10.0) for s, e in good])
+    assert all(0.0 <= s and e <= 0.5 + 1e-9 for s, e in out[:100])
+
+
+def test_retime_negative_prefix_without_room_collapses_at_zero():
+    m = Mapping.linear(1.0, -10.0)
+    times = [(1.0, 2.0), (3.0, 4.0), (10.0, 11.0)]  # good cue exactly at 0
+    out = retime(times, m)
+    assert out[2] == (0.0, 1.0)
+    assert all(s == 0.0 and e > s for s, e in out)
 
 
 def test_retime_preserves_original_overlaps_and_clamps_negative():

@@ -99,8 +99,9 @@ class Harness:
 
     # ---- mock helpers -------------------------------------------------------------
     def table(self, items):
-        return self.lua.table_from([self.lua.table_from({"id": i, "label": label})
-                                    for i, label in items])
+        return self.lua.table_from(
+            [self.lua.table_from({"id": i, "label": label}) for i, label in items]
+        )
 
     def set_input(self, uri=MOVIE_URI, audio=AUDIO, subs=SUBS, audio_sel=10, spu_sel=20):
         self.mock.set_input(uri, self.table(audio), self.table(subs), audio_sel, spu_sel)
@@ -144,8 +145,9 @@ class Harness:
         return [parse_kv(p) for p in sorted(d.glob("*.req"))]
 
     def heartbeat(self, age: int = 0):
-        write_kv(self.q / "heartbeat",
-                 {"time": int(time.time()) - age, "pid": 1234, "version": "0.1.0"})
+        write_kv(
+            self.q / "heartbeat", {"time": int(time.time()) - age, "pid": 1234, "version": "0.1.0"}
+        )
 
     def status(self, req_id: str, **kv):
         data = {"id": req_id, **kv}
@@ -155,9 +157,18 @@ class Harness:
         out = self.q / "out" / f"{req_id}.srt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("1\n00:00:01,000 --> 00:00:02,000\nHi\n", encoding="utf-8")
-        self.status(req_id, state="done", progress="1.0", message=message,
-                    output=str(out), applied=applied, method="whisper",
-                    offset="2.350", scale="1.0417", confidence="0.93")
+        self.status(
+            req_id,
+            state="done",
+            progress="1.0",
+            message=message,
+            output=str(out),
+            applied=applied,
+            method="whisper",
+            offset="2.350",
+            scale="1.0417",
+            confidence="0.93",
+        )
         # the daemon deletes the request once picked up
         req = self.q / "requests" / f"{req_id}.req"
         if req.exists():
@@ -472,8 +483,10 @@ def test_run_loop_exits_on_interrupted_mwait(runtime, tmp_path):
 
 def test_tick_errors_are_caught_and_logged(h):
     h.set_input()
-    h.lua.execute("vlc.var.get_list = function() error('boom') end; "
-                  "vlc.var.get = function() error('boom2') end")
+    h.lua.execute(
+        "vlc.var.get_list = function() error('boom') end; "
+        "vlc.var.get = function() error('boom2') end"
+    )
     assert h.S.safe_tick() in (True, False)
     h.lua.execute("subsync.tick = function() error('kaboom') end")
     assert h.S.safe_tick() is False
@@ -489,8 +502,16 @@ def ext(runtime, tmp_path):
 
 
 def write_intf_state(hh: Harness, age=0, state="idle", last_result=""):
-    write_kv(hh.q / "intf_state", {"time": int(time.time()) - age, "state": state,
-                                   "message": "", "last_result": last_result, "auto": 1})
+    write_kv(
+        hh.q / "intf_state",
+        {
+            "time": int(time.time()) - age,
+            "state": state,
+            "message": "",
+            "last_result": last_result,
+            "auto": 1,
+        },
+    )
 
 
 def test_ext_descriptor_and_menu(ext):
@@ -589,6 +610,10 @@ def test_luacheck():
     cmd = str(exe) if exe.exists() else shutil.which("luacheck")
     if not cmd:
         pytest.skip("luacheck not installed")
-    res = subprocess.run([cmd, "--no-color", "src/vlcsubsync/lua", "tests/lua"],
-                         cwd=ROOT, capture_output=True, text=True)
+    res = subprocess.run(
+        [cmd, "--no-color", "src/vlcsubsync/lua", "tests/lua"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
     assert res.returncode == 0, res.stdout + res.stderr

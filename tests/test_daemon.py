@@ -384,14 +384,20 @@ def test_forced_resync_wins_over_other_modes(env):
         h.daemon.config_loader = lambda: Config(mode="fast")
         h.submit("f_1", media, sub_index=0, mode="exhaustive")
         h.wait_state("f_1", "done")
-        assert len(list(cache.glob("*.meta"))) == 1
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 1)  # stored after "done"
         # user clicks "Sync now" (force=1) in fast mode with a different result
         runner.applied = False
         h.submit("f_2", media, sub_index=0, force=True)
         assert h.wait_state("f_2", "done").applied is False
         assert len(runner.calls) == 2
+
         # only the forced fast result is left; the next (fast) open gets it
-        assert len(list(cache.glob("*.meta"))) == 1
+        # (the cache is updated right after "done" is written)
+        def only_forced_entry_left():
+            metas = [P.read_kv(m) for m in cache.glob("*.meta")]
+            return len(metas) == 1 and metas[0].get("applied") == "0"
+
+        wait_for(only_forced_entry_left)
         assert len(list(cache.glob("*.srt"))) == 1
         h.submit("f_3", media, sub_index=0)
         assert h.wait_state("f_3", "done").applied is False
@@ -401,7 +407,7 @@ def test_forced_resync_wins_over_other_modes(env):
         h.wait_state("f_4", "done")
         assert len(runner.calls) == 3
         # a non-forced run does not drop other modes' entries
-        assert len(list(cache.glob("*.meta"))) == 2
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 2)  # stored after "done"
 
 
 def test_stale_lock_is_taken_over(env):

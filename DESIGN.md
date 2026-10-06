@@ -327,7 +327,7 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job w
 * Cost is roughly linear in the number of transcribed windows: exhaustive is one
   Whisper pass over all dialogue. On a 28.7 min episode it transcribed 50 windows,
   against fast's 12–13 (8 sampled + adaptive). That took 1.9× fast's runtime on GPU
-  and 2.2× on CPU, because decoding and VAD (~7.5 s) are fixed. README has the table.
+  and 2.4× on CPU, because decoding and VAD (~7.5 s) are fixed. README has the table.
 
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)
 `mode=fast|thorough|exhaustive`, `model_en=base.en`, `model_multi=base`,

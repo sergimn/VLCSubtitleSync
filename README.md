@@ -193,13 +193,15 @@ measured, `scripts/measure_real.py`):
 | mode | windows | GPU (CUDA) | CPU | median | p90 | p95 |
 |---|---|---|---|---|---|---|
 | unsynced | – | – | – | 173 s | 280 s | 298 s |
-| fast | 12–13 | 13.3 s | 20.6 s | 0.31 s | 0.76–0.82 s | 1.19–1.22 s |
-| thorough | 22–28 | 19.2 s | 27.4 s | 0.31 s | 0.79–0.87 s | 1.17–1.21 s |
-| exhaustive | 50 (8 silent skipped) | 25.7 s | 46.3 s | 0.31 s | 0.82–0.83 s | 1.18–1.21 s |
+| fast | 12 / 13 | 13.3 s | 19.1 s | 0.31 s | 0.79–0.80 s | 1.20–1.22 s |
+| thorough | 22 / 24 | 16.4 s | 27.5 s | 0.31 / 0.33 s | 0.82 / 1.00 s | 1.19 / 1.40 s |
+| exhaustive | 50 (8 silent skipped) | 25.6 s | 44.9 s | 0.31 s | 0.82–0.83 s | 1.18–1.21 s |
 
-Ranges cover the GPU and CPU runs. Runtimes include about 7.5 s of audio decoding and
-speech detection. On this file all three modes find the same single +25% line, so
-the extra windows do not improve accuracy. The roughly 0.3 s median looks like the
+Ranges and "GPU / CPU" pairs cover the GPU and CPU runs. Runtimes include about 7.5 s
+of audio decoding and speech detection. All modes find the same +25% line. The
+thorough CPU run alone splits it into two segments with a small step between them,
+which makes it a little worse. The extra windows do not improve accuracy on this
+file. The roughly 0.3 s median looks like the
 limit of this measurement: subtitle lines usually start a little before the first
 word is spoken. Exhaustive mode is meant for harder files, such as ones with short
 sections the samples miss or few matching words.

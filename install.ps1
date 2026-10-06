@@ -40,7 +40,7 @@ function Find-Uv {
 }
 
 function Get-ToolBinDir($uv) {
-    $dir = (& $uv tool dir --bin) | Select-Object -Last 1
+    $dir = (& $uv tool dir --bin --color never) | Select-Object -Last 1
     if ($LASTEXITCODE -ne 0 -or -not $dir) { return $null }
     return $dir.Trim()
 }

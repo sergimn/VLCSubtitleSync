@@ -79,7 +79,7 @@ end
 
 local function one_line(s)
     s = tostring(s or "")
-    return (s:gsub("[%c]", " "))
+    return (s:gsub("[\1-\31\127]", " "))
 end
 
 local function trim(s)

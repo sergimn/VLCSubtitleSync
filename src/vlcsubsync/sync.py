@@ -40,6 +40,8 @@ from .transcribe import Transcriber, Word, get_model, get_transcriber
 log = logging.getLogger(__name__)
 
 WINDOW_SECONDS = 30.0
+# Exhaustive mode skips a consecutive window with less detected speech than this (s).
+MIN_SPEECH_SECONDS = 0.5
 MIN_WHISPER_ANCHORS = 6
 LANG_PROB_MIN = 0.5
 
@@ -165,6 +167,36 @@ def pick_windows(
     return sorted(starts)
 
 
+def exhaustive_windows(
+    speech_sec: np.ndarray,
+    duration: float,
+    win: float = WINDOW_SECONDS,
+    min_speech: float = MIN_SPEECH_SECONDS,
+) -> list[float]:
+    """Consecutive window starts 0, win, 2·win, ... covering ``[0, duration)``, without
+    the windows whose detected speech (seconds, from ``speech_sec``) is < ``min_speech``.
+    The last window may be shorter than ``win``."""
+    if duration <= 0:
+        return []
+    n = int(math.ceil(duration / win - 1e-9))
+    cs = np.concatenate([[0.0], np.cumsum(speech_sec)]) if speech_sec.size else np.zeros(1)
+    total = speech_sec.size
+    starts = []
+    for i in range(n):
+        lo = min(int(round(i * win)), total)
+        hi = min(int(round((i + 1) * win)), total)
+        if cs[hi] - cs[lo] >= min_speech:
+            starts.append(float(i * win))
+    return starts
+
+
+def plan_windows(speech_sec: np.ndarray, duration: float, config: Config) -> list[float]:
+    """Initial transcription windows for ``config``'s mode (see ``config.MODES``)."""
+    if config.effective_mode == "exhaustive":
+        return exhaustive_windows(speech_sec, duration)
+    return pick_windows(speech_sec, duration, config.window_count(duration))
+
+
 # --------------------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------------------
@@ -228,6 +260,8 @@ def sync_subtitles(
     the output keeps the original timings.
     """
     t0 = time.monotonic()
+    mode = config.effective_mode
+    exhaustive = mode == "exhaustive"
     prog = _Progress(progress)
     prog(0.0, "Reading media")
     audio, subs, fmt, info = _load_source(media_path, audio_index, subtitle, prog)
@@ -252,7 +286,8 @@ def sync_subtitles(
     anchors: list[Anchor] = []
     reason = ""
     k = config.window_count(duration)
-    windows = pick_windows(speech_sec, duration, k)
+    windows = plan_windows(speech_sec, duration, config)
+    log.info("mode %s: %d initial windows over %.0fs", mode, len(windows), duration)
 
     # Language check / model selection.
     prog(0.37, "Detecting language")
@@ -287,14 +322,18 @@ def sync_subtitles(
     elif windows:
         sub_tok = subtitle_tokens(cues)
         transcribed: list[tuple[float, list[Word]]] = []
-        budget_extra = max(4, k // 2)
+        # Exhaustive mode already covers every window with speech: nothing to add.
+        budget_extra = 0 if exhaustive else max(4, k // 2)
         planned = len(windows)
 
         def run_windows(starts: list[float]) -> None:
             for st in starts:
                 n_done = len(transcribed)
                 frac = n_done / max(planned, 1)
-                prog(0.38 + 0.54 * frac, f"Transcribing {n_done + 1}/{planned}")
+                label = f"Transcribing {n_done + 1}/{planned}"
+                if exhaustive:
+                    label += " (exhaustive)"
+                prog(0.38 + 0.54 * frac, label)
                 a = int(st * SAMPLE_RATE)
                 b = min(audio.shape[0], int((st + WINDOW_SECONDS) * SAMPLE_RATE))
                 try:
@@ -448,8 +487,8 @@ def sync_subtitles(
     result.output_path = save_subtitles(out_subs, output_path, fmt)
     t_end = time.monotonic()
     log.info(
-        "sync done in %.1fs (decode %.1f, vad %.1f, whisper %.1f): %s",
-        t_end - t0, t_decode - t0, t_vad - t_decode, t_whisper - t_vad, result.message,
+        "sync done in %.1fs, mode %s (decode %.1f, vad %.1f, whisper %.1f): %s",
+        t_end - t0, mode, t_decode - t0, t_vad - t_decode, t_whisper - t_vad, result.message,
     )  # fmt: skip
     prog(1.0, "Done")
     return result
@@ -457,6 +496,8 @@ def sync_subtitles(
 
 __all__ = [
     "Mapping",
+    "exhaustive_windows",
+    "plan_windows",
     "SubtitleSource",
     "SyncError",
     "SyncResult",

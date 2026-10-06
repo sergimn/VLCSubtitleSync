@@ -15,12 +15,14 @@ import numpy as np
 from . import vad
 from .align import (
     AlignResult,
+    Anchor,
     Cue,
     Mapping,
     apply_mapping,
     find_anchors,
     fit_mapping,
-    refine_with_speech,
+    refine_local,
+    subdivide,
     subtitle_tokens,
     vad_align,
 )
@@ -247,6 +249,7 @@ def sync_subtitles(
     log.info("subtitle language guess: %s", sub_lang)
 
     fit: AlignResult | None = None
+    anchors: list[Anchor] = []
     reason = ""
     k = config.window_count(duration)
     windows = pick_windows(speech_sec, duration, k)
@@ -347,6 +350,39 @@ def sync_subtitles(
                 len(new), fit.anchors, fit.total_anchors, fit.confidence,
                 len(fit.mapping.segments),
             )  # fmt: skip
+
+        # Bisection verification: check each segment at its midpoint (transcribing a
+        # window there if none is near, within a budget), split where it disagrees.
+        verify_left = config.verify_budget(duration)
+
+        def verify_probe(centre: float, near: float) -> list[Anchor]:
+            nonlocal anchors, verify_left, planned
+            if verify_left <= 0 or not 0.0 <= centre <= duration:
+                return anchors
+            if any(abs(st + 0.5 * WINDOW_SECONDS - centre) <= near for st, _w in transcribed):
+                return anchors
+            taken = [st for st, _w in transcribed]
+            lo = max(0.0, centre - near)
+            hi = min(duration, centre + near)
+            new = pick_windows(speech_sec, duration, 1, ranges=[(lo, hi)], taken=taken)
+            if not new:
+                return anchors
+            verify_left -= len(new)
+            planned += len(new)
+            run_windows(new)
+            anchors = find_anchors(sub_tok, transcribed)
+            return anchors
+
+        if fit.anchors >= MIN_WHISPER_ANCHORS:
+            n_before = len(transcribed)
+            fit, anchors = subdivide(
+                fit, anchors, cues, verify_probe, speech, vad.RESOLUTION, len(transcribed)
+            )
+            log.info(
+                "verification: %d checks, %d splits, +%d windows: conf %.2f, %d segments",
+                fit.details.get("verify_checks", 0), fit.details.get("verify_splits", 0),
+                len(transcribed) - n_before, fit.confidence, len(fit.mapping.segments),
+            )  # fmt: skip
         if fit.anchors < MIN_WHISPER_ANCHORS:
             reason = f"too few transcript matches ({fit.anchors})"
     else:
@@ -355,9 +391,13 @@ def sync_subtitles(
 
     prog(0.93, "Aligning")
     if fit is not None and fit.anchors >= MIN_WHISPER_ANCHORS:
-        fit.mapping, shift = refine_with_speech(fit.mapping, cues, speech, vad.RESOLUTION)
-        fit.details["onset_shift"] = shift
-        log.info("speech-onset refinement: %+.3fs", shift)
+        fit.mapping, info = refine_local(fit.mapping, anchors, cues, speech, vad.RESOLUTION)
+        fit.details.update(info)
+        log.info(
+            "local refinement: segment shifts %s, speech-onset %+.3fs, %d wobble knots",
+            ", ".join(f"{d:+.3f}" for d in info["segment_shifts"]) or "-",
+            info["onset_shift"], info["knots"],
+        )  # fmt: skip
     final = fit
     if fit is None or fit.anchors < MIN_WHISPER_ANCHORS or fit.confidence < config.min_confidence:
         v = vad_align(speech, cues, vad.RESOLUTION)

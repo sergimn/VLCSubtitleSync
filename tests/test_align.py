@@ -14,7 +14,10 @@ from vlcsubsync.align import (
     apply_mapping,
     find_anchors,
     fit_mapping,
+    refine_local,
+    refine_with_speech,
     retime,
+    subdivide,
     subtitle_tokens,
     vad_align,
 )
@@ -64,9 +67,9 @@ def test_pure_offset(synth, offset):
 )
 def test_framerate_drift(synth, scale):
     fit, err = _align(synth, lambda t: t * scale)
-    # Known limit: compressing by 0.8x leaves ~0.15 s median error (in-cue word timing
-    # is estimated); tightened later by per-segment refinement.
-    _assert_accurate(err, median_max=0.2 if scale < 0.9 else None)
+    # In-cue word times follow the fitted scale (speech rate is nominal in the audio
+    # clock), so even 0.8x compression meets the normal tolerance.
+    _assert_accurate(err)
     assert fit.mapping.segments[0].scale == pytest.approx(scale, abs=2e-4)
 
 
@@ -385,3 +388,185 @@ def test_mapping_dominant():
     assert m.dominant().offset == 9.0
     assert m(50) == 51 and m(150) == 159
     assert list(m.map_array(np.array([50.0, 150.0]))) == [51.0, 159.0]
+
+
+# --- bisection verification and local refinement ----------------------------------------
+
+
+def _speech_mask(spans, duration, res=0.01):
+    speech = np.zeros(int(duration / res) + 100, dtype=bool)
+    for a, b, _c in spans:
+        speech[max(0, int(a / res)) : max(0, int(b / res))] = True
+    return speech
+
+
+def _align_full(synth, transform, duration=45 * 60, seed=1, budget=4, use_speech=True, **kw):
+    """fit_mapping → subdivide (probing new windows within ``budget``) → refine_local.
+    Returns (initial fit errors, final fit, final errors, windows transcribed by probes)."""
+    script = synth.script(duration - 30, seed=seed)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    spans = synth.speech_spans(script, transform)
+    speech = _speech_mask(spans, duration) if use_speech else None
+    fake = synth.FakeTranscriber(spans, **kw)
+    starts = pick_windows(np.ones(int(duration)), duration, Config().window_count(duration))
+    windows = [(s, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=s)) for s in starts]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    fit = fit_mapping(anchors, cues, speech, n_windows=len(windows))
+    probes = []
+
+    def probe(centre, near):
+        nonlocal anchors
+        if len(probes) >= budget or any(abs(s + 15 - centre) <= near for s, _w in windows):
+            return anchors
+        st = max(0.0, min(duration - 30.0, centre - 15.0))
+        probes.append(st)
+        windows.append((st, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)))
+        anchors = find_anchors(tok, windows)
+        return anchors
+
+    truth = np.array([transform(c.start) for c in cues])
+    keep = truth >= 0
+    times = [(c.start, c.end) for c in cues]
+
+    def errors(mapping):
+        return np.abs(np.array([s for s, _e in retime(times, mapping)]) - truth)[keep]
+
+    err0 = errors(fit.mapping)
+    fit, anchors = subdivide(fit, anchors, cues, probe, speech, 0.01, len(windows))
+    fit.mapping, _info = refine_local(fit.mapping, anchors, cues, speech, 0.01)
+    return err0, fit, errors(fit.mapping), probes
+
+
+def test_piecewise_drift_scale_change_after_cut(synth):
+    """Film timing (1.0) up to a cut, PAL-sped (25/23.976) after it."""
+    r = 25 / 23.976
+
+    def f(t):
+        return t + 1.0 if t < 1500 else 1501.0 + (t - 1500) * r
+
+    _err0, fit, err, _probes = _align_full(synth, f)
+    segs = fit.mapping.segments
+    assert [s.scale for s in segs] == pytest.approx([1.0, r], abs=2e-4)
+    assert 1400 < segs[1].start < 1600
+    _assert_accurate(err)
+
+
+def test_three_sections_with_small_offset_steps(synth):
+    """Offsets 2.0 / 2.6 / 1.8 s: steps below the 1 s inlier threshold, which the
+    initial fit absorbs into a tilted compromise line; verification separates them."""
+
+    def f(t):
+        return t + 2.0 if t < 900 else (t + 2.6 if t < 1800 else t + 1.8)
+
+    err0, fit, err, probes = _align_full(synth, f)
+    segs = fit.mapping.segments
+    assert len(segs) == 3
+    assert [s.scale for s in segs] == pytest.approx([1.0, 1.0, 1.0])
+    # speech onsets lie 0-0.12 s after the cue starts (synthetic), hence the tolerance
+    assert [s.offset for s in segs] == pytest.approx([2.0, 2.6, 1.8], abs=0.12)
+    assert 800 < segs[1].start < 1000 and 1700 < segs[2].start < 1900
+    assert np.percentile(err, 95) < 0.15 < np.percentile(err0, 95)
+    assert len(probes) <= 4
+
+
+@pytest.mark.parametrize("use_speech", [True, False])
+def test_slow_wobble_is_followed_smoothly(synth, use_speech):
+    """Offset wobbling ±0.3 s sinusoidally (20 min period): local refinement follows it
+    with a few smooth knots and no extra segments."""
+
+    def f(t):
+        return t + 3.0 + 0.3 * math.sin(2 * math.pi * t / 1200)
+
+    err0, fit, err, _probes = _align_full(synth, f, use_speech=use_speech)
+    assert len(fit.mapping.segments) == 1
+    seg = fit.mapping.segments[0]
+    assert 2 <= len(seg.knots) <= 45 * 60 / 120
+    assert max(abs(c) for _x, c in seg.knots) <= 0.5
+    assert np.median(err0) > 0.15
+    assert np.median(err) < (0.08 if use_speech else 0.12)
+    assert np.percentile(err, 95) < np.percentile(err0, 95) - 0.1
+
+
+def test_subdivide_leaves_consistent_fit_alone(synth):
+    err0, fit, err, probes = _align_full(synth, lambda t: t * 25 / 23.976 - 4.0, drop=0.2)
+    assert len(fit.mapping.segments) == 1
+    assert fit.mapping.segments[0].scale == pytest.approx(25 / 23.976)
+    assert fit.details["verify_splits"] == 0
+    assert len(probes) <= 1
+    _assert_accurate(err)
+
+
+def test_subdivide_respects_budget_and_min_length(synth):
+    def f(t):
+        return t + 2.0 if t < 900 else (t + 2.6 if t < 1800 else t + 1.8)
+
+    _e0, fit0, _err, probes = _align_full(synth, f, budget=0)
+    assert probes == []
+    # segments never shorter than the minimum (except the open-ended first one)
+    starts = [s.start for s in fit0.mapping.segments[1:]]
+    assert all(b - a >= 120.0 for a, b in zip(starts, starts[1:], strict=False))
+
+
+def test_refine_local_median_shift_is_bounded():
+    cues = [Cue(10.0 * i, 10.0 * i + 2.0, f"w{i}") for i in range(60)]
+    anchors = [Anchor(c.start, c.start + 5.0 + 0.8, 1.0, window=i // 10, cue=i, token=i)
+               for i, c in enumerate(cues)]  # fmt: skip
+    m, info = refine_local(Mapping.linear(1.0, 5.0), anchors, cues, wobble=False)
+    assert info["segment_shifts"] == [pytest.approx(0.5)]
+    assert m.segments[0].offset == pytest.approx(5.5)
+
+
+def test_refine_with_speech_uses_precision_not_spread():
+    """Real dialogue: cue starts vs speech onsets scatter by ~0.2 s (MAD), but over
+    hundreds of cues the median is precise; the old MAD <= 0.12 gate rejected it."""
+    rng = np.random.default_rng(0)
+    res = 0.01
+    starts = np.cumsum(rng.uniform(2.5, 4.0, 300))
+    cues = [Cue(float(t), float(t) + 1.5, "x") for t in starts]
+    speech = np.zeros(int((starts[-1] + 10) / res), dtype=bool)
+    for t in starts:
+        on = t + 0.15 + rng.normal(0, 0.25)  # true bias +0.15 s, noisy onsets
+        speech[int(on / res) : int((on + 1.2) / res)] = True
+    m, shift = refine_with_speech(Mapping.identity(), cues, speech, res)
+    assert shift == pytest.approx(0.15, abs=0.05)
+    # too few cues for a precise median: untouched
+    m2, shift2 = refine_with_speech(Mapping.identity(), cues[:15], speech, res)
+    assert shift2 == 0.0
+
+
+def test_mapping_knots_interpolate_and_hold():
+    seg = Segment(-math.inf, 1.0, 2.0, knots=((100.0, 0.2), (200.0, -0.2)))
+    m = Mapping([seg])
+    assert m(50.0) == pytest.approx(52.2)  # held flat before the first knot
+    assert m(150.0) == pytest.approx(152.0)
+    assert m(400.0) == pytest.approx(401.8)
+    assert list(m.map_array(np.array([50.0, 150.0, 400.0]))) == pytest.approx([52.2, 152.0, 401.8])
+    # retime uses the corrected start; durations still scale with the segment
+    assert retime([(150.0, 152.0)], m)[0] == pytest.approx((152.0, 154.0))
+
+
+def test_in_cue_token_times_follow_scale():
+    from vlcsubsync.align import _AnchorArrays
+
+    tok = subtitle_tokens([Cue(100.0, 110.0, "one two three four five six seven eight")])
+    rows = zip(tok.times, tok.lead, tok.cap, strict=True)
+    a = [
+        Anchor(float(t), 0.0, 1.0, 0, 0, i, float(ld), float(cp))
+        for i, (t, ld, cp) in enumerate(rows)
+    ]
+    arr = _AnchorArrays.build(a)
+    assert list(arr.x(1.0)) == pytest.approx(list(tok.times))
+    # under 1.25x drift the same speech takes 1/1.25 of the subtitle-clock time
+    assert list(arr.x(1.25) - 100.0) == pytest.approx(list((tok.times - 100.0) / 1.25))
+
+
+@pytest.mark.parametrize("seed", [99, 7, 13, 21, 42, 5, 6])
+def test_vad_align_unrelated_across_scales(synth, seed):
+    """More scale candidates must not raise the odds of a noise maximum: the winner
+    is compared with the best distinguishable rival scale."""
+    cues, _ = _masks(synth, lambda t: t, 20 * 60, seed=4)
+    _, speech = _masks(synth, lambda t: t, 20 * 60, seed=seed)
+    r = vad_align(speech, cues)
+    assert r.confidence < 0.3
+    assert r.details["cross_scale"] < 0.3

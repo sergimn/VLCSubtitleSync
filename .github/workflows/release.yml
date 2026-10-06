@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Check tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -n 's/^version *= *"\(.*\)"/\1/p' pyproject.toml | head -n1)"
+          if [ -z "$ver" ]; then
+            ver="$(sed -n 's/^__version__ *= *"\(.*\)"/\1/p' src/vlcsubsync/__init__.py | head -n1)"
+          fi
+          echo "tag=$tag package=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag != package version $ver"; exit 1; }
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Smoke-test the wheel
+        run: |
+          uv venv --python 3.12 /tmp/smoke
+          uv pip install --python /tmp/smoke dist/*.whl
+          /tmp/smoke/bin/vlc-subsync --version
+
+      - name: Installer assets pinned to this release
+        # The released install scripts install *this* version (the wheel attached to
+        # the release) instead of the main-branch archive.
+        run: |
+          mkdir -p release
+          whl="$(basename dist/*.whl)"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${whl}"
+          sed "s#^DEFAULT_SOURCE=.*#DEFAULT_SOURCE=\"${url}\"#" install.sh > release/install.sh
+          sed "s#^\$DefaultSource = .*#\$DefaultSource = '${url}'#" install.ps1 > release/install.ps1
+          cp install.cmd release/install.cmd
+          grep -q "$url" release/install.sh
+          grep -q "$url" release/install.ps1
+          ls -la dist release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            release/install.sh
+            release/install.ps1
+            release/install.cmd

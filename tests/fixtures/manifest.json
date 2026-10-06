@@ -1,0 +1,478 @@
+{
+ "generator": "scripts/make_fixtures.py",
+ "sample_rate_measured": 22050,
+ "onset_threshold_dbfs": -42.0,
+ "files": {
+  "en_dialogue.mkv": {
+   "duration": 161.928,
+   "audio": [
+    {
+     "index": 0,
+     "lang": "en"
+    }
+   ],
+   "truth": "en_dialogue.truth.srt",
+   "variants": {
+    "en_dialogue.offset_plus_3_2.srt": {
+     "desc": "t + 3.2",
+     "params": {
+      "offset": 3.2
+     }
+    },
+    "en_dialogue.offset_minus_7.srt": {
+     "desc": "t - 7",
+     "params": {
+      "offset": -7.0
+     }
+    },
+    "en_dialogue.drift_25_23976.srt": {
+     "desc": "t * 25/23.976",
+     "params": {
+      "scale": 1.0427083333333333
+     }
+    },
+    "en_dialogue.offset_drift.srt": {
+     "desc": "t * 23.976/25 + 4.0",
+     "params": {
+      "scale": 0.959040959040959,
+      "offset": 4.0
+     }
+    },
+    "en_dialogue.cut.srt": {
+     "desc": "t + 2 for t < 83.710, t + 12 after (simulated ad-break cut)",
+     "params": {
+      "cut_at": 83.71,
+      "offset_before": 2.0,
+      "offset_after": 12.0
+     }
+    }
+   },
+   "mismatch_variants": {
+    "en_dialogue.es_text.offset_plus_3_2.srt": {
+     "desc": "Spanish text on English timing, t + 3.2 (language mismatch)",
+     "params": {
+      "offset": 3.2
+     }
+    }
+   }
+  },
+  "es_dialogue.mkv": {
+   "duration": 182.071,
+   "audio": [
+    {
+     "index": 0,
+     "lang": "es"
+    }
+   ],
+   "truth": "es_dialogue.truth.srt",
+   "variants": {
+    "es_dialogue.offset_plus_3_2.srt": {
+     "params": {
+      "offset": 3.2
+     }
+    }
+   }
+  },
+  "multi_audio.mkv": {
+   "duration": 182.071,
+   "audio": [
+    {
+     "index": 0,
+     "lang": "es",
+     "truth": "es_dialogue.truth.srt"
+    },
+    {
+     "index": 1,
+     "lang": "en",
+     "truth": "en_dialogue.truth.srt"
+    }
+   ],
+   "embedded_subs": [
+    {
+     "index": 0,
+     "lang": "en",
+     "matches_audio": 1,
+     "params": {
+      "offset": 4.5
+     }
+    }
+   ],
+   "sidecars": {
+    "multi_audio.en.srt": {
+     "lang": "en",
+     "matches_audio": 1,
+     "params": {
+      "scale": 1.0427083333333333,
+      "offset": -1.5
+     }
+    }
+   }
+  }
+ },
+ "cues": {
+  "en": [
+   {
+    "start": 9.01,
+    "end": 11.694,
+    "text": "Theo, wake up. The train leaves in forty minutes."
+   },
+   {
+    "start": 12.99,
+    "end": 14.821,
+    "text": "Forty minutes? You told me we had the whole morning."
+   },
+   {
+    "start": 18.415,
+    "end": 21.074,
+    "text": "I said that yesterday, before the station changed the schedule."
+   },
+   {
+    "start": 22.653,
+    "end": 24.214,
+    "text": "Fine. Where did you put my blue jacket?"
+   },
+   {
+    "start": 25.514,
+    "end": 28.043,
+    "text": "It's hanging behind the kitchen door, next to the umbrella."
+   },
+   {
+    "start": 29.301,
+    "end": 31.715,
+    "text": "Did you remember to pack the tickets and the passports?"
+   },
+   {
+    "start": 32.538,
+    "end": 34.803,
+    "text": "Both of them are in the small pocket of my backpack."
+   },
+   {
+    "start": 37.86,
+    "end": 40.355,
+    "text": "Good, because last time we almost missed the ferry."
+   },
+   {
+    "start": 43.438,
+    "end": 45.708,
+    "text": "That was your fault. You wanted one more coffee."
+   },
+   {
+    "start": 46.932,
+    "end": 48.678,
+    "text": "And it was the best coffee I have ever had."
+   },
+   {
+    "start": 50.925,
+    "end": 53.778,
+    "text": "Hurry up. The taxi driver is already waiting outside."
+   },
+   {
+    "start": 56.079,
+    "end": 57.751,
+    "text": "Tell him we need two more minutes, please."
+   },
+   {
+    "start": 58.643,
+    "end": 61.571,
+    "text": "Excuse me, is this the platform for the northern coast?"
+   },
+   {
+    "start": 63.185,
+    "end": 65.55,
+    "text": "I think so. The sign says platform number seven."
+   },
+   {
+    "start": 65.967,
+    "end": 68.816,
+    "text": "Look at the mountains. I can't believe how green everything is."
+   },
+   {
+    "start": 70.242,
+    "end": 72.457,
+    "text": "My grandmother grew up in a village just like that one."
+   },
+   {
+    "start": 74.926,
+    "end": 77.186,
+    "text": "Really? You never told me anything about her."
+   },
+   {
+    "start": 79.686,
+    "end": 82.684,
+    "text": "She was a fisherman's daughter. She could read the weather in the clouds."
+   },
+   {
+    "start": 84.736,
+    "end": 86.706,
+    "text": "So what do the clouds say about this afternoon?"
+   },
+   {
+    "start": 87.216,
+    "end": 88.957,
+    "text": "They say you should have brought a warmer sweater."
+   },
+   {
+    "start": 89.542,
+    "end": 92.495,
+    "text": "Very funny. Let's find something to eat when we arrive."
+   },
+   {
+    "start": 94.223,
+    "end": 97.266,
+    "text": "There is a little restaurant near the harbour that serves grilled sardines."
+   },
+   {
+    "start": 98.691,
+    "end": 101.146,
+    "text": "Perfect. And after lunch we can walk to the lighthouse."
+   },
+   {
+    "start": 101.526,
+    "end": 103.726,
+    "text": "The lighthouse is closed on Mondays, remember?"
+   },
+   {
+    "start": 105.511,
+    "end": 108.09,
+    "text": "Then we will climb the hill behind the old church instead."
+   },
+   {
+    "start": 111.799,
+    "end": 112.952,
+    "text": "Wait. Did you hear that announcement?"
+   },
+   {
+    "start": 116.803,
+    "end": 119.048,
+    "text": "Something about a delay because of a broken signal."
+   },
+   {
+    "start": 122.097,
+    "end": 123.584,
+    "text": "How long do they expect us to wait here?"
+   },
+   {
+    "start": 124.772,
+    "end": 127.301,
+    "text": "The conductor said about twenty minutes, maybe less."
+   },
+   {
+    "start": 130.393,
+    "end": 132.573,
+    "text": "Then I am going to buy a newspaper and a sandwich."
+   },
+   {
+    "start": 136.237,
+    "end": 138.063,
+    "text": "Bring me a bottle of water and some chocolate."
+   },
+   {
+    "start": 140.727,
+    "end": 141.969,
+    "text": "Dark or milk chocolate?"
+   },
+   {
+    "start": 144.911,
+    "end": 147.081,
+    "text": "Dark, obviously. I am not a child."
+   },
+   {
+    "start": 149.532,
+    "end": 150.988,
+    "text": "We are moving again. Finally."
+   },
+   {
+    "start": 152.155,
+    "end": 155.328,
+    "text": "Next stop is ours. Grab your bag and don't forget the camera."
+   },
+   {
+    "start": 156.508,
+    "end": 158.928,
+    "text": "I never forget the camera. That was you, in Lisbon."
+   }
+  ],
+  "es": [
+   {
+    "start": 9.005,
+    "end": 11.973,
+    "text": "Theo, despierta. El tren sale en cuarenta minutos."
+   },
+   {
+    "start": 12.308,
+    "end": 16.199,
+    "text": "¿Cuarenta minutos? Me dijiste que teníamos toda la mañana."
+   },
+   {
+    "start": 17.377,
+    "end": 20.006,
+    "text": "Eso lo dije ayer, antes de que la estación cambiara el horario."
+   },
+   {
+    "start": 21.636,
+    "end": 24.205,
+    "text": "Vale. ¿Dónde pusiste mi chaqueta azul?"
+   },
+   {
+    "start": 25.411,
+    "end": 28.459,
+    "text": "Está colgada detrás de la puerta de la cocina, junto al paraguas."
+   },
+   {
+    "start": 29.392,
+    "end": 32.235,
+    "text": "¿Te acordaste de guardar los billetes y los pasaportes?"
+   },
+   {
+    "start": 32.748,
+    "end": 35.138,
+    "text": "Los dos están en el bolsillo pequeño de mi mochila."
+   },
+   {
+    "start": 35.669,
+    "end": 39.286,
+    "text": "Bien, porque la última vez casi perdimos el ferri."
+   },
+   {
+    "start": 40.005,
+    "end": 42.17,
+    "text": "Eso fue culpa tuya. Querías otro café."
+   },
+   {
+    "start": 43.924,
+    "end": 47.147,
+    "text": "Y fue el mejor café que he tomado nunca."
+   },
+   {
+    "start": 50.006,
+    "end": 52.64,
+    "text": "Date prisa. El taxista ya está esperando fuera."
+   },
+   {
+    "start": 53.22,
+    "end": 56.263,
+    "text": "Dile que necesitamos dos minutos más, por favor."
+   },
+   {
+    "start": 57.812,
+    "end": 59.748,
+    "text": "Perdone, ¿es este el andén para la costa norte?"
+   },
+   {
+    "start": 61.047,
+    "end": 63.96,
+    "text": "Creo que sí. El cartel dice andén número siete."
+   },
+   {
+    "start": 67.758,
+    "end": 70.786,
+    "text": "Mira las montañas. No puedo creer lo verde que está todo."
+   },
+   {
+    "start": 73.423,
+    "end": 76.047,
+    "text": "Mi abuela creció en un pueblo justo como ese."
+   },
+   {
+    "start": 76.866,
+    "end": 79.161,
+    "text": "¿En serio? Nunca me contaste nada de ella."
+   },
+   {
+    "start": 80.991,
+    "end": 85.257,
+    "text": "Era hija de un pescador. Sabía leer el tiempo en las nubes."
+   },
+   {
+    "start": 89.13,
+    "end": 90.737,
+    "text": "¿Y qué dicen las nubes sobre esta tarde?"
+   },
+   {
+    "start": 91.89,
+    "end": 95.148,
+    "text": "Dicen que deberías haber traído un jersey más abrigado."
+   },
+   {
+    "start": 98.931,
+    "end": 101.685,
+    "text": "Muy gracioso. Busquemos algo de comer cuando lleguemos."
+   },
+   {
+    "start": 104.433,
+    "end": 108.593,
+    "text": "Hay un restaurante pequeño cerca del puerto que sirve sardinas a la plancha."
+   },
+   {
+    "start": 111.158,
+    "end": 114.151,
+    "text": "Perfecto. Y después de comer podemos ir andando al faro."
+   },
+   {
+    "start": 117.634,
+    "end": 119.969,
+    "text": "El faro cierra los lunes, ¿recuerdas?"
+   },
+   {
+    "start": 122.735,
+    "end": 125.558,
+    "text": "Entonces subiremos la colina detrás de la iglesia vieja."
+   },
+   {
+    "start": 126.781,
+    "end": 128.641,
+    "text": "Espera. ¿Has oído ese aviso?"
+   },
+   {
+    "start": 131.828,
+    "end": 134.177,
+    "text": "Algo sobre un retraso por una señal averiada."
+   },
+   {
+    "start": 136.898,
+    "end": 139.188,
+    "text": "¿Cuánto tiempo esperan que nos quedemos aquí?"
+   },
+   {
+    "start": 142.962,
+    "end": 145.511,
+    "text": "El revisor dijo unos veinte minutos, quizá menos."
+   },
+   {
+    "start": 145.946,
+    "end": 149.458,
+    "text": "Entonces voy a comprar un periódico y un bocadillo."
+   },
+   {
+    "start": 151.836,
+    "end": 153.896,
+    "text": "Tráeme una botella de agua y algo de chocolate."
+   },
+   {
+    "start": 156.17,
+    "end": 157.686,
+    "text": "¿Chocolate negro o con leche?"
+   },
+   {
+    "start": 158.638,
+    "end": 160.883,
+    "text": "Negro, obviamente. No soy una niña."
+   },
+   {
+    "start": 164.49,
+    "end": 166.79,
+    "text": "Ya nos movemos otra vez. Por fin."
+   },
+   {
+    "start": 168.61,
+    "end": 172.461,
+    "text": "La próxima parada es la nuestra. Coge tu bolsa y no olvides la cámara."
+   },
+   {
+    "start": 175.309,
+    "end": 179.071,
+    "text": "Yo nunca olvido la cámara. Fuiste tú, en Lisboa."
+   }
+  ]
+ }
+}

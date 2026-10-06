@@ -168,7 +168,8 @@ them in `config.ini`.
   it's ready, and results are cached afterwards.
 - **Small residual offsets are possible.** The fit is one timing line per section of
   the video, built from a sample of the audio, so individual lines can still be a
-  fraction of a second early or late. Drift beyond ±28% (0.78–1.28×) isn't handled.
+  fraction of a second early or late. Drift outside 0.78–1.28× (−22% / +28%)
+  isn't handled.
 - Subtitles that don't match the dialogue at all (a different cut with re-edited
   lines, or a heavily paraphrased translation) may not be accepted. SubSync then keeps
   the original timing and tells you so instead of making things worse.

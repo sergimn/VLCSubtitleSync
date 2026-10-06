@@ -172,17 +172,19 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    2) between transcript windows and the *whole* subtitle token stream (no assumption
    on offset magnitude) → (sub_time, audio_time) pairs, weighted by n-gram uniqueness.
 5. Fit `audio = scale*sub + offset` robustly (RANSAC + IRLS refine). Scales are bounded
-   to 0.78–1.28, and free fits snap to the known framerate ratios
-   (`align.SCALE_CANDIDATES`):
+   to 0.78–1.28 (−22% / +28%). Long segments use a free fit that snaps to a known
+   framerate ratio (`align.SCALE_CANDIDATES`) when within 0.0015 of it; short or sparse
+   segments pick the best-fitting ratio, with a prior towards 1.0 that grows with the
+   ratio's size. Ratios beyond ±10% also need at least 10 anchors:
 
    | ratio | typical cause |
    |---|---|
    | 1 | same release, only an offset |
-   | 25/23.976, 23.976/25 | PAL ↔ film/NTSC-film (±4.3%) |
+   | 25/23.976, 23.976/25 | PAL ↔ film/NTSC-film (+4.3% / −4.1%) |
    | 24/23.976, 23.976/24 | 24 ↔ 23.976 fps (±0.1%) |
-   | 25/24, 24/25 | PAL ↔ 24 fps (±4.2%) |
-   | 29.97/23.976, 23.976/29.97 | NTSC TV ↔ film (±25%), seen on real TV episodes |
-   | 29.97/25, 25/29.97 | NTSC TV ↔ PAL (±20%) |
+   | 25/24, 24/25 | PAL ↔ 24 fps (+4.2% / −4.0%) |
+   | 29.97/23.976, 23.976/29.97 | NTSC TV ↔ film (+25% / −20%), seen on real TV episodes |
+   | 29.97/25, 25/29.97 | NTSC TV ↔ PAL (+19.9% / −16.6%) |
 
    If residuals show
    ≥2 clusters (cuts), fit piecewise-linear with DP over time-sorted anchors with a

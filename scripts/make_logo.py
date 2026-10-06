@@ -40,8 +40,16 @@ def icon_body(dark: bool = False) -> str:
         )
     else:
         tile = f'<rect x="0" y="0" width="100" height="100" rx="24" fill="{INK}"/>'
-    bars = [(18, 29, 10, 1), (25, 23, 22, 1), (32, 27, 14, 1), (39, 19, 30, 1),
-            (57, 24, 20, .35), (64, 20, 28, .35), (71, 28, 12, .35), (78, 25, 18, .35)]
+    bars = [
+        (18, 29, 10, 1),
+        (25, 23, 22, 1),
+        (32, 27, 14, 1),
+        (39, 19, 30, 1),
+        (57, 24, 20, 0.35),
+        (64, 20, 28, 0.35),
+        (71, 28, 12, 0.35),
+        (78, 25, 18, 0.35),
+    ]
     parts = [tile]
     for x, y, h, op in bars:
         o = "" if op == 1 else f' opacity="{op}"'
@@ -101,6 +109,7 @@ def lockup(bold: Outliner, medium: Outliner, dark: bool) -> str:
     height = pad + icon + pad
     tx = pad + icon + gap
     col_top = pad + (icon - col_h) / 2
+
     # Baselines: center glyph ascent/descent box inside each line box like CSS does.
     def baseline(top, line_h, f, size):
         content = size * (f.ascent - f.descent) / f.upm
@@ -134,12 +143,21 @@ def main() -> None:
     for name, dark in (("logo.svg", False), ("logo-dark.svg", True)):
         (OUT / name).write_text(lockup(bold, medium, dark))
     for size in (256, 512):
-        cairosvg.svg2png(bytestring=icon_svg.encode(), write_to=str(OUT / f"icon-{size}.png"),
-                         output_width=size, output_height=size)
-    big = Image.open(io.BytesIO(cairosvg.svg2png(bytestring=icon_svg.encode(),
-                                                 output_width=256, output_height=256)))
-    big.save(OUT / "icon.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64),
-                                      (128, 128), (256, 256)])
+        cairosvg.svg2png(
+            bytestring=icon_svg.encode(),
+            write_to=str(OUT / f"icon-{size}.png"),
+            output_width=size,
+            output_height=size,
+        )
+    big = Image.open(
+        io.BytesIO(
+            cairosvg.svg2png(bytestring=icon_svg.encode(), output_width=256, output_height=256)
+        )
+    )
+    big.save(
+        OUT / "icon.ico",
+        sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+    )
     cairosvg.svg2png(url=str(OUT / "logo.svg"), write_to=str(OUT / "logo.png"), scale=2)
     print("wrote", sorted(p.name for p in OUT.iterdir()))
 

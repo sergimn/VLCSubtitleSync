@@ -57,9 +57,20 @@ def write_kv(path: Path, data: dict) -> None:
 class Harness:
     """A Lua runtime with the mocked vlc global and one script loaded."""
 
-    def __init__(self, runtime: str, tmp_path: Path, script: Path, make_path: bool = False):
+    def __init__(
+        self,
+        runtime: str,
+        tmp_path: Path,
+        script: Path,
+        make_path: bool = False,
+        windows: bool = False,
+    ):
         mod = importlib.import_module(f"lupa.{runtime}")
         self.lua = mod.LuaRuntime(unpack_returned_tuples=True)
+        # The scripts detect Windows from package.config's directory separator.
+        # Pin it so results don't depend on the OS running the tests.
+        sep = "\\\\" if windows else "/"
+        self.lua.execute(f'package.config = "{sep}" .. package.config:sub(2)')
         self.userdata = tmp_path / "vlcdata"
         self.userdata.mkdir()
         self.q = self.userdata / "subsync"
@@ -204,6 +215,12 @@ def test_scripts_parse_on_all_runtimes(runtime):
     for script in (INTF, EXT):
         err = lua.execute(f"local f, e = loadfile({str(script)!r}); return e")
         assert err is None, err
+
+
+def test_windows_uri_decodes_to_drive_path(runtime, tmp_path):
+    w = Harness(runtime, tmp_path, INTF, windows=True)
+    assert w.S.uri_to_path("file:///C:/My%20Movies/a%20b.mkv") == "C:\\My Movies\\a b.mkv"
+    assert w.S.uri_to_path("file://server/share/x.mkv") == "\\\\server\\share\\x.mkv"
 
 
 def test_request_written_with_ordinals_labels_and_decoded_path(h):

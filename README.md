@@ -216,11 +216,14 @@ entry. Add `--purge` to also delete the cache, logs, config and downloaded model
 ```sh
 git clone https://github.com/sergimn/VLCSubtitleSync && cd VLCSubtitleSync
 uv venv && uv pip install -e ".[dev]"
+.venv/bin/pre-commit install       # ruff, shellcheck, actionlint, luacheck (if installed) on every commit
 .venv/bin/pytest                 # unit tests (fast; excludes slow/vlc)
 .venv/bin/pytest -m slow         # real Whisper models on real speech (downloads tiny.en, base.en, base)
 .venv/bin/pytest -m vlc          # headless VLC + Lua script + helper, end to end
-.venv/bin/ruff check . && .venv/bin/ruff format --check . && luacheck src/vlcsubsync/lua tests/lua
+.venv/bin/pre-commit run --all-files
 ```
+
+Dependency updates are proposed by [Renovate](https://docs.renovatebot.com/) (`renovate.json`): CI tooling and dev extras are grouped and automerged when CI passes; runtime dependencies always get a PR for manual review.
 
 Test markers:
 

@@ -765,15 +765,65 @@ class Daemon:
         ]
         return hashlib.sha1("\0".join(parts).encode("utf-8")).hexdigest()
 
-    def cache_lookup_keys(self, job: _Job, source: ResolvedSource, config: Any) -> list[str]:
-        """Keys whose results satisfy this job: the most thorough mode first, down to
-        the job's own mode. A result of a more thorough mode is at least as good, so an
-        exhaustive result also answers a later fast/thorough request (never the other
-        way round)."""
+    def cache_lookup_keys(
+        self, job: _Job, source: ResolvedSource, config: Any
+    ) -> list[tuple[str, str]]:
+        """``(mode, key)`` pairs whose results may satisfy this job: the most thorough
+        mode first, down to the job's own mode. A result of a more thorough mode is at
+        least as good, so an exhaustive result also answers a later fast/thorough
+        request (never the other way round), but only if it was applied (see
+        :meth:`_cached_result`)."""
         want = mode_rank(effective_mode(job.request, config))
         return [
-            self.cache_key(job, source, config, m) for m in reversed(MODES) if mode_rank(m) >= want
+            (m, self.cache_key(job, source, config, m))
+            for m in reversed(MODES)
+            if mode_rank(m) >= want
         ]
+
+    def _cached_result(
+        self, job: _Job, source: ResolvedSource, config: Any
+    ) -> tuple[Path, dict[str, str]] | None:
+        """Cached result for ``job``, or None.
+
+        The job's own mode may answer with any cached result, including an unapplied
+        one (no point redoing hopeless work in the same mode). Another, more thorough
+        mode only answers with an *applied* result: an unapplied exhaustive run (e.g.
+        windows lost to CUDA OOM, then the VAD fallback) must not block a fast sync
+        that might succeed.
+        """
+        own = effective_mode(job.request, config)
+        for m, key in self.cache_lookup_keys(job, source, config):
+            hit = self._cache_lookup(key)
+            if hit is None:
+                continue
+            if m != own and not P._to_bool(hit[1].get("applied")):
+                log.debug("ignoring unapplied cached %s result for a %s job", m, own)
+                continue
+            return hit
+        return None
+
+    def _cache_drop_other_modes(
+        self, job: _Job, source: ResolvedSource, config: Any, keep: str
+    ) -> None:
+        """Remove the cached results of every mode but ``keep`` for this file and
+        tracks, so the newest (forced) result is what later lookups find."""
+        for m in MODES:
+            if m == keep:
+                continue
+            key = self.cache_key(job, source, config, m)
+            meta_path = self.cache_dir / f"{key}.meta"
+            meta = P.read_kv(meta_path)
+            paths = [meta_path]
+            if meta and meta.get("file"):
+                paths.append(self.cache_dir / meta["file"])
+            for p in paths:
+                try:
+                    p.unlink()
+                    log.debug("dropped cached %s result %s", m, p.name)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    log.warning("cannot drop cached result %s: %s", p, exc)
 
     def _cache_lookup(self, key: str) -> tuple[Path, dict[str, str]] | None:
         meta = P.read_kv(self.cache_dir / f"{key}.meta")
@@ -829,12 +879,7 @@ class Daemon:
             out_dir = job.queue_dir / P.OUT_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            cached = None
-            if not r.force:
-                for k in self.cache_lookup_keys(job, source, config):
-                    cached = self._cache_lookup(k)
-                    if cached is not None:
-                        break
+            cached = None if r.force else self._cached_result(job, source, config)
             if cached is not None:
                 cached_file, meta = cached
                 dest = out_dir / f"{r.id}{cached_file.suffix}"
@@ -894,6 +939,10 @@ class Daemon:
             )
             writer.write(done, force=True)
             self._cache_store(key, output, done)
+            if r.force:
+                # the user asked for a fresh result: it must not be shadowed by an
+                # older result of another (more thorough) mode on the next open
+                self._cache_drop_other_modes(job, source, config, mode)
             log.info(
                 "job %s done in %.1fs (mode %s): %s (applied=%s)",
                 r.id,

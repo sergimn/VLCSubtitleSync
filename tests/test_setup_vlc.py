@@ -717,7 +717,7 @@ def test_resetup_restarts_path_unit_when_watches_change(tmp_path):
     fs.commands.clear()
     assert S.run_setup(fs.ctx(), model=False) == 0
     path_unit = (fs.home / ".config/systemd/user/vlc-subsync.path").read_text()
-    assert "snap/vlc/current" in path_unit
+    assert str(Path("snap/vlc/current")) in path_unit
     reload_ = ["systemctl", "--user", "daemon-reload"]
     assert reload_ in fs.commands and restart in fs.commands
     assert fs.commands.index(reload_) < fs.commands.index(restart)

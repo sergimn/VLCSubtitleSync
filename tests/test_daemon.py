@@ -25,7 +25,8 @@ def wait_for(cond, timeout=10.0, interval=0.02):
 class FakeRunner:
     """Writes a fake SRT; optionally blocks until released."""
 
-    def __init__(self, fail_for=(), block=False, applied=True):
+    def __init__(self, fail_for=(), block=False, applied=True, mapping_segments=None):
+        self.mapping_segments = mapping_segments
         self.calls: list[D.JobSpec] = []
         self.fail_for = set(fail_for)
         self.block = block
@@ -54,6 +55,7 @@ class FakeRunner:
             anchors=40,
             applied=self.applied,
             message="offset +2.35s, drift +4.17%",
+            mapping_segments=self.mapping_segments,
         )
 
 
@@ -84,12 +86,15 @@ def external_resolver(req):
 
 class Harness:
     def __init__(self, env, runner, resolver=external_resolver, **kw):
+        config_loader = kw.pop(
+            "config_loader", lambda: SimpleNamespace(model_en="base.en", model_multi="base")
+        )
         self.daemon = D.Daemon(
             [env.queue],
             use_default_queues=False,
             runner=runner,
             resolver=resolver,
-            config_loader=lambda: SimpleNamespace(model_en="base.en", model_multi="base"),
+            config_loader=config_loader,
             cache_dir=env.tmp / "cache" / "results",
             lock_path=env.tmp / "state" / "daemon.lock",
             poll_interval=0.02,
@@ -548,3 +553,59 @@ def test_external_output_keeps_format(env):
         h.submit("f_1", media, sub_index=0)
         st = h.wait_state("f_1", "done")
     assert st.output.endswith("f_1.ass")
+
+
+SEGS = [
+    P.MapSegment(None, 83.71, 1.0, 2.0, ((10.0, 0.05), (60.0, -0.02))),
+    P.MapSegment(83.71, None, 0.959041, 12.0),
+]
+
+
+def test_done_status_carries_mapping_segments_and_cache_returns_them(env):
+    media = make_media(env)
+    runner = FakeRunner(mapping_segments=SEGS)
+    with Harness(env, runner) as h:
+        h.submit("m_1", media, sub_index=0)
+        st = h.wait_state("m_1", "done")
+        raw = P.read_kv(P.status_path(env.queue, "m_1"))
+        assert raw["segments"] == "2"
+        assert raw["seg0"] == ",83.710,1.0000000,2.0000"
+        assert raw["seg0_knots"] == "10.000:0.0500;60.000:-0.0200"
+        assert raw["seg1"] == "83.710,,0.9590410,12.0000"
+        assert "seg1_knots" not in raw
+        assert raw["sync_mode"] == "track"  # config without sync_mode: the default
+        assert st.segments == SEGS
+        # cache hit: same mapping, without running the engine again
+        h.submit("m_2", media, sub_index=0)
+        st2 = h.wait_state("m_2", "done")
+        assert len(runner.calls) == 1
+        assert st2.segments == SEGS
+        meta = [P.read_kv(m) for m in (env.tmp / "cache" / "results").glob("*.meta")]
+        assert meta and meta[0]["segments"] == "2" and "seg1" in meta[0]
+
+
+def test_unapplied_result_has_no_segments(env):
+    media = make_media(env)
+    runner = FakeRunner(applied=False, mapping_segments=SEGS)
+    with Harness(env, runner) as h:
+        h.submit("u_1", media, sub_index=0)
+        st = h.wait_state("u_1", "done")
+        assert st.segments is None
+        assert "segments" not in P.read_kv(P.status_path(env.queue, "u_1"))
+
+
+def test_status_reports_configured_sync_mode_also_on_cache_hit(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    cfg = {"c": Config(sync_mode="delay")}
+    runner = FakeRunner(mapping_segments=SEGS)
+    with Harness(env, runner, config_loader=lambda: cfg["c"]) as h:
+        h.submit("s_1", media, sub_index=0)
+        assert h.wait_state("s_1", "done").sync_mode == "delay"
+        cfg["c"] = Config(sync_mode="track")  # the user edited config.ini
+        h.submit("s_2", media, sub_index=0)
+        st = h.wait_state("s_2", "done")
+        assert len(runner.calls) == 1  # cache hit...
+        assert st.sync_mode == "track"  # ...with today's setting
+        assert st.segments == SEGS

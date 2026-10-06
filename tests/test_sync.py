@@ -116,6 +116,13 @@ def test_sync_cut_piecewise(tmp_path, synth, energy_vad):
     _check(err)
     # adaptive windows were added around the cut
     assert len(fake.calls) > Config().window_count(25 * 60)
+    # the mapping itself is exposed (delay mode applies it live in VLC)
+    m = r.mapping_segments
+    assert len(m) == 2
+    assert m[0].sub_start is None and m[1].sub_end is None
+    assert m[0].sub_end == m[1].sub_start and 1150 < m[0].sub_end < 1250
+    assert m[0].audio(600.0) - 600.0 == pytest.approx(3.0, abs=0.15)
+    assert m[1].audio(1800.0) - 1800.0 == pytest.approx(33.0, abs=0.15)
 
 
 @pytest.mark.parametrize("verify_windows", ["auto", "0"])
@@ -256,6 +263,7 @@ def test_too_few_anchors_not_applied(tmp_path, synth, energy_vad):
     assert not r.applied
     assert r.method == "none" and r.offset == 0.0 and r.scale == 1.0
     assert r.message.startswith("not synced")
+    assert r.mapping_segments == []
     out = pysubs2.load(r.output_path)
     orig = pysubs2.load(str(srt))
     assert [(e.start, e.end, e.text) for e in out] == [(e.start, e.end, e.text) for e in orig]
@@ -511,3 +519,27 @@ def test_real_whisper_on_fixtures(tmp_path, media, variant, truth, method):
     err = np.abs(np.array([e.start for e in out]) - np.array([e.start for e in ref])) / 1000
     assert np.median(err) < 0.15, np.median(err)
     assert np.percentile(err, 95) < 0.4, np.percentile(err, 95)
+
+
+def test_mapping_segments_from_align_mapping():
+    import math
+
+    from vlcsubsync.align import Mapping, Segment
+    from vlcsubsync.protocol import MapSegment
+    from vlcsubsync.sync import mapping_segments
+
+    m = Mapping(
+        [
+            Segment(-math.inf, 1.0, 2.0, 10, ((0.0, 0.1), (100.0, -0.1))),
+            Segment(500.0, 0.959, 12.0, 5),
+        ]
+    )
+    segs = mapping_segments(m)
+    assert segs == [
+        MapSegment(None, 500.0, 1.0, 2.0, ((0.0, 0.1), (100.0, -0.1))),
+        MapSegment(500.0, None, 0.959, 12.0),
+    ]
+    for t in (-5.0, 0.0, 50.0, 100.0, 499.0, 500.0, 900.0):
+        seg = segs[0] if t < 500 else segs[1]
+        assert seg.audio(t) == pytest.approx(m(t))
+    assert mapping_segments(Mapping.identity()) == [MapSegment(None, None, 1.0, 0.0)]

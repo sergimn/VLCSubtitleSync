@@ -34,6 +34,16 @@
    recursive and returns (status, errno).
  * os.rename/os.remove/os.execute/os.getenv are the standard ones (on
    Windows os.rename fails if the target exists -> remove + retry).
+ * Input variables "time" and "spu-delay" are VLC_VAR_INTEGER in microseconds
+   (src/input/var.c: var_Create(p_input, "time"/"spu-delay", VLC_VAR_INTEGER);
+   input.c: spu-delay = sub-delay (1/10 s) * 100000). "time" is the playback
+   position (es_out.c ES_OUT_SET_TIMES subtracts the buffering). A positive
+   spu-delay shows subtitles later: decoder.c DecoderFixTs adds it to every
+   subtitle timestamp when the subpicture is queued, so a change only affects
+   subtitles decoded afterwards. A negative value also enlarges the input's
+   pts_delay (input.c UpdatePtsDelay), and the clock never shrinks it again
+   (clock.c input_clock_SetJitter): each new minimum stalls playback once by
+   the difference. See DESIGN.md "Delay mode".
  * os.execute(cmd) is C system(): `/bin/sh -c cmd` on POSIX, `cmd.exe /c cmd` on
    Windows. From a GUI process like VLC, cmd.exe gets a console window of its
    own, which may flash briefly; `start "" /B` makes it return at once (see
@@ -54,6 +64,10 @@ M.DAEMON_GRACE_US = 3000000   -- time a job may wait before we complain about th
 M.SPAWN_RETRY_US = 60000000   -- launcher spawn: wait this long before starting it again
 M.SPAWN_MAX = 3               -- launcher spawn: at most this many starts per VLC session
 M.OSD_DURATION = 3000000
+-- delay mode (experimental): see DESIGN.md "Delay mode"
+M.DELAY_TOLERANCE_US = 40000  -- re-set spu-delay when the target moved more than this
+M.SEEK_US = 2000000           -- "time" jumped this far from wall-clock progress = seek
+M.SYNC_MODES = { track = true, delay = true }
 
 M.execute = os.execute        -- replaceable in tests
 M.getenv = os.getenv
@@ -377,6 +391,10 @@ function M.write_state(force)
         { "daemon", S.hb_alive and 1 or 0 },
         -- sync_now_mode values this intf understands (older intfs lack the key)
         { "modes", "fast,thorough,exhaustive" },
+        -- how results are applied: track (default) or delay (experimental)
+        { "sync_mode", M.current_sync_mode() },
+        { "sync_modes", "track,delay" },
+        { "delay_active", S.delay and 1 or 0 },
     })
     if ok then
         S.state_written = t
@@ -424,6 +442,17 @@ function M.read_control()
             if not auto then S.pending = nil end
         end
     end
+    local sm = trim(tostring(c.sync_mode or "")):lower()
+    if not M.SYNC_MODES[sm] then sm = nil end
+    if sm ~= S.sync_mode_ctl then
+        local before = M.current_sync_mode()
+        S.sync_mode_ctl = sm
+        S.state_dirty = true
+        if M.current_sync_mode() ~= before then
+            log_info("sync mode " .. M.current_sync_mode())
+            S.sync_mode_changed = true
+        end
+    end
     local n = tonumber(c.sync_now) or 0
     if S.sync_now_seen == nil then
         S.sync_now_seen = n -- baseline: ignore requests made before we started
@@ -435,6 +464,186 @@ function M.read_control()
     end
     if n < S.sync_now_seen then S.sync_now_seen = n end -- counter reset
     return false
+end
+
+-- "track" (load the synced file as an extra track, the default) or "delay"
+-- (experimental). The extension's toggle (control sync_mode=) wins over the
+-- helper's config (sync_mode= in the last done status).
+function M.current_sync_mode()
+    if not S then return "track" end
+    return S.sync_mode_ctl or S.cfg_sync_mode or "track"
+end
+
+---------------------------------------------------------------- delay mode
+-- The mapping comes from a done status: segments=<n>, seg<i>=<sub_start>,
+-- <sub_end>,<scale>,<offset> (empty bound = open) and optionally
+-- seg<i>_knots=<t>:<c>;... with audio = scale*sub + offset + c(sub), all in
+-- seconds of the subtitle clock (DESIGN.md "Mapping segments").
+
+local function num(s)
+    local v = tonumber(s)
+    if v == nil or v ~= v or v == math.huge or v == -math.huge then return nil end
+    return v
+end
+
+function M.parse_segments(st)
+    local n = tonumber(st and st.segments)
+    if not n or n < 1 or n > 256 then return nil end
+    local segs = {}
+    for i = 0, n - 1 do
+        local v = st["seg" .. i]
+        if not v then return nil end
+        local a, b, c, d = v:match("^%s*([^,]*),([^,]*),([^,]*),([^,]*)%s*$")
+        if not a then return nil end
+        local seg = { lo = num(a), hi = num(b), scale = num(c), offset = num(d), knots = {} }
+        if (trim(a) ~= "" and not seg.lo) or (trim(b) ~= "" and not seg.hi)
+            or not seg.scale or not seg.offset or seg.scale <= 0 then
+            return nil
+        end
+        local k = st["seg" .. i .. "_knots"]
+        if k and k ~= "" then
+            for item in k:gmatch("[^;]+") do
+                local kt, kc = item:match("^%s*([^:]+):(.+)$")
+                kt, kc = num(kt), num(kc)
+                if not kt or not kc then return nil end
+                seg.knots[#seg.knots + 1] = { kt, kc }
+            end
+            table.sort(seg.knots, function(x, y) return x[1] < y[1] end)
+        end
+        segs[#segs + 1] = seg
+    end
+    return segs
+end
+
+-- Local refinement c(t): linear between knots, flat outside.
+function M.seg_correction(seg, t)
+    local k = seg.knots
+    local n = #k
+    if n == 0 then return 0 end
+    if t <= k[1][1] then return k[1][2] end
+    for i = 2, n do
+        if t <= k[i][1] then
+            local x0, y0, x1, y1 = k[i - 1][1], k[i - 1][2], k[i][1], k[i][2]
+            if x1 <= x0 then return y0 end
+            return y0 + (y1 - y0) * (t - x0) / (x1 - x0)
+        end
+    end
+    return k[n][2]
+end
+
+function M.seg_audio(seg, s)
+    return seg.scale * s + seg.offset + M.seg_correction(seg, s)
+end
+
+-- Audio-domain span [lo, hi) of a segment (open bounds -> +-huge).
+local function audio_span(seg)
+    local lo = seg.lo and M.seg_audio(seg, seg.lo) or -math.huge
+    local hi = seg.hi and M.seg_audio(seg, seg.hi) or math.huge
+    return lo, hi
+end
+
+-- Segment index for audio time T (s): the (last) segment whose audio span
+-- contains T; in a gap (forward cut) the upcoming one; after the end the
+-- nearest preceding one.
+function M.segment_at(segs, T)
+    local hit, up, up_lo, prev, prev_hi
+    for i, seg in ipairs(segs) do
+        local lo, hi = audio_span(seg)
+        if T >= lo and T < hi then hit = i end
+        if lo > T and (not up_lo or lo < up_lo) then up, up_lo = i, lo end
+        if hi <= T and (not prev_hi or hi >= prev_hi) then prev, prev_hi = i, hi end
+    end
+    return hit or up or prev or 1
+end
+
+-- Delay (s) for audio time T (s): T - s, where s is the subtitle time that
+-- maps to T. Also returns the segment index and s.
+function M.delay_at(segs, T)
+    local i = M.segment_at(segs, T)
+    local seg = segs[i]
+    local s = (T - seg.offset) / seg.scale
+    if #seg.knots > 0 then
+        -- c(s) is bounded (+-0.5 s) and slow: a few fixed-point steps converge
+        for _ = 1, 4 do
+            s = (T - seg.offset - M.seg_correction(seg, s)) / seg.scale
+        end
+    end
+    return T - s, i, s
+end
+
+local function round(x)
+    return math.floor(x + 0.5)
+end
+
+local function set_spu_delay(input, us)
+    local ok, err = pcall(vlc.var.set, input, "spu-delay", us)
+    if not ok then log_err("cannot set spu-delay: " .. tostring(err)) end
+    return ok
+end
+
+local function get_int(input, var)
+    local ok, v = pcall(vlc.var.get, input, var)
+    if ok then return tonumber(v) end
+    return nil
+end
+
+-- Start correcting the selected original track live. `entry` is the memo
+-- entry ({segs, message, ...}), `key` its audio|sub key.
+function M.delay_start(input, snap, entry, key)
+    if S.delay then M.delay_stop(input, "replaced") end
+    S.delay = {
+        key = key, spu_id = snap.spu, audio_id = snap.audio, segs = entry.segs,
+        bias = round(get_int(input, "spu-delay") or 0), entry = entry,
+    }
+    log_info(string.format("delay mode: start (es=%s, %d segment(s), user bias %d us)",
+        tostring(snap.spu), #entry.segs, S.delay.bias))
+    M.delay_update(input, true)
+    M.osd("Subtitles synced (live delay, experimental): "
+        .. ((entry.message and entry.message ~= "") and entry.message or "done"))
+    S.state_dirty = true
+end
+
+-- Stop, putting the user's own delay (normally 0) back.
+function M.delay_stop(input, why)
+    local D = S.delay
+    if not D then return end
+    S.delay = nil
+    S.state_dirty = true
+    if input then set_spu_delay(input, D.bias) end
+    log_info(string.format("delay mode: stop (%s), spu-delay back to %d us",
+        tostring(why), D.bias))
+end
+
+-- One tick of delay mode: follow "time", keep the user's manual adjustments.
+function M.delay_update(input, force)
+    local D = S.delay
+    local T = get_int(input, "time")
+    if not T then return end
+    local cur = get_int(input, "spu-delay")
+    if D.last_set and cur and cur ~= D.last_set then
+        -- somebody else (hotkeys, the Track Synchronization dialog) moved it:
+        -- that difference is the user's bias and stays on top of ours
+        D.bias = D.bias + (cur - D.last_set)
+        D.last_set = cur
+        log_info(string.format("delay mode: user adjusted spu-delay, bias now %d us", D.bias))
+    end
+    local wall = now_us()
+    local seek = false
+    if D.last_T then
+        local jump = (T - D.last_T) - (wall - D.last_wall)
+        seek = jump > M.SEEK_US or jump < -M.SEEK_US
+    end
+    D.last_T, D.last_wall = T, wall
+    local d, i = M.delay_at(D.segs, T / 1000000)
+    local target = round(d * 1000000) + D.bias
+    if force or not D.last_set or (seek and target ~= D.last_set)
+        or math.abs(target - D.last_set) > M.DELAY_TOLERANCE_US then
+        if set_spu_delay(input, target) then
+            log_dbg(string.format("spu-delay=%d us (time=%.3fs seg=%d bias=%d us%s)",
+                target, T / 1000000, i - 1, D.bias, seek and " seek" or ""))
+            D.last_set = target
+        end
+    end
 end
 
 ---------------------------------------------------------------- tracks
@@ -529,6 +738,10 @@ function M.reset_input()
     S.job = nil
     S.adding = nil
     S.non_file_logged = nil
+    -- the old input (and its spu-delay variable) is gone; a new input starts
+    -- from the sub-delay option again, so there is nothing to restore
+    if S.delay then log_dbg("delay mode: input gone") end
+    S.delay = nil
 end
 
 local function memo_for(uri)
@@ -692,6 +905,18 @@ function M.fire(input, snap, sel, force)
             log_dbg("previous sync for " .. sel.key .. " was not applied; not retrying")
             return
         end
+        if M.current_sync_mode() == "delay" then
+            if m.segs and not S.ours[snap.spu] then
+                if not (S.delay and S.delay.key == sel.key and S.delay.spu_id == snap.spu) then
+                    M.delay_start(input, snap, m, sel.key)
+                end
+                return
+            end
+            -- no mapping remembered (synced in track mode by an older helper):
+            -- ask the helper again, it answers from its cache
+            M.submit(sel, false)
+            return
+        end
         if m.es and snap.spu_set[m.es] and S.ours[m.es] then
             if snap.spu ~= m.es then
                 log_dbg("re-selecting synced track " .. m.es)
@@ -739,10 +964,34 @@ function M.handle_status(input, snap)
     local memo = memo_for(S.input_uri)
     if state == "done" then
         local message = st.message or ""
-        if st.applied == "1" and st.output and st.output ~= "" then
+        if st.sync_mode and M.SYNC_MODES[st.sync_mode] and st.sync_mode ~= S.cfg_sync_mode then
+            S.cfg_sync_mode = st.sync_mode -- the helper's configured mode
+            S.state_dirty = true
+        end
+        local segs = M.parse_segments(st)
+        if st.applied == "1" and M.current_sync_mode() == "delay" then
+            -- experimental: no extra track, correct the original one live
+            if not segs then
+                memo[job.key] = { applied = false, message = message }
+                M.osd("SubSync: live delay needs a newer helper – keeping original timing")
+                M.set_state("error", "no mapping in result (helper too old?)", nil)
+                log_err("job " .. job.id .. ": delay mode but the status has no segments")
+                return
+            end
             local entry = {
                 audio = job.audio, sub = job.sub, sub_label = job.sub_label,
-                output = st.output, message = message, applied = true,
+                output = st.output, message = message, applied = true, segs = segs,
+            }
+            memo[job.key] = entry
+            M.set_state("done", "Subtitles synced (live delay)", "synced (live delay): " .. message)
+            local sel = M.selection(snap)
+            if sel.key == job.key and not sel.is_ours then
+                M.delay_start(input, snap, entry, job.key)
+            end
+        elseif st.applied == "1" and st.output and st.output ~= "" then
+            local entry = {
+                audio = job.audio, sub = job.sub, sub_label = job.sub_label,
+                output = st.output, message = message, applied = true, segs = segs,
             }
             memo[job.key] = entry
             -- only auto-select if the user still has that combination selected
@@ -765,6 +1014,30 @@ function M.handle_status(input, snap)
     else
         log_dbg("unknown job state " .. tostring(state))
     end
+end
+
+-- The sync mode was toggled while playing: move the current result over.
+function M.switch_sync_mode(input, snap, sel)
+    if M.current_sync_mode() == "track" then
+        local D = S.delay
+        if not D then return end
+        M.delay_stop(input, "sync mode track")
+        local e = D.entry
+        if e.output and file_exists(e.output) then
+            M.load_output(input, snap, e, true)
+        end
+        return
+    end
+    -- delay: leave our synced track for the original one, corrected live
+    if not (sel.is_ours and sel.key) then return end
+    local m = S.memo[S.input_uri] and S.memo[S.input_uri][sel.key]
+    if not (m and m.segs) then return end
+    local orig = M.spu_id_for_ordinal(snap, sel.sub)
+    if not orig then return end
+    select_spu(input, orig)
+    snap.spu = orig
+    S.last_spu = orig
+    M.delay_start(input, snap, m, sel.key)
 end
 
 ---------------------------------------------------------------- tick
@@ -847,6 +1120,17 @@ function M.tick()
             sel.is_ours and " [synced]" or ""))
     end
 
+    -- delay mode: the corrected combination is no longer selected -> give the
+    -- user's own delay back (re-selecting it re-applies the remembered mapping)
+    if S.delay and (snap.spu ~= S.delay.spu_id or snap.audio ~= S.delay.audio_id) then
+        M.delay_stop(input, "track switch")
+    end
+    if S.sync_mode_changed then
+        S.sync_mode_changed = nil
+        M.switch_sync_mode(input, snap, sel)
+    end
+    if S.delay then M.delay_update(input, false) end
+
     if (audio_changed or spu_changed) and S.auto then
         if not sel.key then
             S.pending = nil -- subtitles disabled (or no audio): nothing to do
@@ -861,7 +1145,8 @@ function M.tick()
     if sync_now then
         if sel.key then
             -- re-syncing an already synced track: bypass the daemon's cache
-            S.pending = { due = t, key = sel.key, force = sel.is_ours and true or false,
+            local resync = sel.is_ours or (S.delay ~= nil and S.delay.key == sel.key)
+            S.pending = { due = t, key = sel.key, force = resync and true or false,
                           explicit = true, mode = sync_mode }
         else
             M.osd("SubSync: select a subtitle track first")

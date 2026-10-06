@@ -28,7 +28,14 @@ from typing import Any, Literal, Protocol
 from . import __version__
 from . import lifecycle as L
 from . import protocol as P
-from .config import DEFAULT_MODE, MODES, mode_rank, normalize_mode
+from .config import (
+    DEFAULT_MODE,
+    DEFAULT_SYNC_MODE,
+    MODES,
+    mode_rank,
+    normalize_mode,
+    normalize_sync_mode,
+)
 
 log = logging.getLogger("vlcsubsync.daemon")
 
@@ -977,6 +984,7 @@ class Daemon:
                 done.progress = 1.0
                 done.output = str(dest)
                 done.time = None
+                done.sync_mode = _sync_mode(config)  # the current setting, not the cached one
                 log.info("job %s: cache hit (mode %s)", r.id, mode)
                 writer.write(done, force=True)
                 return done
@@ -1024,6 +1032,8 @@ class Daemon:
                 offset=_float_or_none(getattr(result, "offset", None)),
                 scale=_float_or_none(getattr(result, "scale", None)),
                 confidence=_float_or_none(getattr(result, "confidence", None)),
+                segments=_segments_or_none(result),
+                sync_mode=_sync_mode(config),
             )
             writer.write(done, force=True)
             self._cache_store(key, output, done)
@@ -1183,6 +1193,21 @@ class Daemon:
                     P.Status(id=job.request.id, state="error", message="Daemon stopped"),
                 )
         self.remove_heartbeats()
+
+
+def _sync_mode(config: Any) -> str:
+    """The configured sync_mode (``track`` unless the config says ``delay``)."""
+    return normalize_sync_mode(getattr(config, "sync_mode", None)) or DEFAULT_SYNC_MODE
+
+
+def _segments_or_none(result: Any) -> list[P.MapSegment] | None:
+    """The result's mapping (``SyncResult.mapping_segments``) when it was applied."""
+    if not getattr(result, "applied", True):
+        return None
+    segs = getattr(result, "mapping_segments", None)
+    if not segs:
+        return None
+    return [s for s in segs if isinstance(s, P.MapSegment)] or None
 
 
 def _float_or_none(value: Any) -> float | None:

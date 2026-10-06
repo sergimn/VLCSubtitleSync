@@ -7,6 +7,7 @@ tolerant (ignore blank lines, comments, unknown keys, a UTF-8 BOM and CRLF endin
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import tempfile
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from .config import normalize_mode
+from .config import normalize_mode, normalize_sync_mode
 
 PROTOCOL_VERSION = 1
 
@@ -32,6 +33,10 @@ CONTROL_FILE = "control"
 INTF_STATE_FILE = "intf_state"
 
 STATES = ("queued", "running", "done", "error")
+
+# Mapping segments in a done status (see DESIGN.md "Mapping segments").
+MAX_SEGMENTS = 256
+MAX_KNOTS = 4096  # per segment
 
 _ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,128}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -188,6 +193,87 @@ def media_path_from_value(value: str) -> str:
     return value
 
 
+# --------------------------------------------------------------------------- mapping
+
+
+@dataclass(frozen=True)
+class MapSegment:
+    """One piece of the subtitle → audio mapping, in the subtitle clock (seconds):
+    ``audio = scale*sub + offset + correction(sub)`` for ``sub_start <= sub < sub_end``.
+
+    ``None`` bounds are open (the first segment starts at -inf, the last ends at
+    +inf). ``knots`` are the local refinement's ``(sub_time, seconds)`` points,
+    linearly interpolated and held flat outside (``align.Segment.knots``)."""
+
+    sub_start: float | None
+    sub_end: float | None
+    scale: float
+    offset: float
+    knots: tuple[tuple[float, float], ...] = ()
+
+    def correction(self, t: float) -> float:
+        k = self.knots
+        if not k:
+            return 0.0
+        if t <= k[0][0]:
+            return k[0][1]
+        for (x0, y0), (x1, y1) in zip(k, k[1:], strict=False):
+            if t <= x1:
+                return y0 if x1 <= x0 else y0 + (y1 - y0) * (t - x0) / (x1 - x0)
+        return k[-1][1]
+
+    def audio(self, t: float) -> float:
+        return self.scale * t + self.offset + self.correction(t)
+
+
+def _fmt_bound(x: float | None) -> str:
+    return "" if x is None or not math.isfinite(x) else f"{x:.3f}"
+
+
+def format_segment(seg: MapSegment) -> str:
+    """``<sub_start>,<sub_end>,<scale>,<offset>``; an open bound is empty."""
+    return f"{_fmt_bound(seg.sub_start)},{_fmt_bound(seg.sub_end)},{seg.scale:.7f},{seg.offset:.4f}"
+
+
+def format_knots(knots: tuple[tuple[float, float], ...]) -> str:
+    """``<sub_time>:<seconds>;...``"""
+    return ";".join(f"{t:.3f}:{c:.4f}" for t, c in knots[:MAX_KNOTS])
+
+
+def _finite(text: str) -> float | None:
+    try:
+        v = float(text)
+    except ValueError:
+        return None
+    return v if math.isfinite(v) else None
+
+
+def parse_segment(value: str, knots: str = "") -> MapSegment | None:
+    parts = [p.strip() for p in (value or "").split(",")]
+    if len(parts) != 4:
+        return None
+    lo = None if parts[0] == "" else _finite(parts[0])
+    hi = None if parts[1] == "" else _finite(parts[1])
+    scale, offset = _finite(parts[2]), _finite(parts[3])
+    if (parts[0] and lo is None) or (parts[1] and hi is None):
+        return None
+    if scale is None or offset is None or scale <= 0:
+        return None
+    if lo is not None and hi is not None and hi < lo:
+        return None
+    pts: list[tuple[float, float]] = []
+    for item in (knots or "").split(";"):
+        if not item.strip():
+            continue
+        t, sep, c = item.partition(":")
+        tv, cv = _finite(t), _finite(c)
+        if not sep or tv is None or cv is None:
+            return None
+        pts.append((tv, cv))
+    pts.sort()
+    return MapSegment(lo, hi, scale, offset, tuple(pts[:MAX_KNOTS]))
+
+
 # --------------------------------------------------------------------------- dataclasses
 
 
@@ -274,6 +360,11 @@ class Status:
     offset: float | None = None
     scale: float | None = None
     confidence: float | None = None
+    # Done + applied: the full mapping (track and delay mode), see MapSegment.
+    segments: list[MapSegment] | None = None
+    # The helper's configured sync_mode ("track" | "delay"); the VLC side uses it
+    # unless the extension's toggle wrote its own choice into <q>/control.
+    sync_mode: str | None = None
     time: float | None = None
 
     def to_dict(self) -> dict[str, object]:
@@ -295,12 +386,32 @@ class Status:
             out["scale"] = f"{self.scale:.6f}"
         if self.confidence is not None:
             out["confidence"] = f"{self.confidence:.3f}"
+        if self.segments:
+            segs = list(self.segments)[:MAX_SEGMENTS]
+            out["segments"] = len(segs)
+            for i, seg in enumerate(segs):
+                out[f"seg{i}"] = format_segment(seg)
+                if seg.knots:
+                    out[f"seg{i}_knots"] = format_knots(seg.knots)
+        sync_mode = normalize_sync_mode(self.sync_mode)
+        if sync_mode:
+            out["sync_mode"] = sync_mode
         out["time"] = int(self.time if self.time is not None else time.time())
         return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, str]) -> Status:
         applied = data.get("applied")
+        segments: list[MapSegment] | None = None
+        n = _to_int(data.get("segments"), None)
+        if n is not None and 0 < n <= MAX_SEGMENTS:
+            parsed = [
+                parse_segment(data.get(f"seg{i}", ""), data.get(f"seg{i}_knots", ""))
+                for i in range(n)
+            ]
+            # all or nothing: a partial mapping would mis-time the gaps
+            if all(p is not None for p in parsed):
+                segments = [p for p in parsed if p is not None]
         return cls(
             id=data.get("id", ""),
             state=data.get("state", "queued"),
@@ -312,6 +423,8 @@ class Status:
             offset=_to_float(data.get("offset"), None),
             scale=_to_float(data.get("scale"), None),
             confidence=_to_float(data.get("confidence"), None),
+            segments=segments,
+            sync_mode=normalize_sync_mode(data.get("sync_mode")),
             time=_to_float(data.get("time"), None),
         )
 

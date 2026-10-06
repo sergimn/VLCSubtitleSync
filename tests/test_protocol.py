@@ -217,3 +217,55 @@ def test_heartbeat_roundtrip(tmp_path):
     assert (tmp_path / "heartbeat").read_text() == "time=1000\npid=42\nversion=0.1.0\n"
     hb = P.read_heartbeat(tmp_path)
     assert hb.pid == 42 and hb.age(now=1005) == 5
+
+
+def test_status_segments_roundtrip(tmp_path):
+    segs = [
+        P.MapSegment(None, 83.71, 1.0, 2.0, ((10.0, 0.05), (60.0, -0.02))),
+        P.MapSegment(83.71, 400.0, 0.959041, 12.0),
+        P.MapSegment(400.0, None, 1.0427083, -1.5),
+    ]
+    st = P.Status(id="a_1", state="done", progress=1.0, applied=True, segments=segs,
+                  sync_mode="delay")  # fmt: skip
+    d = st.to_dict()
+    assert d["segments"] == 3
+    assert d["seg0"] == ",83.710,1.0000000,2.0000"
+    assert d["seg0_knots"] == "10.000:0.0500;60.000:-0.0200"
+    assert d["seg1"] == "83.710,400.000,0.9590410,12.0000"
+    assert d["seg2"] == "400.000,,1.0427083,-1.5000"
+    assert d["sync_mode"] == "delay"
+    P.write_status(tmp_path, st)
+    back = P.read_status(tmp_path, "a_1")
+    assert back.segments == segs and back.sync_mode == "delay"
+
+
+def test_status_without_segments_has_no_keys():
+    d = P.Status(id="a_1", state="done", segments=[]).to_dict()
+    assert "segments" not in d and "sync_mode" not in d
+    assert P.Status.from_dict({"id": "a_1"}).segments is None
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"segments": "2", "seg0": ",,1,0"},  # seg1 missing
+        {"segments": "1", "seg0": ",,0,0"},  # scale <= 0
+        {"segments": "1", "seg0": ",,1"},  # too few fields
+        {"segments": "1", "seg0": "nan,,1,0"},
+        {"segments": "1", "seg0": "5,1,1,0"},  # end before start
+        {"segments": "1", "seg0": ",,1,0", "seg0_knots": "1:x"},
+        {"segments": "9999", "seg0": ",,1,0"},
+    ],
+)
+def test_bad_segments_are_dropped_whole(data):
+    assert P.Status.from_dict({"id": "a", **data}).segments is None
+
+
+def test_map_segment_evaluates_knots():
+    s = P.MapSegment(None, None, 2.0, 1.0, ((0.0, 0.0), (10.0, 1.0)))
+    assert s.audio(-5.0) == -9.0  # flat before the first knot
+    assert s.audio(5.0) == 11.5
+    assert s.audio(20.0) == 42.0  # flat after the last knot
+    assert P.parse_segment(P.format_segment(s), P.format_knots(s.knots)) == s
+    assert P.Status.from_dict({"id": "a", "sync_mode": "Delay"}).sync_mode == "delay"
+    assert P.Status.from_dict({"id": "a", "sync_mode": "x"}).sync_mode is None

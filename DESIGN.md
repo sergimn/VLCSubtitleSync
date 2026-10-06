@@ -145,7 +145,9 @@ Lua considers the daemon alive if `os.time() - time <= 10`.
 `sync_now_mode` present in that same write becomes the request's `mode=` (absent =
 no `mode` key, i.e. the configured mode). "Sync now (exhaustive)" in the extension
 writes it; "Sync subtitles now" does not. `<q>/intf_state` (intf → extension,
-display only): `state`, `message`, `last_result`.
+display only, except `modes`): `state`, `message`, `last_result`, `modes` (the
+`sync_now_mode` values it understands; an intf from before sync modes lacks it, and
+the extension then asks for a VLC restart instead of claiming an exhaustive sync).
 
 Daemon housekeeping: delete `.req` once picked up; delete jobs/out older than 7 days.
 Result cache key = sha1(media path, size, mtime, audio_index, sub source identity,
@@ -155,6 +157,15 @@ exhaustive key, then thorough, down to the job's own mode: a result of a *more*
 thorough mode also answers a later cheaper request for the same file and tracks
 (it used at least the same evidence), never the other way round. So after
 "Sync now (exhaustive)", reopening the file reuses the exhaustive result.
+* Another mode's entry is only used if it was applied (`applied=1`). Example: an
+  exhaustive run that lost its windows to CUDA OOM and fell back to VAD with
+  `applied=0` must not block a fast sync that might succeed. The job's own mode
+  reuses unapplied results as before, so hopeless work is not redone.
+* A forced run (`force=1`) stores its result and deletes the other modes' entries
+  for the same file and tracks, so the newest forced result wins on the next open.
+* The order assumes the mode defaults. Explicit `windows=N` / `verify_windows=N` are
+  not part of the key and can make "thorough" sample less than "fast". This is
+  accepted: such settings are rare and were never in the key.
 
 ### Lua behaviour (intf)
 Loop every ~500 ms (`vlc.misc.mwait`); VLC 3 has no `should_die()` — `mwait` raises "Interrupted." when the interface is closing, which ends the loop.

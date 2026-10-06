@@ -285,7 +285,8 @@ def sync_subtitles(
     fit: AlignResult | None = None
     anchors: list[Anchor] = []
     reason = ""
-    k = config.window_count(duration)
+    # sampled-window count (sizes the adaptive budget); exhaustive mode does not sample
+    k = 0 if exhaustive else config.window_count(duration)
     windows = plan_windows(speech_sec, duration, config)
     log.info("mode %s: %d initial windows over %.0fs", mode, len(windows), duration)
 

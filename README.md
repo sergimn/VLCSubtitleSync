@@ -149,7 +149,8 @@ model_en=base.en        # Whisper model for English subtitles (tiny.en, base.en,
 model_multi=base        # model for every other language (tiny, base, small, medium, ...)
 device=auto             # auto | cpu | cuda   (auto falls back to CPU if CUDA fails)
 compute_type=int8       # CTranslate2 compute type (int8, int8_float16, float16, float32)
-windows=auto            # number of 30 s audio samples to transcribe, or auto (per mode)
+windows=auto            # number of 30 s audio samples to transcribe, or auto (per mode);
+                        # a number is ignored in exhaustive mode, which covers everything
 verify_windows=auto     # extra samples the section check may transcribe (0 = none)
 min_confidence=0.5      # below this the original timing is kept (0..1)
 threads=0               # CPU threads, 0 = automatic
@@ -164,12 +165,18 @@ starts, so restart it (or log out and in) after a change. <!-- TODO(lead): confi
 |---|---|
 | `fast` (default) | about one 30 s sample per 4 minutes (at least 8), plus a few extra samples to check each section |
 | `thorough` | about 2.5× more samples (one per ~96 s, at least 20) and a 3× larger budget for the section check |
-| `exhaustive` | the whole file in consecutive 30 s pieces, skipping the ones with no speech. All matches feed the fit, the section check and the fine-tuning |
+| `exhaustive` | the whole file in consecutive 30 s pieces, skipping the ones with no speech. All matches feed the fit and the fine-tuning. The section check uses those pieces and transcribes nothing extra |
 
 Set the default with `mode=` in `config.ini`. You can also choose a mode for one run:
 **View → SubSync → Sync now (exhaustive)** in VLC, or `vlc-subsync sync --mode …` on
 the command line. A cached exhaustive result is reused when the file is opened again,
-including by later fast syncs.
+including by later fast syncs, but only if it was applied. A forced re-sync ("Sync
+subtitles now" on an already synced track) replaces the cached results of the other
+modes, so the newest result is what you get next time.
+
+After upgrading SubSync, **restart VLC** before using "Sync now (exhaustive)". Until
+then the old interface script keeps running and can't do it. The menu says so instead
+of running a normal sync.
 
 Measured on a real 28.7 min TV episode (`--audio 0 --sub 0`). Its subtitles were timed
 for 29.97 fps, so they drift +25% and start almost 3 minutes off. Hardware: RTX 3050 Ti

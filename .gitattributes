@@ -1,0 +1,8 @@
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+*.lua text eol=lf
+*.mkv binary
+*.mka binary
+*.ico binary
+*.png binary

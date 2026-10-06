@@ -94,6 +94,7 @@ class SyncResult:
     anchors: int
     applied: bool                 # False if confidence too low → output == original timing
     message: str                  # human summary, e.g. "offset +2.35s, drift +4.1%"
+    mapping_segments: list[MapSegment]  # full mapping (protocol.MapSegment), [] if not applied
 
 def sync_subtitles(media_path: str, audio_index: int, subtitle: SubtitleSource,
                    output_path: str, config: Config,
@@ -138,18 +139,38 @@ method=whisper
 offset=2.350
 scale=1.0417
 confidence=0.93
+segments=2                             # done + applied: the whole mapping, see below
+seg0=,1200.000,1.0000000,2.3500
+seg0_knots=120.000:0.0500;240.000:-0.0200
+seg1=1200.000,,1.0000000,32.3500
+sync_mode=track                        # the helper's configured sync_mode (track|delay)
 ```
+**Mapping segments.** In the subtitle clock (seconds), segment *i* maps
+`audio = scale*sub + offset + c(sub)` for `sub_start <= sub < sub_end`:
+`seg<i>=<sub_start>,<sub_end>,<scale>,<offset>`, time-ordered, an empty bound is open
+(the first segment starts at −∞, the last ends at +∞), `sub_end` of one segment is
+`sub_start` of the next. `c` is #8's local refinement (`align.Segment.knots`, at most
+±0.5 s): `seg<i>_knots=<sub_time>:<seconds>;…`, linearly interpolated and flat outside
+the knots; absent = 0. This is exactly the mapping `retime` applies to the output file
+(except its overlap/negative-time clean-up of individual cues). At most 256 segments;
+a reader drops the whole mapping if any line is malformed. Written only when
+`applied=1`; the result cache meta stores the same keys, so a cache hit returns them.
+Track mode ignores them and still loads `output`.
 `<q>/heartbeat` (daemon): `time=<unix seconds>\npid=<pid>\nversion=<x.y.z>`; refreshed every ≤2 s.
 Lua considers the daemon alive if `os.time() - time <= 10`.
 
-`<q>/control` (extension → intf): `sync_now=<counter>`, `auto=1|0`, and optionally
-`sync_now_mode=exhaustive`. intf reacts when `sync_now` increases; the
+`<q>/control` (extension → intf): `sync_now=<counter>`, `auto=1|0`, optionally
+`sync_now_mode=exhaustive`, and `sync_mode=delay|track` once the "Experimental: no extra
+track (live delay)" toggle was used (every control write keeps it; absent = the helper's
+config decides, from the `sync_mode=` of the last done status). intf reacts when `sync_now` increases; the
 `sync_now_mode` present in that same write becomes the request's `mode=` (absent =
 no `mode` key, i.e. the configured mode). "Sync now (exhaustive)" in the extension
 writes it; "Sync subtitles now" does not. `<q>/intf_state` (intf → extension,
-display only, except `modes`): `state`, `message`, `last_result`, `modes` (the
+display only, except `modes`/`sync_modes`): `state`, `message`, `last_result`, `modes` (the
 `sync_now_mode` values it understands; an intf from before sync modes lacks it, and
-the extension then asks for a VLC restart instead of claiming an exhaustive sync).
+the extension then asks for a VLC restart instead of claiming an exhaustive sync),
+`sync_mode` (in effect), `sync_modes=track,delay` (an intf without it has no delay
+mode: the toggle asks for a restart) and `delay_active=1|0`.
 
 `<q>/launcher` (setup → intf), see "Lifecycle":
 ```
@@ -194,9 +215,75 @@ added). On `done` + `applied=1`: `vlc.input.add_subtitle(output, true)` (try pat
 `vlc.strings.make_uri(output)`), remember the new ES id(s) as "ours → source", OSD
 `"Subtitles synced: <message>"`. On error / not applied: short OSD message, keep
 original. Remember the result per (input, audio, source) so re-selecting doesn't resync.
+In delay mode (below) a done result never calls `add_subtitle`.
 OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job with
 `mode=exhaustive` (or thorough) says so in its OSD/progress text: "Syncing subtitles
 (exhaustive, may take a while)… 42% – Transcribing 20/58 (exhaustive)".
+
+### Delay mode (experimental, off by default)
+
+`sync_mode=delay` (config, or the extension toggle via `control`): instead of loading
+a synced copy, the intf keeps the user's **original** track selected and corrects it
+live through the input variable `spu-delay`. Default `track` behaviour is unchanged.
+
+VLC 3.0.x semantics (checked in the 3.0.x sources):
+* `spu-delay` and `time` are `VLC_VAR_INTEGER` in **µs** (`src/input/var.c`
+  `input_ControlVarInit`: `var_Create(p_input, "spu-delay"|"time", VLC_VAR_INTEGER)`;
+  `input.c`: initialised from `sub-delay` (1/10 s) × 100000). `vlc.var.set` takes an
+  integer (`modules/lua/libs/variables.c`), so we pass rounded µs.
+* **Positive = later**: `var.c` `EsDelayCallback` → `INPUT_CONTROL_SET_SPU_DELAY` →
+  `UpdatePtsDelay` → `es_out_SetDelay(SPU_ES)` → `EsOutDecoderChangeDelay` →
+  `input_DecoderChangeDelay`; `decoder.c` `DecoderFixTs` adds it to the subpicture's
+  start/stop (`*pi_ts0 += i_es_delay`) in `DecoderPlaySpu`, i.e. **when the subtitle is
+  decoded**, before it is queued to the vout. A subtitle already queued (or on screen)
+  keeps its timing: no redraw, no flicker; a change applies from the next decoded one.
+* **Negative values pause playback.** `input.c` `UpdatePtsDelay` adds
+  `-min(audio-delay, spu-delay)` to the input's `pts_delay`, and `clock.c`
+  `input_clock_SetJitter` only ever raises the clock's `pts_delay` ("TODO when
+  increasing -> force rebuffering"). Every new minimum shifts all output later by the
+  difference, i.e. a stall of that length; the total equals the most negative delay
+  reached. `time` (`es_out.c` `ES_OUT_SET_TIMES`) is the demux time minus the
+  buffering, i.e. the playback position.
+
+Mapping inversion, each 500 ms tick while the synced combination is selected: read
+`time` T (s). Pick the segment whose *audio-domain* span `[audio(sub_start),
+audio(sub_end))` contains T (the later one if spans overlap, i.e. a backward cut; in a
+gap, a forward cut, the upcoming one; after the end the last). Subtitle time
+`s = (T − offset)/scale`, refined by 4 fixed-point steps `s = (T − offset − c(s))/scale`
+when knots exist (c is bounded and slow); delay `d = T − s`. Because a subtitle takes
+its delay when decoded, d is evaluated at `T + lead`, `lead = 1 s + max(0, −d(T))`
+(the caching plus the extra buffering of a negative delay; measured: median error
++0.19 s without the lookahead, +0.06 s with it, same as track mode's +0.07 s). Set
+`spu-delay = round(d·1e6) + bias` when it differs from the value we last set by
+> 40 ms, at once on a seek (T moved > 2 s away from wall-clock progress), and on
+start. Every set logs `[subsync] spu-delay=<µs> us (time=<T>s seg=<i> bias=<µs>)`
+(dbg).
+
+User bias: at start `bias` = the current `spu-delay` (normally 0). If the variable
+differs from what we last set (hotkeys g/h, Track Synchronization), the difference is
+added to `bias` and kept on top of every later correction. On a switch of the
+subtitle or audio track, `spu-delay` is set back to `bias`; re-selecting the synced
+combination re-applies the remembered mapping (memo per input/audio/sub, no new
+request). A new input has a new `spu-delay` (from `sub-delay`), so nothing is restored
+on input change or stop. Toggling the mode while playing moves the result over (delay
+→ track: restore the bias, load `output`; track → delay: select the original track).
+"Sync now" with the corrected track selected forces a re-sync. A done status without
+segments (older helper) is not applied in delay mode (OSD says so). OSD on start:
+`"Subtitles synced (live delay, experimental): <message>"`, plus "– may pause playback
+up to N s in total" when the mapping needs a delay below −0.5 s over `[0, length]`.
+
+Real VLC 3.0.24 (snap) check, `tests/test_integration.py::test_vlc_delay_mode_end_to_end`
+plus a screen-recorded run (Xvfb + x11grab, testsrc video, sidecar with −4% drift):
+`spu-delay` went from +1.20 s to −5.36 s over the file; median line start error
++0.06 s (track mode +0.07 s, unsynced up to 5.2 s); total stall ≈ 5.4 s (wall clock
+minus media time), as predicted; hotkey bias (+1 s via 20×h) kept for 50 s of
+corrections, the line on screen when it changed was not redrawn or moved; when the
+bias was removed again (−1 s) the line already queued kept its +1 s start but was cut
+short (0.6 s of 1.5 s shown, cause not investigated); seeks ±60 s corrected on the next
+tick (the first `time` after a seek is ~2 s off while VLC rebuffers, so two "seek"
+sets happen). VLC prefers an installed `subsync.lua` in the user data
+dir over `VLC_DATA_PATH`, so the test installs the intf as `subsync_e2e` with its own
+queue name.
 
 ## Alignment algorithm (align.py)
 1. Decode selected audio stream → 16 kHz mono float32.
@@ -354,7 +441,8 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job w
 `mode=fast|thorough|exhaustive`, `model_en=base.en`, `model_multi=base`,
 `device=auto|cpu|cuda`, `compute_type=int8`, `windows=auto`, `verify_windows=auto`,
 `min_confidence=0.5`, `threads=0` (= `max(1, min(8, cpu_count // 2))`, leaving half
-the cores to VLC). Invalid values are ignored (default kept). The daemon loads the
+the cores to VLC), `sync_mode=track|delay` (experimental delay mode, default track;
+reported to the intf in each done status). Invalid values are ignored (default kept). The daemon loads the
 config for every job.
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 

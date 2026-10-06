@@ -67,6 +67,7 @@ M.OSD_DURATION = 3000000
 -- delay mode (experimental): see DESIGN.md "Delay mode"
 M.DELAY_TOLERANCE_US = 40000  -- re-set spu-delay when the target moved more than this
 M.SEEK_US = 2000000           -- "time" jumped this far from wall-clock progress = seek
+M.LOOKAHEAD_S = 1.0           -- see M.delay_update
 M.SYNC_MODES = { track = true, delay = true }
 
 M.execute = os.execute        -- replaceable in tests
@@ -571,6 +572,29 @@ function M.delay_at(segs, T)
     return T - s, i, s
 end
 
+-- Most negative delay over playback times [0, len] (len <= 0: unknown, then
+-- only the segment boundaries and 0 are looked at). Delays are linear within
+-- a segment (up to the small knot corrections), so the ends of each audio span
+-- are enough.
+function M.min_delay(segs, len)
+    local ts = { 0 }
+    if len and len > 0 then ts[#ts + 1] = len end
+    for _, seg in ipairs(segs) do
+        local lo, hi = audio_span(seg)
+        for _, t in ipairs({ lo, hi - 0.001 }) do
+            if t > 0 and t < math.huge and (not len or len <= 0 or t < len) then
+                ts[#ts + 1] = t
+            end
+        end
+    end
+    local m = math.huge
+    for _, t in ipairs(ts) do
+        local d = M.delay_at(segs, t)
+        if d < m then m = d end
+    end
+    return m
+end
+
 local function round(x)
     return math.floor(x + 0.5)
 end
@@ -598,8 +622,16 @@ function M.delay_start(input, snap, entry, key)
     log_info(string.format("delay mode: start (es=%s, %d segment(s), user bias %d us)",
         tostring(snap.spu), #entry.segs, S.delay.bias))
     M.delay_update(input, true)
-    M.osd("Subtitles synced (live delay, experimental): "
-        .. ((entry.message and entry.message ~= "") and entry.message or "done"))
+    local text = "Subtitles synced (live delay, experimental): "
+        .. ((entry.message and entry.message ~= "") and entry.message or "done")
+    -- every new low of a negative spu-delay pauses playback by the difference
+    local dmin = M.min_delay(entry.segs, (get_int(input, "length") or 0) / 1000000)
+    if dmin < -0.5 then
+        log_info(string.format("delay mode: needs spu-delay down to %.1f s;"
+            .. " VLC pauses playback that long in total while it gets there", dmin))
+        text = text .. string.format(" – may pause playback up to %.0f s in total", -dmin)
+    end
+    M.osd(text)
     S.state_dirty = true
 end
 
@@ -634,7 +666,13 @@ function M.delay_update(input, force)
         seek = jump > M.SEEK_US or jump < -M.SEEK_US
     end
     D.last_T, D.last_wall = T, wall
-    local d, i = M.delay_at(D.segs, T / 1000000)
+    -- A subtitle takes its delay when it is decoded, ahead of its display:
+    -- about the input caching plus any negative delay (VLC buffers that much
+    -- more) plus half our update interval. Aim at the subtitles shown then.
+    local now_s = T / 1000000
+    local d0 = M.delay_at(D.segs, now_s)
+    local lead = M.LOOKAHEAD_S + math.max(0, -d0)
+    local d, i = M.delay_at(D.segs, now_s + lead)
     local target = round(d * 1000000) + D.bias
     if force or not D.last_set or (seek and target ~= D.last_set)
         or math.abs(target - D.last_set) > M.DELAY_TOLERANCE_US then

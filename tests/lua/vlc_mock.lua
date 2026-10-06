@@ -67,7 +67,7 @@ function Mock.new(opts)
             spu = spu or {},
             -- "time" (playback position) and "spu-delay" are integers in microseconds
             sel = { ["audio-es"] = audio_sel or -1, ["spu-es"] = spu_sel or -1,
-                    ["time"] = 0, ["spu-delay"] = 0 },
+                    ["time"] = 0, ["spu-delay"] = 0, ["length"] = opts.length or 0 },
         }
         m.adds_pending = {}
     end

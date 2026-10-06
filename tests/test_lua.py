@@ -675,12 +675,26 @@ def delay_sets(hh) -> list[int]:
     return [int(v.value) for v in hh.mock.var_sets.values() if v.name == "spu-delay"]
 
 
-def expected_us(T, scale, offset):
-    return round((T - (T - offset) / scale) * 1e6)
+def expected_us(T, scale, offset, lookahead=0.0):
+    """spu-delay the intf aims at for playback time T (one linear segment): the
+    mapping's delay at T + lead, lead = lookahead + the negative part of the delay
+    (VLC decodes subtitles that much earlier)."""
+
+    def d(t):
+        return t - (t - offset) / scale
+
+    lead = lookahead + max(0.0, -d(T))
+    return round(d(T + lead) * 1e6)
 
 
-def start_delay(hh, *segs, knots=None, t0=10.0, via="control", message="offset +2.50s"):
-    """Play, sync with the given mapping in delay mode; returns the request id."""
+def start_delay(
+    hh, *segs, knots=None, t0=10.0, via="control", message="offset +2.50s", lookahead=0.0
+):
+    """Play, sync with the given mapping in delay mode; returns the request id.
+
+    The lookahead (subtitles take their delay when decoded, ahead of display) is
+    off by default so the expected values are the mapping at "time" itself."""
+    hh.S.LOOKAHEAD_S = lookahead
     if via == "control":
         hh.control(auto=1, sync_now=0, sync_mode="delay")
     hh.set_input()
@@ -716,6 +730,24 @@ def test_delay_negative_offset_sign(h):
     """Subtitles 7 s late: audio = sub - 7 -> spu-delay -7 s (earlier)."""
     start_delay(h, (None, None, 1.0, -7.0), t0=30)
     assert spu_delay(h) == -7_000_000
+    # VLC pauses playback for every new low of a negative delay: say so
+    assert any(o.endswith("may pause playback up to 7 s in total") for o in h.osd())
+    assert any("needs spu-delay down to -7.0 s" in line for line in h.logs())
+
+
+def test_delay_positive_needs_no_pause_warning(h):
+    start_delay(h, (None, None, 1.0, 2.5))
+    assert not any("may pause" in o for o in h.osd())
+
+
+def test_min_delay_over_the_file(h):
+    segs = h.S.parse_segments(h.lua.table_from(seg_status((None, None, 23.976 / 25, 1.44))))
+    # d(T) = T - (T - 1.44) / 0.959: +1.44 at 0, about -6.3 s at 182 s
+    assert h.S.min_delay(segs, 182.0) == pytest.approx(182 - (182 - 1.44) * 25 / 23.976)
+    cut = h.S.parse_segments(
+        h.lua.table_from(seg_status((None, 100.0, 1.0, 2.0), (100.0, None, 1.0, -10.0)))
+    )
+    assert h.S.min_delay(cut, 0) == pytest.approx(-10.0)
 
 
 def test_delay_follows_drift(h):
@@ -723,11 +755,13 @@ def test_delay_follows_drift(h):
     start_delay(h, (None, None, scale, offset), t0=10)
     assert abs(spu_delay(h) - expected_us(10, scale, offset)) <= 1
     values = [spu_delay(h)]
-    for T in range(11, 181):
+    for k in range(21, 361):  # 10 s .. 180 s, one tick per 0.5 s of playback
+        T = k / 2
         h.mock.set_time(T)
         h.tick()
         target = expected_us(T, scale, offset)
-        assert abs(spu_delay(h) - target) <= 40_000  # within the tolerance
+        # within the tolerance plus one tick's change (~21 ms)
+        assert abs(spu_delay(h) - target) <= 40_000 + 21_000
         values.append(spu_delay(h))
     # the delay grows (more negative) over time: -0.4 s at 10 s, -6.3 s at 180 s
     assert values[0] > -500_000 and values[-1] < -6_000_000
@@ -939,6 +973,22 @@ def test_delay_sync_now_forces_resync(h):
     h.tick(2)
     reqs = h.requests()
     assert len(reqs) == 1 and reqs[0]["force"] == "1"
+
+
+def test_delay_lookahead_aims_at_subtitles_decoded_now(h):
+    """With the lookahead, the delay is the mapping's at time + lead, where lead is
+    LOOKAHEAD_S plus the negative part of the delay (VLC decodes that much earlier)."""
+    scale, offset = 23.976 / 25, 1.44
+    start_delay(h, (None, None, scale, offset), t0=100, lookahead=1.0)
+    assert spu_delay(h) == expected_us(100, scale, offset, lookahead=1.0)
+    plain = 100 - (100 - offset) / scale  # about -2.8 s at 100 s
+    assert spu_delay(h) < round(plain * 1e6) - 150_000  # aimed ~3.8 s ahead
+    assert h.S.LOOKAHEAD_S == 1.0
+
+
+def test_delay_default_lookahead():
+    src = INTF.read_text(encoding="utf-8")
+    assert "M.LOOKAHEAD_S = 1.0" in src
 
 
 def test_parse_segments_rejects_bad_input(h):

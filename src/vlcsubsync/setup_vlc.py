@@ -510,7 +510,8 @@ def cleanup_legacy_snap_vlcrc(ctx: Context, inst: VlcInstall) -> None:
 
     Those versions edited ~/snap/vlc/current/.config/vlc/vlcrc, but the snap launcher
     passes --config=~/snap/vlc/common/vlcrc. Only files carrying our state marker are
-    touched; a vlcrc we created ourselves is removed entirely.
+    touched. A vlcrc we created ourselves is removed only if, after reverting our keys,
+    no active settings remain (the user or VLC may have added some since).
     """
     if inst.kind != "snap":
         return
@@ -522,13 +523,23 @@ def cleanup_legacy_snap_vlcrc(ctx: Context, inst: VlcInstall) -> None:
     state = P.read_kv(legacy.state_file) or {}
     ctx.info(f"cleaning up settings from an earlier version in {legacy.vlcrc}")
     unconfigure_vlcrc(ctx, legacy)
-    if (
-        state.get("created_vlcrc") == "1"
-        and legacy.vlcrc.exists()
-        and ctx.do(f"remove {legacy.vlcrc}")
-    ):
+    if state.get("created_vlcrc") != "1" or not legacy.vlcrc.exists():
+        return
+    if ctx.dry_run:
+        ctx.do(f"remove {legacy.vlcrc} if no other settings remain")
+        return
+    if _has_active_settings(_read_text(legacy.vlcrc)):
+        ctx.info(f"keeping {legacy.vlcrc}: it now contains other settings")
+        return
+    if ctx.do(f"remove {legacy.vlcrc}"):
         with contextlib.suppress(OSError):
             legacy.vlcrc.unlink()
+
+
+def _has_active_settings(text: str) -> bool:
+    """True if a vlcrc has any `key=value` line that isn't commented out."""
+    _bom, lines, _nl = _split_lines(text)
+    return any("=" in ln and not ln.lstrip().startswith(("#", ";", "[")) for ln in lines)
 
 
 # --------------------------------------------------------------------------- Lua scripts

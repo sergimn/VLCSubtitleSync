@@ -456,3 +456,62 @@ def test_setup_cleans_legacy_snap_vlcrc(tmp_path):
     text = (fs.home / "snap/vlc/common/vlcrc").read_text(encoding="utf-8")
     assert active(text, "extraintf") == ["luaintf"]
     assert active(text, "lua-intf") == ["subsync"]
+
+
+def _legacy_snap(fs, text, *, created, marker=True):
+    (fs.home / "snap/vlc/current").mkdir(parents=True, exist_ok=True)
+    d = fs.home / "snap/vlc/current/.config/vlc"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "vlcrc").write_text(text, encoding="utf-8")
+    if marker:
+        (d / "vlcrc.subsync-state").write_text(
+            f"added_luaintf=1\nprevious_lua_intf=\ncreated_vlcrc={int(created)}\n",
+            encoding="utf-8",
+        )
+    return d / "vlcrc"
+
+
+OURS = "[core]\nextraintf=luaintf\n[lua]\nlua-intf=subsync\n"
+
+
+def test_legacy_created_vlcrc_with_user_settings_is_kept(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    legacy = _legacy_snap(fs, OURS + "[core]\nvolume=200\n", created=True)
+    assert S.run_setup(fs.ctx(), model=False, autostart=False) == 0
+    text = legacy.read_text(encoding="utf-8")
+    assert "volume=200" in text
+    assert active(text, "lua-intf") == []  # our settings are reverted all the same
+
+
+def test_legacy_not_created_by_us_is_reverted_not_removed(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    legacy = _legacy_snap(fs, OURS, created=False)
+    assert S.run_setup(fs.ctx(), model=False, autostart=False) == 0
+    assert legacy.exists()
+    assert active(legacy.read_text(encoding="utf-8"), "lua-intf") == []
+
+
+def test_legacy_without_marker_is_untouched(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    legacy = _legacy_snap(fs, OURS, created=True, marker=False)
+    assert S.run_setup(fs.ctx(), model=False, autostart=False) == 0
+    assert legacy.read_text(encoding="utf-8") == OURS
+
+
+def test_legacy_cleanup_dry_run_touches_nothing(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    legacy = _legacy_snap(fs, OURS, created=True)
+    ctx = fs.ctx()
+    ctx.dry_run = True
+    assert S.run_setup(ctx, model=False, autostart=False) == 0
+    assert legacy.read_text(encoding="utf-8") == OURS
+    assert (legacy.parent / "vlcrc.subsync-state").exists()
+    assert not (fs.home / "snap/vlc/common/vlcrc").exists()
+
+
+def test_uninstall_cleans_legacy_snap_vlcrc(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    legacy = _legacy_snap(fs, OURS, created=True)
+    assert S.run_uninstall(fs.ctx()) == 0
+    assert not legacy.exists()
+    assert not (legacy.parent / "vlcrc.subsync-state").exists()

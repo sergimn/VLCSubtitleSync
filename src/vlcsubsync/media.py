@@ -212,6 +212,9 @@ class _AudioBuffer:
 
 # Mid-stream timestamp jumps smaller than this are treated as jitter (MKV stores ms).
 PTS_TOLERANCE = 0.05
+# Mid-stream jumps larger than this are timestamp discontinuities (MPEG-TS rollover,
+# concatenated files, bad muxes), not real gaps: the frame is kept contiguous.
+MAX_PTS_JUMP = 30.0
 
 
 class _AudioAssembler:
@@ -221,7 +224,8 @@ class _AudioAssembler:
     the container start). Frames are normally laid end to end; when a frame's pts says
     it starts more than :data:`PTS_TOLERANCE` after the end of the previous one the gap
     is filled with silence, and when it starts earlier (overlap) the overlapping
-    samples are dropped. The first frame is placed exactly: leading silence is inserted
+    samples are dropped; jumps above :data:`MAX_PTS_JUMP` are ignored (the frame stays
+    contiguous). The first frame is placed exactly: leading silence is inserted
     if it starts after t=0, and audio before t=0 is trimmed.
     """
 
@@ -246,6 +250,13 @@ class _AudioAssembler:
         expected = 0.0 if self.cursor is None else self.cursor
         tol = 0.5 / SAMPLE_RATE if self.cursor is None else PTS_TOLERANCE
         delta = t - expected
+        if self.cursor is not None and abs(delta) > MAX_PTS_JUMP:
+            log.warning(
+                "audio timestamp jump of %+.1f s at %.1f s; treating it as a discontinuity",
+                delta,
+                expected,
+            )
+            delta = 0.0
         if delta > tol:  # gap: flush what is buffered, then pad with silence
             self._flush()
             self.drop = 0

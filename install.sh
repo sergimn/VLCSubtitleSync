@@ -75,7 +75,7 @@ UV="$(find_uv || true)"
 if [ "$ACTION" = uninstall ]; then
     say "Uninstalling SubSync"
     [ -n "$UV" ] || die "uv not found; nothing to uninstall?"
-    BIN_DIR="$("$UV" tool dir --bin 2>/dev/null || true)"
+    BIN_DIR="$("$UV" tool dir --bin --color never 2>/dev/null || true)"
     if [ -n "$BIN_DIR" ] && [ -x "$BIN_DIR/vlc-subsync" ]; then
         "$BIN_DIR/vlc-subsync" uninstall "$@" || warn "vlc-subsync uninstall reported problems"
     elif command -v vlc-subsync >/dev/null 2>&1; then
@@ -108,7 +108,7 @@ fi
 say "Installing vlc-subsync with Python $PYVER (this downloads ~200 MB the first time)"
 "$UV" tool install --force --python "$PYVER" "$SPEC" || die "package installation failed"
 
-BIN_DIR="$("$UV" tool dir --bin)"
+BIN_DIR="$("$UV" tool dir --bin --color never)"
 EXE="$BIN_DIR/vlc-subsync"
 [ -x "$EXE" ] || die "vlc-subsync was not found in $BIN_DIR after installation"
 

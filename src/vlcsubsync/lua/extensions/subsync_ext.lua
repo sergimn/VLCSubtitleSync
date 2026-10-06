@@ -60,7 +60,7 @@ local function join(dir, name)
 end
 
 local function one_line(s)
-    return (tostring(s or ""):gsub("[%c]", " "))
+    return (tostring(s or ""):gsub("[\1-\31\127]", " "))
 end
 
 local function trim(s)

@@ -563,17 +563,19 @@ def ext(runtime, tmp_path):
     return Harness(runtime, tmp_path, EXT)
 
 
-def write_intf_state(hh: Harness, age=0, state="idle", last_result=""):
-    write_kv(
-        hh.q / "intf_state",
-        {
-            "time": int(time.time()) - age,
-            "state": state,
-            "message": "",
-            "last_result": last_result,
-            "auto": 1,
-        },
-    )
+def write_intf_state(
+    hh: Harness, age=0, state="idle", last_result="", modes="fast,thorough,exhaustive"
+):
+    data = {
+        "time": int(time.time()) - age,
+        "state": state,
+        "message": "",
+        "last_result": last_result,
+        "auto": 1,
+    }
+    if modes is not None:  # None: an intf from before sync modes
+        data["modes"] = modes
+    write_kv(hh.q / "intf_state", data)
 
 
 def test_ext_descriptor_and_menu(ext):
@@ -646,6 +648,25 @@ def test_ext_sync_now_exhaustive_signals_running_intf(ext):
     ext.lua.eval("trigger_menu(1)")
     assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "2"}
     assert ext.requests() == []
+
+
+def test_ext_exhaustive_with_old_intf_asks_for_restart(ext):
+    """A pre-modes intf (still running after an upgrade) would ignore sync_now_mode."""
+    write_intf_state(ext, modes=None)
+    ext.control(auto=1, sync_now=4)
+    ext.lua.eval("trigger_menu(2)")
+    assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "4"}  # untouched
+    assert ext.requests() == []
+    assert "Restart VLC" in ext.mock.last_dialog.widgets[1].text
+    assert not any("may take a while" in o for o in ext.osd())
+    # the plain item still works through that intf
+    ext.lua.eval("trigger_menu(1)")
+    assert parse_kv(ext.q / "control")["sync_now"] == "5"
+
+
+def test_intf_state_advertises_modes(h):
+    h.tick()
+    assert h.intf_state()["modes"].split(",") == ["fast", "thorough", "exhaustive"]
 
 
 def test_ext_fallback_exhaustive_request(ext):

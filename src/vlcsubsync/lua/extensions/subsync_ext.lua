@@ -401,10 +401,29 @@ end
 
 ---------------------------------------------------------------- actions
 
+-- True if the running intf (its intf_state `st`) understands sync_now_mode=`mode`.
+-- Interface scripts from before sync modes do not write the `modes` key.
+function E.intf_supports(st, mode)
+    local modes = st and st.modes
+    if not modes then return false end
+    for m in modes:gmatch("[^,%s]+") do
+        if m == mode then return true end
+    end
+    return false
+end
+
 -- `mode`: nil/"" = the helper's configured mode, or "exhaustive".
 function E.sync_now(mode)
     local exhaustive = mode == E.EXHAUSTIVE
-    local _, i_alive = E.intf_status()
+    local st, i_alive = E.intf_status()
+    if i_alive and mode and mode ~= "" and not E.intf_supports(st, mode) then
+        -- An interface script from before sync modes (still running after an
+        -- upgrade, until VLC restarts) would ignore sync_now_mode and run a normal
+        -- sync; a request of our own would race with it over the loaded track.
+        E.show_status("The running SubSync interface script is from an older version"
+            .. " and cannot run a " .. mode .. " sync. Restart VLC, then try again.")
+        return
+    end
     if i_alive then
         local c = E.read_control()
         local n = (tonumber(c.sync_now) or 0) + 1

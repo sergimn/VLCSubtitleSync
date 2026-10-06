@@ -297,6 +297,8 @@ function M.write_state(force)
         { "media", S.media_path or "" },
         { "job", S.job and S.job.id or "" },
         { "daemon", S.hb_alive and 1 or 0 },
+        -- sync_now_mode values this intf understands (older intfs lack the key)
+        { "modes", "fast,thorough,exhaustive" },
     })
     if ok then
         S.state_written = t

@@ -7,6 +7,8 @@
 #   VLC_SUBSYNC_SOURCE     package source (default: GitHub main branch archive);
 #                          may be a local checkout directory for testing
 #   VLC_SUBSYNC_PYTHON     Python version (default 3.12)
+#   VLC_SUBSYNC_MIN_AGE_DAYS  only install dependency releases at least this many
+#                          days old (default 14, supply-chain protection; 0 disables)
 #   VLC_SUBSYNC_UNINSTALL  set to 1 to uninstall (for `irm | iex`, which takes no args)
 
 param(
@@ -20,6 +22,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $DefaultSource = 'https://github.com/sergimn/VLCSubtitleSync/archive/refs/heads/main.zip'
 $Source = if ($env:VLC_SUBSYNC_SOURCE) { $env:VLC_SUBSYNC_SOURCE } else { $DefaultSource }
 $PyVer = if ($env:VLC_SUBSYNC_PYTHON) { $env:VLC_SUBSYNC_PYTHON } else { '3.12' }
+$MinAgeDays = if ($null -ne $env:VLC_SUBSYNC_MIN_AGE_DAYS -and $env:VLC_SUBSYNC_MIN_AGE_DAYS -ne '') { $env:VLC_SUBSYNC_MIN_AGE_DAYS } else { '14' }
 if ($env:VLC_SUBSYNC_UNINSTALL -eq '1') { $Uninstall = $true }
 if (-not $SetupArgs) { $SetupArgs = @() }
 
@@ -85,8 +88,19 @@ function Invoke-Main {
         $spec = 'vlc-subsync @ ' + ([System.Uri]$abs).AbsoluteUri
     }
 
+    # Supply-chain protection: ignore dependency releases newer than $MinAgeDays days,
+    # so a freshly published malicious version can't reach users before it's noticed.
+    # uv records the cutoff in the tool receipt, so 'uv tool upgrade' keeps honouring it.
+    if ($MinAgeDays -notmatch '^[0-9]+$') { Fail 'VLC_SUBSYNC_MIN_AGE_DAYS must be a whole number of days' }
+    $installArgs = @('tool', 'install', '--force', '--python', $PyVer)
+    if ([int]$MinAgeDays -gt 0) {
+        $cutoff = (Get-Date).ToUniversalTime().AddDays(-[int]$MinAgeDays).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture)
+        Say "Using only dependency releases published before $cutoff ($MinAgeDays days ago)"
+        $installArgs += @('--exclude-newer', $cutoff)
+    }
+
     Say "Installing vlc-subsync with Python $PyVer (this downloads ~200 MB the first time)"
-    & $uv tool install --force --python $PyVer $spec
+    & $uv @installArgs $spec
     if ($LASTEXITCODE -ne 0) { Fail 'package installation failed' }
 
     $bin = Get-ToolBinDir $uv

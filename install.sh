@@ -12,12 +12,16 @@
 #   VLC_SUBSYNC_SOURCE   package source (default: GitHub main branch archive);
 #                        may be a local checkout directory or archive for testing
 #   VLC_SUBSYNC_PYTHON   Python version for the tool environment (default 3.12)
+#   VLC_SUBSYNC_MIN_AGE_DAYS
+#                        only install dependency releases at least this many days
+#                        old (default 14, supply-chain protection; 0 disables)
 
 set -eu
 
 DEFAULT_SOURCE="https://github.com/sergimn/VLCSubtitleSync/archive/refs/heads/main.zip"
 SOURCE="${VLC_SUBSYNC_SOURCE:-$DEFAULT_SOURCE}"
 PYVER="${VLC_SUBSYNC_PYTHON:-3.12}"
+MIN_AGE_DAYS="${VLC_SUBSYNC_MIN_AGE_DAYS:-14}"
 ACTION=install
 
 if [ -t 1 ]; then
@@ -105,8 +109,30 @@ if [ -e "$SOURCE" ]; then
     SPEC="vlc-subsync @ file://$ABS"
 fi
 
+# Supply-chain protection: ignore dependency releases newer than MIN_AGE_DAYS, so a
+# freshly published malicious version can't reach users before it's noticed. uv
+# records the cutoff in the tool receipt, so 'uv tool upgrade' keeps honouring it.
+case "$MIN_AGE_DAYS" in
+    '' | *[!0-9]*) die "VLC_SUBSYNC_MIN_AGE_DAYS must be a whole number of days" ;;
+esac
+AGE_ARGS=""
+if [ "$MIN_AGE_DAYS" -gt 0 ]; then
+    CUTOFF_EPOCH=$(( $(date -u +%s) - MIN_AGE_DAYS * 86400 ))
+    # GNU/busybox date take -d @epoch; BSD/macOS date takes -r epoch.
+    CUTOFF="$(date -u -d "@$CUTOFF_EPOCH" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+        || date -u -r "$CUTOFF_EPOCH" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
+        || die "cannot compute the dependency age cutoff (set VLC_SUBSYNC_MIN_AGE_DAYS=0 to skip)"
+    AGE_ARGS="$CUTOFF"
+    say "Using only dependency releases published before $CUTOFF ($MIN_AGE_DAYS days ago)"
+fi
+
 say "Installing vlc-subsync with Python $PYVER (this downloads ~200 MB the first time)"
-"$UV" tool install --force --python "$PYVER" "$SPEC" || die "package installation failed"
+if [ -n "$AGE_ARGS" ]; then
+    "$UV" tool install --force --python "$PYVER" --exclude-newer "$AGE_ARGS" "$SPEC" \
+        || die "package installation failed"
+else
+    "$UV" tool install --force --python "$PYVER" "$SPEC" || die "package installation failed"
+fi
 
 BIN_DIR="$("$UV" tool dir --bin --color never)"
 EXE="$BIN_DIR/vlc-subsync"

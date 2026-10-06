@@ -44,6 +44,10 @@ The installer finds VLC wherever it is installed: the regular system package, th
 Linux **snap** and **flatpak**, the macOS app and the Windows installer. Your existing
 VLC settings are kept. Before it changes `vlcrc` it saves a backup copy next to it.
 
+For supply-chain safety the installer only uses dependency releases that are at least
+**14 days old**, so a freshly published malicious version can't reach you before it's
+noticed. Set `VLC_SUBSYNC_MIN_AGE_DAYS` to change the window (`0` turns it off).
+
 ## Usage
 
 Open a video and choose a subtitle track (embedded, or a `.srt`/`.ass`/`.vtt` file next

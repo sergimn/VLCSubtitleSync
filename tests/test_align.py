@@ -443,12 +443,12 @@ def _align_full(synth, transform, duration=45 * 60, seed=1, budget=4, use_speech
     def probe(centre, near):
         nonlocal anchors
         if len(probes) >= budget or any(abs(s + 15 - centre) <= near for s, _w in windows):
-            return anchors
+            return anchors, False
         st = max(0.0, min(duration - 30.0, centre - 15.0))
         probes.append(st)
         windows.append((st, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)))
         anchors = find_anchors(tok, windows)
-        return anchors
+        return anchors, True
 
     truth = np.array([transform(c.start) for c in cues])
     keep = truth >= 0
@@ -625,11 +625,11 @@ def test_short_segment_from_one_biased_window_is_folded(synth):
         nonlocal anchors
         st = max(0.0, centre - 15.0)
         if len(probes) >= 2 or any(abs(s + 15 - centre) <= near for s, _w in windows):
-            return anchors
+            return anchors, False
         probes.append(st)
         windows.append((st, transcribe(st)))
         anchors = find_anchors(tok, windows)
-        return anchors
+        return anchors, True
 
     out, _anchors = subdivide(fit, anchors, cues, probe, None, 0.01, len(windows))
     assert len(probes) == 1 and not 60.0 <= probes[0] <= 90.0  # away from the bad window
@@ -637,3 +637,195 @@ def test_short_segment_from_one_biased_window_is_folded(synth):
     assert [(s.scale, s.offset) for s in out.mapping.segments] == pytest.approx(
         [(1.0, 2.0)], abs=0.05
     )
+
+
+@pytest.mark.parametrize("length", [200.0, 330.0])  # fold path (< 2x120 s) / main loop
+@pytest.mark.parametrize("budget", [0, 3])
+def test_genuine_short_cut_section_survives_verification(synth, length, budget):
+    """An inserted scene: the subtitles are 12 s off for one short section that holds
+    under 10% of the anchors. Windows 12 s off the neighbours' line are disagreement,
+    not missing evidence, so neither the merge, the whole-range repair nor the fold
+    may swallow the section. A small 0.6 s step earlier in the file makes the
+    verification split there, so the merge loop runs (it used to merge the section
+    away: its windows had no candidates within 2 s and counted as "unknown")."""
+    from vlcsubsync.align import AlignResult
+
+    a, b = 1300.0, 1300.0 + length
+
+    def f(t):
+        return t + 14.6 if a <= t < b else (t + 2.0 if t < 500 else t + 2.6)
+
+    duration = 40 * 60
+    script = synth.script(duration - 30, seed=1)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    fake = synth.FakeTranscriber(synth.speech_spans(script, f))
+    # dense windows elsewhere, two inside the section (one alone is an outlier to
+    # fit_mapping, which is right: one window's timestamps can be off on their own)
+    starts = [st for st in (30.0 + 100.0 * i for i in range(24)) if not a - 40 < st < b + 20]
+    starts += [a + 14.0 + 10.0, b + 14.0 - 45.0]
+    windows = [(st, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)) for st in starts]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    fit = fit_mapping(anchors, cues, None, n_windows=len(windows))
+    assert [s.offset for s in fit.mapping.segments] == pytest.approx([2.6, 14.6, 2.6], abs=0.2)
+    tokens = {(x.window, x.token) for x in anchors}
+    inside = {(x.window, x.token) for x in anchors if a <= x.sub_time < b}
+    assert len(inside) < 0.1 * len(tokens)
+    probes = []
+
+    def probe(centre, near):
+        nonlocal anchors
+        if len(probes) >= budget or any(abs(s + 15 - centre) <= near for s, _w in windows):
+            return anchors, False
+        st = max(0.0, min(duration - 30.0, centre - 15.0))
+        probes.append(st)
+        windows.append((st, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)))
+        anchors = find_anchors(tok, windows)
+        return anchors, True
+
+    out, _ = subdivide(fit, anchors, cues, probe, None, 0.01, len(windows))
+    assert isinstance(out, AlignResult)
+    segs = out.mapping.segments
+    assert [s.offset for s in segs] == pytest.approx([2.0, 2.6, 14.6, 2.6], abs=0.2)
+    assert a - 60 < segs[2].start < a + 60 and b - 60 < segs[3].start < b + 60
+    assert out.details["verify_splits"] >= 1  # the merge loop did run
+    assert out.details.get("verify_folded", 0) == 0
+
+
+def test_probe_without_evidence_is_not_verification(synth):
+    """Probe windows on music or silence add no anchors: the probe is retried at other
+    positions while the budget lasts, and a segment whose windows have no coherent
+    evidence is left unverified (and reported), not counted as verified."""
+    from vlcsubsync.align import AlignResult
+
+    duration = 30 * 60
+    script = synth.script(duration - 30, seed=1)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    fake = synth.FakeTranscriber(synth.speech_spans(script, lambda t: t + 2.0))
+    garbage = synth.FakeTranscriber(synth.speech_spans(script, lambda t: t + 2.0), garbage=True)
+
+    def transcribe(st):  # real speech before 900 s; music (garbage words) after
+        t = fake if st < 900 else garbage
+        return t.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)
+
+    windows = [(st, transcribe(st)) for st in (60.0, 300.0, 600.0, 1000.0, 1300.0, 1600.0)]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    mapping = Mapping([Segment(-math.inf, 1.0, 2.0, 100), Segment(950.0, 1.0, 2.0, 0)])
+    fit = AlignResult(mapping, "whisper", 0.9, 100, len(anchors))
+    probes = []
+
+    def probe(centre, near):  # every probe lands on silence
+        if len(probes) >= 3:
+            return anchors, False
+        probes.append(centre)
+        return anchors, True
+
+    out, _ = subdivide(fit, anchors, cues, probe, None, 0.01, len(windows))
+    assert len(probes) == 3  # retried at other positions until the budget ran out
+    assert out.details["verify_empty_probes"] == 3
+    assert out.details["verify_unverified"] >= 1  # the music-only segment
+    assert out.mapping == mapping  # left as it was
+
+
+def _dense_cues_and_anchors(bias, spacing=0.5, duration=1200.0, offset=2.0):
+    """A cue every ``spacing`` s (``0.8 * spacing`` long), one anchor per cue at
+    ``offset + bias(t)`` s, one window per 30 s."""
+    cues, anchors = [], []
+    for i, t in enumerate(np.arange(5.0, duration, spacing)):
+        t = float(t)
+        cues.append(Cue(t, t + 0.8 * spacing, f"w{i}"))
+        anchors.append(Anchor(t, t + offset + bias(t), 1.0, int(t // 30), i, i))
+    return cues, anchors
+
+
+def test_refinement_total_correction_is_bounded(synth):
+    """Steps 1 (per-segment median), 2 (speech onsets) and 3 (wobble) each have their own
+    bound; together they used to reach ~1.4 s. The total relative to the fitted line is
+    bounded by max_shift."""
+    cues, anchors = _dense_cues_and_anchors(lambda t: 0.45 + 0.3 * math.sin(t / 150.0))
+    res = 0.01
+    speech = np.zeros(int(1300 / res), dtype=bool)
+    for c in cues[::4]:  # speech starts another 0.35 s later than the anchors say
+        on = c.start + 2.0 + 0.45 + 0.35
+        speech[int(on / res) : int((on + 1.0) / res)] = True
+    fitted = Mapping([Segment(-math.inf, 1.0, 2.0)])
+    m, info = refine_local(fitted, anchors, cues, speech, res)
+    t = np.linspace(0, 1250, 5001)
+    corr = m.map_array(t) - fitted.map_array(t)
+    assert np.abs(corr).max() <= 0.5 + 1e-6
+    assert info["max_correction"] <= 0.5 + 1e-6
+    assert corr.max() > 0.4  # it did correct, up to the bound
+
+
+@pytest.mark.parametrize("wobble", [True, False])
+def test_refinement_is_continuous_at_segment_boundaries(wobble):
+    """Two segments with the same fitted line at the boundary; the anchors pull the
+    first one +0.4 s and the second -0.4 s. Independent per-segment shifts made the
+    mapping jump back 0.8 s at the boundary, and retime squeezed the cues before it
+    into 0.2 s flashes. The correction is continuous: no reordering, no flashes."""
+    cues, anchors = _dense_cues_and_anchors(lambda t: 0.4 if t < 600 else -0.4)
+    fitted = Mapping([Segment(-math.inf, 1.0, 2.0), Segment(600.0, 1.0, 2.0)])
+    m, _info = refine_local(fitted, anchors, cues, None, 0.01, wobble=wobble)
+    eps = 1e-6
+    assert m(600.0 - eps) == pytest.approx(m(600.0), abs=1e-3)  # continuous
+    times = [(c.start, c.end) for c in cues]
+    out = retime(times, m)
+    starts = [s for s, _e in out]
+    assert starts == sorted(starts)
+    durs = np.array([e - s for s, e in out])
+    assert durs.min() > 0.3  # cues are 0.4 s long; no 0.2 s flashes
+    # away from the boundary each segment still gets its own correction
+    assert m(100.0) - fitted(100.0) == pytest.approx(0.4, abs=0.05)
+    assert m(1100.0) - fitted(1100.0) == pytest.approx(-0.4, abs=0.05)
+
+
+def test_genuine_backward_cut_still_jumps():
+    """Continuity is only for the correction: a fitted backward cut keeps its jump."""
+    cues, anchors = _dense_cues_and_anchors(lambda t: 0.0 if t < 600 else -5.0)
+    fitted = Mapping([Segment(-math.inf, 1.0, 2.0), Segment(600.0, 1.0, -3.0)])
+    m, _info = refine_local(fitted, anchors, cues, None, 0.01)
+    assert m(600.0) - m(600.0 - 1e-6) == pytest.approx(-5.0, abs=0.05)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_snap_tolerates_per_window_timestamp_bias(seed):
+    """Real Whisper windows each carry a shared timestamp bias (~0.2-0.4 s): the free
+    slope through 12 such windows is off the exact NTSC ratio by a few 1e-4, which is
+    within its standard error, so the exact ratio is kept."""
+    from vlcsubsync.align import _snap_scale
+
+    rng = np.random.default_rng(seed)
+    xs, ys, wins = [], [], []
+    for k in range(12):
+        x = 60.0 + 130.0 * k + np.sort(rng.uniform(0, 24, 40))
+        bias = rng.normal(0, 0.3)
+        xs.append(x)
+        ys.append(1.25 * x + 0.3 + bias + rng.normal(0, 0.25, x.size))
+        wins.append(np.full(x.size, k))
+    x, y, win = np.concatenate(xs), np.concatenate(ys), np.concatenate(wins)
+    w = np.ones_like(x)
+    s_free = float(np.polyfit(x, y, 1)[0])
+    s, _o = _snap_scale(x, y, w, s_free, float(np.median(y - s_free * x)), win)
+    assert s == 1.25
+
+
+def test_24_vs_23976_is_not_snapped_away(synth):
+    """24/23.976 (+0.1%) stays distinguishable from 1.0 on clean data."""
+    fit, err = _align(synth, lambda t: t * 24 / 23.976 + 1.0)
+    assert fit.mapping.segments[0].scale == pytest.approx(24 / 23.976, abs=1e-5)
+    _assert_accurate(err)
+
+
+@pytest.mark.parametrize("period,phase", [(1200, 1.3), (1800, 0.0), (1800, 2.2), (900, 4.0)])
+def test_wobble_periods_and_phases_not_chopped(synth, period, phase):
+    """Verification must leave smooth wobble to local refinement, whatever its period
+    and phase (no extra segments), and refinement must improve it."""
+
+    def f(t):
+        return t + 3.0 + 0.3 * math.sin(2 * math.pi * t / period + phase)
+
+    err0, fit, err, _probes = _align_full(synth, f)
+    assert len(fit.mapping.segments) == 1
+    assert np.median(err) < 0.1
+    assert np.percentile(err, 95) < np.percentile(err0, 95)

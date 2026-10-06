@@ -355,23 +355,25 @@ def sync_subtitles(
         # window there if none is near, within a budget), split where it disagrees.
         verify_left = config.verify_budget(duration)
 
-        def verify_probe(centre: float, near: float) -> list[Anchor]:
+        def verify_probe(centre: float, near: float) -> tuple[list[Anchor], bool]:
+            """Transcribe a window near ``centre`` unless one is within ``near`` s or the
+            budget is spent; returns (anchors, whether a window was transcribed)."""
             nonlocal anchors, verify_left, planned
             if verify_left <= 0 or not 0.0 <= centre <= duration:
-                return anchors
+                return anchors, False
             if any(abs(st + 0.5 * WINDOW_SECONDS - centre) <= near for st, _w in transcribed):
-                return anchors
+                return anchors, False
             taken = [st for st, _w in transcribed]
             lo = max(0.0, centre - near)
             hi = min(duration, centre + near)
             new = pick_windows(speech_sec, duration, 1, ranges=[(lo, hi)], taken=taken)
             if not new:
-                return anchors
+                return anchors, False
             verify_left -= len(new)
             planned += len(new)
             run_windows(new)
             anchors = find_anchors(sub_tok, transcribed)
-            return anchors
+            return anchors, True
 
         if fit.anchors >= MIN_WHISPER_ANCHORS:
             n_before = len(transcribed)

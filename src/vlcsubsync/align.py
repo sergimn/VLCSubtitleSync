@@ -400,6 +400,21 @@ def _window_medians(r: np.ndarray, win: np.ndarray) -> np.ndarray:
     return np.array([np.median(r[m & (win == k)]) for k in np.unique(win[m])])
 
 
+def _slope_se(x: np.ndarray, r: np.ndarray, win: np.ndarray) -> float:
+    """Standard error of a line's slope when each window is one noisy observation
+    (its words share a timestamp bias): robust spread of the per-window median
+    residuals over sqrt(windows) x spread of the window positions."""
+    m = np.abs(r) < INLIER_THRESHOLD
+    ks = np.unique(win[m])
+    if ks.size < 4:
+        return 0.0
+    d = np.array([np.median(r[m & (win == k)]) for k in ks])
+    xw = np.array([np.median(x[m & (win == k)]) for k in ks])
+    spread = max(1.4826 * float(np.median(np.abs(d - np.median(d)))), 0.03)
+    sx = float(np.std(xw))
+    return spread / (math.sqrt(ks.size) * sx) if sx > 0 else 0.0
+
+
 def _snap_scale(x, y, w, s, o, win=None) -> tuple[float, float]:
     """Snap a free-fit scale to a known framerate ratio if it is very close and the fit
     does not get worse: per anchor, or per transcription window when ``win`` is given
@@ -420,6 +435,10 @@ def _snap_scale(x, y, w, s, o, win=None) -> tuple[float, float]:
                 d1 = _window_medians(r1, win)
                 d2 = _window_medians(r2, win)
                 if d1.size >= 4 and np.median(np.abs(d2)) <= np.median(np.abs(d1)) + 0.02:
+                    return s2, o2
+                # ... or the free slope is within 2 standard errors of the ratio, the
+                # error estimated from the spread of the per-window medians
+                if d1.size >= 4 and abs(s - cand) <= 2.0 * _slope_se(x, r1, win):
                     return s2, o2
     return s, o
 
@@ -781,21 +800,34 @@ def fit_mapping(
 def _fit_stats(mapping: Mapping, arr: _AnchorArrays, n_windows: int):
     """Confidence and statistics of ``mapping`` against the anchors: one vote per
     transcript token (its candidates are alternatives), so repeated phrases do not
-    dilute the inlier ratio. Returns ``(confidence, inliers, groups, median, details)``.
+    dilute the inlier ratio. ``n_windows`` = windows transcribed before verification.
+    Returns ``(confidence, inliers, groups, median, details)``.
     """
     x = arr.x_for(mapping)
     y, w, win, grp = arr.y, arr.w, arr.win, arr.grp
-    res = np.abs(y - mapping.map_array(x))
+    signed = y - mapping.map_array(x)
+    res = np.abs(signed)
     inl = res < INLIER_THRESHOLD
     n_groups = int(grp.max()) + 1
     g_weight = np.bincount(grp, weights=w, minlength=n_groups)
     g_in = np.bincount(grp, weights=inl.astype(float), minlength=n_groups) > 0
     n_in = int(g_in.sum())
     ratio = float(g_weight[g_in].sum() / g_weight.sum()) if g_weight.sum() > 0 else 0.0
-    med = float(np.median(res[inl])) if inl.any() else 99.0
-    win_with = len(set(win[inl].tolist())) if inl.any() else 0
-    n_win = max(n_windows, len(set(win.tolist())), 1)
-    coverage = min(1.0, win_with / n_win)
+    # Residual term: a window's words share a timestamp bias of ~WINDOW_BIAS on real
+    # audio (that is not misfit of the line), so up to that much of each window's
+    # median residual is removed first. A line off by more still shows the excess.
+    adj = signed.copy()
+    for k in set(win[inl].tolist()):
+        mk = inl & (win == k)
+        adj[mk] -= np.clip(np.median(signed[mk]), -WINDOW_BIAS, WINDOW_BIAS)
+    med = float(np.median(np.abs(adj[inl]))) if inl.any() else 99.0
+    with_inliers = set(win[inl].tolist()) if inl.any() else set()
+    # Windows numbered >= n_windows were added by verification probes: they count
+    # only when they contribute inliers (a probe on music must not lower coverage).
+    probes_used = sum(1 for k in with_inliers if n_windows and k >= n_windows)
+    base_windows = {k for k in set(win.tolist()) if not n_windows or k < n_windows}
+    n_win = max(n_windows, len(base_windows), 1) + probes_used
+    coverage = min(1.0, len(with_inliers) / n_win)
     conf = (
         (1.0 - math.exp(-n_in / 12.0))
         * (0.35 + 0.65 * ratio)
@@ -931,24 +963,36 @@ def _window_verdict(
 ) -> tuple[str, float]:
     """Does window ``k`` agree with ``seg``? → ("agree"|"disagree"|"unknown", deviation).
 
-    Disagreement: the window's own consistent anchors (mode of its residuals) have a
-    median residual > ``tol``, or the segment line explains less than half of what the
-    window's own mode explains (its inliers are inconsistent with the line).
+    The window's own consensus is the mode of the residuals of *all* its candidate
+    anchors (whatever their distance from the line), kept if ≥ ``min_groups``
+    transcript tokens support it. Disagreement: that consensus is more than ``tol``
+    off the line (10 s off is a disagreement, not missing evidence), or the line
+    explains less than half of what the consensus explains. "unknown" means the
+    window has no coherent evidence at all (music, silence, garbled transcript).
     """
-    x = arr.x(seg.scale)
-    r = arr.y - seg.line(x)
-    b = _best_per_group(r, arr.grp, (arr.win == k) & (np.abs(r) < 2.0))
-    if b.sum() < min_groups:
+    m = arr.win == k
+    if not m.any():
         return "unknown", 0.0
-    rr, ww = r[b], arr.w[b]
-    sup = (ww[None, :] * np.clip(1.0 - ((rr[None, :] - rr[:, None]) / 0.3) ** 2, 0, None)).sum(1)
+    r_all = arr.y - seg.line(arr.x(seg.scale))
+    rr, ww, gg = r_all[m], arr.w[m], arr.grp[m]
+    if len(np.unique(gg)) < min_groups:
+        return "unknown", 0.0
+    kern = np.clip(1.0 - ((rr[None, :] - rr[:, None]) / 0.3) ** 2, 0, None)
+    sup = (ww[None, :] * kern).sum(1)
     mode = float(rr[int(np.argmax(sup))])
-    core = np.abs(rr - mode) < 0.5
-    if core.sum() < min_groups:
+    near = np.flatnonzero(np.abs(rr - mode) < 0.5)
+    # one candidate per transcript token: the closest to the mode
+    near = near[np.lexsort((np.abs(rr[near] - mode), gg[near]))]
+    keep = np.ones(near.size, dtype=bool)
+    keep[1:] = gg[near][1:] != gg[near][:-1]
+    core = near[keep]
+    if core.size < min_groups:
         return "unknown", 0.0
     dev = _wmedian(rr[core], ww[core])
-    sup0 = float((ww * np.clip(1.0 - (rr / 0.3) ** 2, 0, None)).sum())
-    inconsistent = sup0 < 0.5 * float(sup.max())
+    b0 = _best_per_group(rr, gg, np.abs(rr) < 0.5)
+    sup0 = float((ww[b0] * np.clip(1.0 - (rr[b0] / 0.3) ** 2, 0, None)).sum())
+    supm = float((ww[core] * np.clip(1.0 - ((rr[core] - mode) / 0.3) ** 2, 0, None)).sum())
+    inconsistent = sup0 < 0.5 * supm
     return ("disagree" if abs(dev) > tol or inconsistent else "agree"), dev
 
 
@@ -1073,13 +1117,16 @@ def _range_error(
 
 
 def _verifies(arr: _AnchorArrays, lo: float, hi: float, seg: Segment, tol: float) -> bool:
-    """No transcription window inside [lo, hi] (mapped by ``seg``) disagrees with it."""
+    """Positive verification of ``seg`` over [lo, hi]: at least one transcription
+    window inside agrees with it, and every window inside that has coherent evidence
+    agrees (no evidence is not agreement, and a window far off the line disagrees)."""
     a_lo, a_hi = sorted((seg.map(lo), seg.map(hi)))
-    return not any(
-        _window_verdict(arr, k, seg, tol)[0] == "disagree"
+    verdicts = [
+        _window_verdict(arr, k, seg, tol)[0]
         for k, c in _window_centres(arr).items()
         if a_lo <= c <= a_hi
-    )
+    ]
+    return "agree" in verdicts and "disagree" not in verdicts
 
 
 def _change_point(arr: _AnchorArrays, p: _Piece) -> tuple[float, float] | None:
@@ -1138,9 +1185,12 @@ def subdivide(
     """Bisection verification of a fit.
 
     Each segment's mapping is checked at its midpoint against a transcription window
-    there: ``probe(audio_time, near)`` returns the (possibly extended) anchor list,
-    transcribing a window centred at ``audio_time`` if none lies within ``near`` s and
-    the window budget allows (``probe=None``: only existing windows are used). If the
+    there: ``probe(audio_time, near)`` returns ``(anchors, transcribed)``, transcribing
+    a window centred at ``audio_time`` if none lies within ``near`` s and the window
+    budget allows (``probe=None``: only existing windows are used). A probe window
+    without coherent evidence (music, silence) is not agreement: other positions are
+    tried while the budget lasts, and a segment with no evidence at all is left as it
+    is and counted in ``details["verify_unverified"]``. If the
     window disagrees (see :func:`_window_verdict`), the segment is split at the best
     cue gap near its midpoint and both halves are refitted on their own (known-ratio
     snapping, scale prior, short halves share the dominant scale). A split is kept
@@ -1170,8 +1220,38 @@ def subdivide(
     cur = list(anchors)
     arr = _AnchorArrays.build(cur)
     done: list[_Piece] = []
-    checks = splits = 0
+    checks = splits = unverified = empty_probes = 0
     changed = False
+
+    def run_probe(centre: float, near: float) -> set[int] | None:
+        """Probe; None if nothing was transcribed, else the new windows' ids that
+        have coherent evidence (empty: the window gave nothing usable)."""
+        nonlocal cur, arr
+        if probe is None:
+            return None
+        before = set(np.unique(arr.win).tolist())
+        new, transcribed = probe(centre, near)
+        if not transcribed:
+            return None
+        cur = list(new)
+        arr = _AnchorArrays.build(cur)
+        ids = set(np.unique(arr.win).tolist()) - before
+        return ids
+
+    def probe_with_evidence(centres: list[float], near: float, seg: Segment) -> None:
+        """Probe the first position; if the window yields no coherent evidence (music,
+        silence), retry the next positions while the budget lasts."""
+        nonlocal empty_probes
+        for n, c in enumerate(centres):
+            ids = run_probe(c, near)
+            if ids is None:
+                if n == 0:
+                    return  # a window is already near the first position (or no budget)
+                continue
+            if any(_window_verdict(arr, k, seg, tol)[0] != "unknown" for k in ids):
+                return
+            empty_probes += 1
+
     while queue:
         p = queue.pop(0)
         if p.hi - p.lo < 2 * min_len or p.depth >= max_depth:
@@ -1180,13 +1260,11 @@ def subdivide(
         mid = 0.5 * (p.lo + p.hi)
         centre = p.seg.map(mid)
         near = min(90.0, max(30.0, (p.hi - p.lo) * p.seg.scale / 8.0))
-        if probe is not None:
-            new = probe(centre, near)
-            if len(new) != len(cur):
-                cur = list(new)
-                arr = _AnchorArrays.build(cur)
+        span = 0.25 * (p.hi - p.lo) * p.seg.scale
+        probe_with_evidence([centre, centre + span, centre - span], near, p.seg)
         if not len(arr.anchors):
             done.append(p)
+            unverified += 1
             continue
         # The midpoint window, plus every other window already inside the segment (a
         # compromise line through two different sections is right at its middle).
@@ -1197,7 +1275,12 @@ def subdivide(
         if abs(centres[k] - centre) <= near + 15.0 and k not in inside:
             inside.append(k)
         checks += 1
-        if not any(_window_verdict(arr, j, p.seg, tol)[0] == "disagree" for j in inside):
+        verdicts = [_window_verdict(arr, j, p.seg, tol)[0] for j in inside]
+        if "disagree" not in verdicts and "agree" not in verdicts:
+            unverified += 1  # no coherent evidence anywhere in the segment: leave it
+            done.append(p)
+            continue
+        if "disagree" not in verdicts:
             # Verified; still prefer a known-ratio refit that halves the per-window
             # error (an initial compromise line can stay within the tolerance).
             whole = _refit_range(arr, p.lo, p.hi, p.seg, dom_s, rng)
@@ -1278,20 +1361,23 @@ def subdivide(
             i += 1
             continue
         a_lo, a_hi = sorted((p.seg.map(p.lo), p.seg.map(p.hi)))
-        if probe is not None and a_hi - a_lo >= 60.0:
-            # independent evidence: the point of the segment farthest from any window
+        if probe is not None and a_hi - a_lo >= 60.0 and len(arr.anchors):
+            # independent evidence: the points of the segment farthest from any window
             # (one window's timestamps can be off by more than a second on its own)
             taken = np.array(list(_window_centres(arr).values()))
             grid = np.linspace(a_lo + 15.0, a_hi - 15.0, 32)
-            far = grid[int(np.argmax(np.min(np.abs(grid[:, None] - taken[None, :]), axis=1)))]
-            new = probe(float(far), 15.0)
-            if len(new) != len(cur):
-                cur = list(new)
-                arr = _AnchorArrays.build(cur)
+            dist = np.min(np.abs(grid[:, None] - taken[None, :]), axis=1)
+            order = [float(grid[g]) for g in np.argsort(-dist)[:8]]
+            # first the farthest point, then the farthest one away from it
+            far = [order[0]] + [c for c in order[1:] if abs(c - order[0]) >= 30.0][:1]
+            probe_with_evidence(far, 15.0, p.seg)
         centres = _window_centres(arr)
         inside = [k for k, c in centres.items() if a_lo <= c <= a_hi]
         checks += 1
-        own = sum(_window_verdict(arr, k, p.seg, tol)[0] == "agree" for k in inside)
+        own_v = [_window_verdict(arr, k, p.seg, tol)[0] for k in inside]
+        own = own_v.count("agree")
+        if "agree" not in own_v and "disagree" not in own_v:
+            unverified += 1
         target = None
         for j in (i - 1, i + 1):
             if 0 <= j < len(done):
@@ -1313,7 +1399,10 @@ def subdivide(
         i = min(i, j)
 
     if not changed:
-        fit.details.update(verify_checks=checks, verify_splits=0, verify_folded=0)
+        fit.details.update(
+            verify_checks=checks, verify_splits=0, verify_folded=0,
+            verify_unverified=unverified, verify_empty_probes=empty_probes,
+        )  # fmt: skip
         if len(cur) != len(anchors):  # new windows: refresh statistics
             conf, n_in, n_groups, med, stats = _fit_stats(fit.mapping, arr, n_windows)
             fit = AlignResult(fit.mapping, fit.method, conf, n_in, n_groups, med,
@@ -1364,7 +1453,8 @@ def subdivide(
     mapping = Mapping(final)
     conf, n_in, n_groups, med, stats = _fit_stats(mapping, arr, n_windows)
     details = {**fit.details, **stats, "verify_checks": checks, "verify_splits": splits,
-               "verify_folded": folded}  # fmt: skip
+               "verify_folded": folded, "verify_unverified": unverified,
+               "verify_empty_probes": empty_probes}  # fmt: skip
     # Safety net against a bad refit: never trade a fit for one that explains clearly
     # fewer anchors (folding a biased window legitimately drops a few) or explains them
     # worse (the confidence itself also pays a small per-segment penalty).
@@ -1396,15 +1486,18 @@ def refine_local(
        from neighbourhood medians of the remaining anchor residuals (per window, with
        ``WINDOW_BIAS`` allowed for a window's shared timestamp bias) and of speech-onset
        deltas, combined by precision and shrunk towards 0; linearly interpolated, so
-       slow wobble is followed without per-cue jitter. Bounded ±``max_shift``.
+       slow wobble is followed without per-cue jitter.
 
     Each step works on the residual of the previous one, so they cannot fight: the
     anchors decide differences *between* parts of the file, speech onsets the common
-    absolute bias. Returns ``(mapping, info)``.
+    absolute bias. The result is one continuous correction relative to the fitted
+    lines, bounded by ±``max_shift`` in *total* (see :func:`_assemble_correction`).
+    Returns ``(mapping, info)``.
     """
     info: dict = {"segment_shifts": [], "onset_shift": 0.0, "knots": 0}
     if not anchors or len(anchors) < 3:
         return mapping, info
+    fitted = mapping
     arr = _AnchorArrays.build(anchors)
     cue_starts = np.array([c.start for c in cues]) if cues else np.zeros(0)
     first = float(cue_starts.min()) if cue_starts.size else -math.inf
@@ -1441,12 +1534,11 @@ def refine_local(
     if speech is not None and speech.size and cues:
         mapping, info["onset_shift"] = refine_with_speech(mapping, cues, speech, resolution)
         onsets = speech_onsets(speech, resolution)
-    if not wobble:
-        return mapping, info
-
-    # 3. smooth neighbourhood corrections
+    # 3. smooth neighbourhood corrections (relative knots per segment)
     segs = mapping.segments
-    out: list[Segment] = []
+    rel_knots: list[tuple[np.ndarray, np.ndarray] | None] = [None] * len(segs)
+    if not wobble:
+        return _assemble_correction(fitted, mapping, rel_knots, first, last, max_shift, info)
     delta, ok = (
         _onset_deltas(mapping, cue_starts, onsets, 0.5) if onsets.size >= 5 else (None, None)
     )
@@ -1470,7 +1562,6 @@ def refine_local(
             base_o = float(np.median(delta[in_seg])) if in_seg.sum() >= 8 else 0.0
         n_knots = int((hi_c - lo_c) // WOBBLE_STEP)
         if n_knots < 2:
-            out.append(seg)
             continue
         kx = lo_c + (np.arange(n_knots) + 0.5) * (hi_c - lo_c) / n_knots
         ky = np.zeros(n_knots)
@@ -1496,7 +1587,6 @@ def refine_local(
             ky[j] = e * WOBBLE_PRIOR**2 / (WOBBLE_PRIOR**2 + v)  # shrink towards 0
             has[j] = True
         if has.sum() < 2:
-            out.append(seg)
             continue
         kx, ky = kx[has], ky[has]
         if ky.size >= 3:  # smooth: [1/4, 1/2, 1/4]
@@ -1507,13 +1597,60 @@ def refine_local(
                     [(ky[-2] + 2 * ky[-1]) / 3],
                 ]
             )
-        ky = np.clip(ky, -max_shift, max_shift)
-        if np.abs(ky).max() < 0.02:
-            out.append(seg)
-            continue
-        knots = tuple((float(a), round(float(c), 4)) for a, c in zip(kx, ky, strict=True))
-        out.append(Segment(seg.start, seg.scale, seg.offset, seg.anchors, knots))
-        info["knots"] += len(knots)
+        if np.abs(ky).max() >= 0.02:
+            rel_knots[i] = (kx, ky)
+    return _assemble_correction(fitted, mapping, rel_knots, first, last, max_shift, info)
+
+
+def _assemble_correction(
+    fitted: Mapping,
+    shifted: Mapping,
+    rel_knots: list[tuple[np.ndarray, np.ndarray] | None],
+    first: float,
+    last: float,
+    max_shift: float,
+    info: dict,
+) -> tuple[Mapping, dict]:
+    """Turn the refinement steps into one correction curve c(t) relative to the fitted
+    lines: per segment its shift (steps 1-2) plus its wobble knots (step 3), a shared
+    knot at every segment boundary (the mean of the two sides) so c is continuous
+    there, and every value clipped to ±``max_shift``. Since c is linear between knots
+    and flat outside them, the *total* correction is bounded by ``max_shift`` and the
+    mapping jumps at a boundary exactly as much as the fitted lines do: refinement
+    alone never creates a backward jump (which ``retime`` would resolve by squeezing
+    cues), only a genuine cut does."""
+    segs0, segs1 = fitted.segments, shifted.segments
+    n = len(segs0)
+    base = [b.offset - a.offset for a, b in zip(segs0, segs1, strict=True)]
+    pts: list[list[tuple[float, float]]] = []
+    for i in range(n):
+        lo = max(segs0[i].start, first) if i else first
+        hi = min(segs0[i + 1].start, last) if i + 1 < n else last
+        if rel_knots[i] is not None:
+            kx, ky = rel_knots[i]
+            pts.append([(float(x), base[i] + float(y)) for x, y in zip(kx, ky, strict=True)])
+        elif math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+            pts.append([(0.5 * (lo + hi), base[i])])
+        else:
+            pts.append([])
+    for i in range(1, n):  # shared boundary knots
+        t = segs0[i].start
+        left = pts[i - 1][-1][1] if pts[i - 1] else base[i - 1]
+        right = pts[i][0][1] if pts[i] else base[i]
+        v = 0.5 * (left + right)
+        pts[i - 1] = [q for q in pts[i - 1] if q[0] < t - 1e-6] + [(t, v)]
+        pts[i] = [(t, v)] + [q for q in pts[i] if q[0] > t + 1e-6]
+    out: list[Segment] = []
+    total = 0.0
+    for i, (s0, s1) in enumerate(zip(segs0, segs1, strict=True)):
+        b = max(-max_shift, min(max_shift, base[i]))
+        rel = tuple((float(t), round(max(-max_shift, min(max_shift, v)) - b, 4)) for t, v in pts[i])
+        if not rel or max(abs(c) for _t, c in rel) < 1e-3:
+            rel = ()
+        total = max([total, abs(b)] + [abs(b + c) for _t, c in rel])
+        out.append(Segment(s1.start, s0.scale, s0.offset + b, s1.anchors, rel))
+        info["knots"] += len(rel)
+    info["max_correction"] = total
     return Mapping(out), info
 
 

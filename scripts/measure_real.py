@@ -19,7 +19,10 @@ compared on the same ground truth::
     # table of every run stored in /tmp/m
     python scripts/measure_real.py movie.mkv --audio 0 --sub 0 --out /tmp/m --report
 
-Nothing is written next to the media; keep ``--out`` outside the repository.
+Everything for one media + audio + subtitle source lives in ``OUT/<media key>/``
+(original subtitles, ground truth, run records), so several episodes can share an
+``--out`` and ``--report`` only lists the runs of the given media. ``--out`` must be
+outside the repository and outside the media's folder.
 """
 
 from __future__ import annotations
@@ -85,6 +88,18 @@ def ground_truth(media: str, audio: int, out: Path, model: str, device: str) -> 
     path.write_text(json.dumps({"model": model, "words": words}))
     print(f"ground truth: {len(words)} words in {time.monotonic() - t0:.0f}s → {path}")
     return words
+
+
+def media_key(args) -> str:
+    """Directory name identifying media file, audio track and subtitle source."""
+    media = Path(args.media)
+    key = f"{media.stem}.{media.stat().st_size}.a{args.audio}"
+    if args.sub_path:
+        sp = Path(args.sub_path)
+        key += f".ext-{sp.stem}.{sp.stat().st_size}"
+    else:
+        key += f".s{args.sub}"
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in key)
 
 
 def load_original(media: str, sub: int, out: Path):
@@ -227,7 +242,13 @@ def main() -> int:
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING)
 
-    out = Path(args.out)
+    base = Path(args.out).expanduser().resolve()
+    repo = Path(__file__).resolve().parents[1]
+    media_dir = Path(args.media).expanduser().resolve().parent
+    for forbidden, what in ((repo, "the repository"), (media_dir, "the media's folder")):
+        if base == forbidden or base.is_relative_to(forbidden):
+            ap.error(f"--out must be outside {what} ({forbidden})")
+    out = base / media_key(args)
     out.mkdir(parents=True, exist_ok=True)
     model = args.truth_model
     if model is None:

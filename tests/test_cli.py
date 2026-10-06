@@ -215,7 +215,10 @@ def test_serve_dispatch(monkeypatch):
         "use_default_queues": False,
         "log_to_stderr": True,
         "verbose": True,
+        "persistent": False,
     }
+    assert cli.main(["serve", "--persistent"]) == 0
+    assert got["persistent"] is True
 
 
 def test_daemon_main_no_console(monkeypatch):

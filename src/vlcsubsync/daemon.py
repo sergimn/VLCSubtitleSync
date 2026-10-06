@@ -1,9 +1,11 @@
 """``vlc-subsync serve``: watches the VLC queue dirs and runs sync jobs.
 
-See DESIGN.md ("File protocol").  One worker thread runs jobs one at a time; the main
-thread polls the ``requests/`` dirs, writes heartbeats and does housekeeping.  The job
-runner and the subtitle-source resolver are injectable so the daemon can be tested
-without the sync engine.
+See DESIGN.md ("File protocol", "Lifecycle"). One worker thread runs jobs one at a
+time and unloads the Whisper models after a minute without jobs; the main thread polls
+the ``requests/`` dirs, writes heartbeats, does housekeeping and, unless persistent,
+exits once VLC is gone (see :mod:`vlcsubsync.lifecycle`). The job runner, the
+subtitle-source resolver, the model unloader and the clocks are injectable so the
+daemon can be tested without the sync engine and without sleeping.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from . import __version__
+from . import lifecycle as L
 from . import protocol as P
 from .config import DEFAULT_MODE, MODES, mode_rank, normalize_mode
 
@@ -456,8 +459,9 @@ def load_config() -> Any:
 class EngineRunner:
     """Default job runner: calls ``vlcsubsync.sync.sync_subtitles``.
 
-    Whisper models stay warm between jobs through ``vlcsubsync.transcribe``'s
-    module-level model cache (the daemon process is long-lived).
+    Whisper models stay warm between back-to-back jobs through
+    ``vlcsubsync.transcribe``'s module-level model cache; the daemon unloads them
+    after ``model_idle`` seconds without a job.
     """
 
     def __call__(self, spec: JobSpec, progress: ProgressFn) -> Any:
@@ -547,6 +551,17 @@ class Daemon:
         rescan_interval: float = 30.0,
         max_age: float = MAX_AGE_SECONDS,
         version: str = __version__,
+        idle_exit: bool = False,
+        idle_grace: float = L.IDLE_GRACE_SECONDS,
+        startup_grace: float = L.STARTUP_GRACE_SECONDS,
+        intf_max_age: float = L.INTF_FRESH_SECONDS,
+        idle_check_interval: float = 1.0,
+        model_idle: float = L.MODEL_IDLE_SECONDS,
+        model_unloader: Callable[[], int] | None = None,
+        worker_wait: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        lock_wait: float = 3.0,
     ):
         self.extra_queue_dirs = [Path(q) for q in queue_dirs]
         self.use_default_queues = use_default_queues
@@ -564,6 +579,23 @@ class Daemon:
         self.rescan_interval = rescan_interval
         self.max_age = max_age
         self.version = version
+        # lifecycle (see vlcsubsync.lifecycle): exit when VLC is gone, unload models
+        self.idle_exit = idle_exit
+        self.intf_max_age = intf_max_age
+        self.idle_check_interval = idle_check_interval
+        self.model_idle = model_idle
+        self.model_unloader = model_unloader or L.unload_models
+        self.worker_wait = worker_wait
+        self.clock = clock
+        self.wall_clock = wall_clock
+        self.lock_wait = lock_wait
+        self.idle_policy = L.IdleExitPolicy(
+            idle_grace=idle_grace, startup_grace=startup_grace, clock=clock
+        )
+        self.exit_reason = ""
+        self.models_unloaded = 0  # number of unloads (for tests / logs)
+        self._models_loaded = False  # the engine ran since the last unload
+        self._last_job_end = clock()
 
         self.queue_dirs: list[Path] = []
         self.stop_event = threading.Event()
@@ -729,13 +761,22 @@ class Daemon:
     # ---------------------------------------------------------------- worker
     def _worker_loop(self) -> None:
         while True:
+            job: _Job | None = None
             with self._cond:
                 while not self._pending and not self.stop_event.is_set():
-                    self._cond.wait(timeout=1.0)
+                    if self.model_unload_due():
+                        break
+                    self._cond.wait(timeout=self.worker_wait)
                 if self.stop_event.is_set():
                     return
-                job = self._pending.pop(0)
-                self._running = job
+                if self._pending:
+                    job = self._pending.pop(0)
+                    self._running = job
+            if job is None:
+                # Unloading runs on the worker thread itself, so it can never race
+                # with a job using the model; a job queued meanwhile just waits.
+                self.unload_models()
+                continue
             try:
                 self.run_job(job)
             except Exception:  # noqa: BLE001 - never let a job kill the worker
@@ -743,7 +784,53 @@ class Daemon:
             finally:
                 with self._cond:
                     self._running = None
+                    self._last_job_end = self.clock()
                 self.jobs_completed += 1
+
+    # ---------------------------------------------------------------- model unloading
+    def model_unload_due(self, now: float | None = None) -> bool:
+        """True when the engine ran and no job has run for ``model_idle`` seconds."""
+        if not self._models_loaded:
+            return False
+        now = self.clock() if now is None else now
+        return now - self._last_job_end >= self.model_idle
+
+    def unload_models(self) -> int:
+        """Free the Whisper models (called on the worker thread when idle)."""
+        self._models_loaded = False
+        before = L.rss_mb()
+        try:
+            released = self.model_unloader()
+        except Exception:  # noqa: BLE001
+            log.exception("unloading models failed")
+            return 0
+        self.models_unloaded += 1
+        after = L.rss_mb()
+        mem = f"; RSS {before:.0f} -> {after:.0f} MiB" if before and after else ""
+        log.info(
+            "unloaded %d Whisper model(s) after %.0f s without jobs%s",
+            released,
+            self.model_idle,
+            mem,
+        )
+        return released
+
+    # ---------------------------------------------------------------- idle exit
+    def busy(self) -> bool:
+        with self._cond:
+            return bool(self._pending) or self._running is not None
+
+    def check_idle_exit(self) -> bool:
+        """True when VLC is gone and nothing was queued or running for long enough."""
+        activity = L.vlc_activity(
+            self.queue_dirs,
+            self.wall_clock(),
+            max_age=self.intf_max_age,
+            recent=self.idle_policy.startup_grace,
+        )
+        return self.idle_policy.update(
+            vlc_alive=activity.alive, busy=self.busy(), just_stopped=activity.just_stopped
+        )
 
     def cache_key(
         self, job: _Job, source: ResolvedSource, config: Any, mode: str | None = None
@@ -919,6 +1006,7 @@ class Daemon:
                     )
                 )
 
+            self._models_loaded = True
             result = self.runner(spec, progress)
             if job.cancel.is_set():
                 raise JobCancelled(job.cancel_reason or "Cancelled")
@@ -1017,8 +1105,18 @@ class Daemon:
                 self._running.cancel.set()
             self._cond.notify_all()
 
+    def _acquire_lock(self) -> bool:
+        # A previous instance may be exiting right now (VLC closed and re-opened within
+        # the idle grace): wait for it briefly instead of giving up.
+        deadline = time.monotonic() + self.lock_wait
+        while not self.lock.acquire():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
+        return True
+
     def run(self, *, acquire_lock: bool = True) -> int:
-        if acquire_lock and not self.lock.acquire():
+        if acquire_lock and not self._acquire_lock():
             pid = self.lock.holder_pid()
             log.error("another vlc-subsync daemon is already running (pid %s)", pid)
             return ALREADY_RUNNING
@@ -1026,9 +1124,15 @@ class Daemon:
             self.scan_queue_dirs()
             if not self.queue_dirs:
                 log.warning("no VLC queue dirs found yet; will keep looking")
-            log.info("vlc-subsync daemon %s started (pid %d)", self.version, os.getpid())
+            log.info(
+                "vlc-subsync daemon %s started (pid %d)%s",
+                self.version,
+                os.getpid(),
+                "; exits when VLC is gone" if self.idle_exit else "",
+            )
+            L.clean_request_junk(self.queue_dirs, self.wall_clock())
             self.start_worker()
-            last_hb = last_scan = 0.0
+            last_hb = last_scan = last_idle = 0.0
             last_hk = time.monotonic() - self.housekeeping_interval + 5.0
             while not self.stop_event.is_set():
                 now = time.monotonic()
@@ -1048,6 +1152,16 @@ class Daemon:
                     except Exception:  # noqa: BLE001
                         log.exception("housekeeping failed")
                     last_hk = now
+                if self.idle_exit and now - last_idle >= self.idle_check_interval:
+                    last_idle = now
+                    if self.check_idle_exit():
+                        # last look: a request may have landed since the poll above
+                        if self.poll_requests() == 0:
+                            self.exit_reason = "VLC is not running and no job is pending"
+                            log.info("%s; exiting", self.exit_reason)
+                            L.clean_request_junk(self.queue_dirs, self.wall_clock())
+                            break
+                        self.idle_policy.reset()
                 self.stop_event.wait(self.poll_interval)
         finally:
             self._shutdown()
@@ -1095,10 +1209,18 @@ def serve(
     use_default_queues: bool = True,
     log_to_stderr: bool = True,
     verbose: bool = False,
+    persistent: bool = False,
 ) -> int:
-    """Entry point for ``vlc-subsync serve``."""
+    """Entry point for ``vlc-subsync serve``.
+
+    Unless ``persistent``, the daemon exits by itself once VLC is gone (see
+    DESIGN.md "Lifecycle").
+    """
     setup_logging(to_stderr=log_to_stderr, level=logging.DEBUG if verbose else logging.INFO)
-    daemon = Daemon(queue_dirs, use_default_queues=use_default_queues)
+    applied = L.lower_priority()  # before any thread exists: threads inherit it
+    if applied:
+        log.info("process priority lowered: %s", ", ".join(applied))
+    daemon = Daemon(queue_dirs, use_default_queues=use_default_queues, idle_exit=not persistent)
     install_signal_handlers(daemon)
     try:
         rc = daemon.run()

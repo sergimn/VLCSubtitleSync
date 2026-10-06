@@ -19,8 +19,8 @@ input.
 * Fully automatic mode needs a **Lua interface script** (`lua/intf/subsync.lua`,
   enabled via `vlcrc`: `extraintf=luaintf`, `lua-intf=subsync`), because VLC
   extensions must be activated manually each session. A companion **extension**
-  (`lua/extensions/subsync_ext.lua`, View menu) provides "Sync now", auto on/off and
-  status.
+  (`lua/extensions/subsync_ext.lua`, View menu) provides "Sync now", "Sync now
+  (exhaustive)", auto on/off and status.
 
 ```
 VLC ── intf/subsync.lua ──writes──► <q>/requests/<id>.req
@@ -121,7 +121,9 @@ sub_index=0                            # ordinal among subtitle tracks VLC lists
 sub_label=Track 1 - [English]
 sub_path=                              # optional explicit external subtitle path
 force=0                                # 1 = ignore result cache
+mode=exhaustive                        # optional: fast|thorough|exhaustive, overrides config
 ```
+`mode` is omitted for the default; unknown values are ignored (config mode used).
 `<q>/jobs/<id>.status` (daemon → Lua), rewritten on each update:
 ```
 id=...
@@ -138,13 +140,21 @@ confidence=0.93
 `<q>/heartbeat` (daemon): `time=<unix seconds>\npid=<pid>\nversion=<x.y.z>`; refreshed every ≤2 s.
 Lua considers the daemon alive if `os.time() - time <= 10`.
 
-`<q>/control` (extension → intf): `sync_now=<counter>`, `auto=1|0`. intf reacts when
-`sync_now` increases. `<q>/intf_state` (intf → extension, display only): `state`,
-`message`, `last_result`.
+`<q>/control` (extension → intf): `sync_now=<counter>`, `auto=1|0`, and optionally
+`sync_now_mode=exhaustive`. intf reacts when `sync_now` increases; the
+`sync_now_mode` present in that same write becomes the request's `mode=` (absent =
+no `mode` key, i.e. the configured mode). "Sync now (exhaustive)" in the extension
+writes it; "Sync subtitles now" does not. `<q>/intf_state` (intf → extension,
+display only): `state`, `message`, `last_result`.
 
 Daemon housekeeping: delete `.req` once picked up; delete jobs/out older than 7 days.
 Result cache key = sha1(media path, size, mtime, audio_index, sub source identity,
-model, version) → reuse previous output instantly unless `force=1`.
+model, version, effective mode) → reuse previous output instantly unless `force=1`.
+Effective mode = the request's `mode=`, else the config's. A lookup tries the
+exhaustive key, then thorough, down to the job's own mode: a result of a *more*
+thorough mode also answers a later cheaper request for the same file and tracks
+(it used at least the same evidence), never the other way round. So after
+"Sync now (exhaustive)", reopening the file reuses the exhaustive result.
 
 ### Lua behaviour (intf)
 Loop every ~500 ms (`vlc.misc.mwait`); VLC 3 has no `should_die()` — `mwait` raises "Interrupted." when the interface is closing, which ends the loop.
@@ -157,13 +167,17 @@ added). On `done` + `applied=1`: `vlc.input.add_subtitle(output, true)` (try pat
 `vlc.strings.make_uri(output)`), remember the new ES id(s) as "ours → source", OSD
 `"Subtitles synced: <message>"`. On error / not applied: short OSD message, keep
 original. Remember the result per (input, audio, source) so re-selecting doesn't resync.
-OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
+OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job with
+`mode=exhaustive` (or thorough) says so in its OSD/progress text: "Syncing subtitles
+(exhaustive, may take a while)… 42% – Transcribing 20/58 (exhaustive)".
 
 ## Alignment algorithm (align.py)
 1. Decode selected audio stream → 16 kHz mono float32.
 2. VAD → speech segments over whole file (cheap).
 3. Choose K windows (default ~ max(8, duration/240s), 30 s each) evenly across the
-   file, snapped to speech-dense regions; transcribe with word timestamps.
+   file, snapped to speech-dense regions; transcribe with word timestamps. The
+   count and the later verification budget depend on the sync mode (see "Sync
+   modes"); exhaustive mode transcribes consecutive windows instead.
    Language: guess from subtitle text (stopword heuristic); English → `*.en` model,
    else multilingual model with `language=<guess>`; if audio language (whisper
    detect) ≠ subtitle language → skip to VAD fallback.
@@ -256,9 +270,30 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
 9. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 
+## Sync modes (`mode=` in config, per-request `mode=`, `vlc-subsync sync --mode`)
+
+| mode | windows (step 3) | adaptive (step 5) | verification budget (step 6) |
+|---|---|---|---|
+| `fast` (default) | `max(8, d/240 s)` sampled | ≤ `max(4, K/2)` | `2 + 1 per 30 min` |
+| `thorough` | `max(20, d/96 s)` sampled (~2.5×) | ≤ `max(4, K/2)` | 3× fast |
+| `exhaustive` | consecutive `[0,30) [30,60) …` up to `d`, minus silent ones | none | 0 |
+
+* Exhaustive skips a window with < 0.5 s of VAD speech (`sync.MIN_SPEECH_SECONDS`);
+  the last window may be shorter than 30 s. Every window with speech is transcribed,
+  so adaptive and verification probes have nothing left to add (they could only pick
+  silent windows); the fit, bisection verification (with the windows already
+  inside each segment) and local refinement run on all anchors as usual.
+* Explicit `windows=N` / `verify_windows=N` keep overriding the per-mode defaults
+  (`windows` is ignored by exhaustive, which covers everything).
+* Cost is roughly linear in the number of transcribed windows: exhaustive is one
+  Whisper pass over all dialogue. On a 28.7 min episode it transcribed 50 windows,
+  against fast's 12–13 (8 sampled + adaptive). That took 1.9× fast's runtime on GPU
+  and 2.2× on CPU, because decoding and VAD (~7.5 s) are fixed. README has the table.
+
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)
-`model_en=base.en`, `model_multi=base`, `device=auto|cpu|cuda`, `compute_type=int8`,
-`windows=auto`, `verify_windows=auto`, `min_confidence=0.5`, `threads=0`.
+`mode=fast|thorough|exhaustive`, `model_en=base.en`, `model_multi=base`,
+`device=auto|cpu|cuda`, `compute_type=int8`, `windows=auto`, `verify_windows=auto`,
+`min_confidence=0.5`, `threads=0`. Invalid values are ignored (default kept).
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 
 ## Installation UX

@@ -624,7 +624,7 @@ def test_vlc_end_to_end(tmp_path: Path):
     vlog = vlog_path.open("w", encoding="utf-8", errors="replace")
     vlc_cmd = [
         vlc, "-I", "dummy", "--extraintf", "luaintf", "--lua-intf", "subsync",
-        "-vv", "--no-qt-privacy-ask", "--no-metadata-network-access",
+        "-vv", "--no-metadata-network-access",
         "--vout", "dummy", "--aout", "dummy",
         "--audio-track", "1", "--sub-track", "0",
         "--play-and-exit",

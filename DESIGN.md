@@ -146,7 +146,7 @@ Result cache key = sha1(media path, size, mtime, audio_index, sub source identit
 model, version) → reuse previous output instantly unless `force=1`.
 
 ### Lua behaviour (intf)
-Loop every ~500 ms (`vlc.misc.mwait`), exit on `vlc.misc.should_die()`.
+Loop every ~500 ms (`vlc.misc.mwait`); VLC 3 has no `should_die()` — `mwait` raises "Interrupted." when the interface is closing, which ends the loop.
 Trigger a sync when, for the current input, (a) playback started with a sub track
 selected, (b) `spu-es` changed to a non-disabled track that isn't one we added, or
 (c) `audio-es` changed while a sub track is selected; debounce 1.5 s; only one job in

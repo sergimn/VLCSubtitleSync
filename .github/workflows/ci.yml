@@ -57,6 +57,9 @@ jobs:
           cache-dependency-glob: pyproject.toml
       - name: Install
         run: uv pip install -e ".[dev]"
+      - name: Install ffmpeg (media tests generate files with it)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Unit tests (excludes slow / vlc via pyproject addopts)
         run: pytest -q
 

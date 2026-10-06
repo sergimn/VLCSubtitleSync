@@ -8,6 +8,9 @@
   ],
   "timezone": "Europe/Madrid",
   "schedule": ["before 6am on monday"],
+  "minimumReleaseAge": "14 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "internalChecksFilter": "strict",
   "labels": ["dependencies"],
   "pre-commit": { "enabled": true },
   "packageRules": [

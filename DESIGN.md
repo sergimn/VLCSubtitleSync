@@ -180,10 +180,13 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    to 0.78–1.28 (−22% / +28%). Long segments use a free fit that snaps to a known
    framerate ratio (`align.SCALE_CANDIDATES`) when within 0.0015 of it; short or sparse
    segments pick the best-fitting ratio, with a prior towards 1.0 that grows with the
-   ratio's size. Snapping is judged per anchor *or* per transcription window (median
-   residual of each window): a window's word timestamps share a bias of 0.2–0.4 s on
-   real audio, so one biased window must not tilt the line off an exact ratio. Ratios
-   beyond ±10% also need at least 10 anchors:
+   ratio's size. Snapping is judged per anchor *or* per transcription window: a
+   window's word timestamps share a bias of 0.2–0.4 s on real audio, so one biased
+   window must not tilt the line off an exact ratio. The ratio is taken if the
+   per-window median residuals are no worse, or if the free slope is within 2
+   standard errors of it, with each window one observation (SE = robust spread of
+   the window medians / (√windows · spread of window positions)). Ratios beyond ±10%
+   also need at least 10 anchors:
 
    | ratio | typical cause |
    |---|---|
@@ -203,8 +206,17 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    * Each segment is checked against the window nearest its midpoint (transcribed
      there if none lies within `clamp(len/8, 30, 90)` s and the budget
      `verify_windows` allows: auto = 2 + 1 per 30 min) and against every window
-     already inside it (free). A window *disagrees* if the mode of its own residuals
-     has a median > 0.25 s, or the segment line explains < 50% of what that mode does.
+     already inside it (free). A window's own consensus is the mode of the residuals
+     of *all* its candidate anchors (however far from the line), kept if ≥ 6
+     transcript tokens support it. The window *disagrees* if that consensus is
+     > 0.25 s off the line (10 s off is disagreement, not missing evidence), or the
+     line explains < 50% of what the consensus does; it is *unknown* only without
+     a coherent consensus (music, silence, garbled words). A segment verifies only on
+     positive evidence: at least one window agrees and none disagrees.
+   * A probe window without coherent evidence is not agreement: other positions
+     (±¼ of the segment) are tried while the budget lasts. A segment with no
+     evidence at all is left as it is and counted in `verify_unverified`; empty
+     probes in `verify_empty_probes`.
    * On disagreement two cuts are tried: the best cue gap near the midpoint, and the
      cue gap at the L1 change point of the per-window median residuals (sections at
      1/3 and 2/3 leave both midpoint halves mixed). Each half is refitted with known
@@ -224,16 +236,26 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
      many of their windows agree with the neighbour as with them (ties favour fewer
      segments). Real case: with beam-1 CPU decoding, one cold-open window's
      timestamps were 1.6 s late and created a false 90 s first segment.
-   * Adjacent segments merge when one refit of both verifies. Boundaries of new splits
+   * Adjacent segments merge when one refit of both *positively* verifies against all
+     their windows (a genuine 10 s cut holding < 10% of the anchors stays: its windows
+     disagree with any merged line). Boundaries of new splits
      use the usual cue-gap / speech-overlap placement. Safety net: the result is
      dropped if it explains < 90% of the inliers or its median residual grows > 0.05 s.
    * Known limit: a section needs two windows of evidence (one window's timestamps
      can be off by more than a second), so sections shorter than the window spacing
      (~4 min by default) can be missed.
 7. Local refinement (`align.refine_local`), three steps that each work on the
-   residual of the previous one, so they cannot fight:
+   residual of the previous one, so they cannot fight, assembled into **one
+   continuous correction curve relative to the fitted lines, bounded by ±0.5 s in
+   total** (`_assemble_correction`): each segment contributes its shift (steps 1–2)
+   and wobble knots (step 3), every segment boundary gets a shared knot (mean of both
+   sides), and all values are clipped to ±0.5 s. The curve is linear between knots
+   and flat outside them, so the total never exceeds the bound, and the mapping jumps
+   at a boundary exactly as much as the fitted lines do. Refinement alone never
+   creates a backward jump (which `retime` would resolve by squeezing earlier cues);
+   genuine cuts keep theirs.
    1. per segment: shift by the weighted median residual of its inlier anchors
-      (one candidate per transcript token), bounded ±0.5 s;
+      (one candidate per transcript token);
    2. global: `refine_with_speech` snaps mapped cue starts to the nearest speech
       onset (±0.5 s) and applies the median shift when it is *precise*: standard
       error of the median ≤ 0.04 s and MAD ≤ 0.25 s (real dialogue has a 0.1–0.2 s
@@ -243,9 +265,9 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
       ±120 s neighbourhood: per-window median anchor residuals (variance
       SE² + 0.2² for the window's shared timestamp bias) and median speech-onset
       deltas (SE²), each relative to its own segment baseline, combined by
-      precision, shrunk towards 0 with a 0.2 s prior, smoothed [¼ ½ ¼], bounded
-      ±0.5 s and linearly interpolated (`Segment.knots`). Slow wobble is followed;
-      single lines are not moved individually.
+      precision, shrunk towards 0 with a 0.2 s prior, smoothed [¼ ½ ¼] and linearly
+      interpolated (`Segment.knots`). Slow wobble is followed; single lines are not
+      moved individually.
 8. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
    with the subtitle-on mask at 10 ms resolution over the same candidate scales
    (FFT). Each scale's peak height above its own baseline is divided by the same
@@ -253,7 +275,13 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    winner must stand out against the best rival scale that maps the file > 3 s
    differently (`cross_scale`): more candidates must not mean more chances for a
    noise maximum to win.
-9. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
+9. Confidence: (1 − e^(−inliers/12)) · (0.35 + 0.65·inlier weight ratio) ·
+   (0.4 + 0.6·window coverage) · e^(−max(0, residual − 0.25)/0.4) · 0.95^(segments−1).
+   The residual is the median |inlier residual| after removing up to 0.2 s of each
+   window's median (its shared timestamp bias is not misfit; a line off by more still
+   shows the excess). Verification probe windows count in the coverage denominator
+   only if they contribute inliers.
+10. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)

@@ -73,6 +73,12 @@ The first sync of a file usually takes **30–90 seconds on a typical CPU** (sec
 with an NVIDIA GPU). SubSync only transcribes a few 30-second samples spread over the
 file, not the whole movie. Playback continues normally meanwhile.
 
+The section check (see *How it works*) may transcribe a few extra samples: at most
+2, plus 1 per 30 minutes of video, by default. Often none are needed, but on a CPU each
+one adds a second or so (one extra sample on a 28-minute episode: 19.2 s instead of
+19.1 s). Set `verify_windows=0` in `config.ini` to never transcribe extra samples
+for it.
+
 ## How it works
 
 ```

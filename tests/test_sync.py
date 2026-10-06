@@ -127,6 +127,34 @@ def test_language_mismatch_uses_vad(tmp_path, synth, energy_vad):
     _check(_errors(synth, r.output_path, script, f))
 
 
+def test_english_only_model_uses_multilingual_detector(tmp_path, synth, energy_vad, monkeypatch):
+    """English subs + .en model: the audio language must come from the multilingual model."""
+    import vlcsubsync.sync as sync_mod
+
+    def f(t):
+        return t + 4.0
+
+    script, wav, srt, fake = _case(tmp_path, synth, f, 10 * 60)
+    fake.multilingual = False  # behaves like base.en: would always answer "en"
+
+    class Detector:
+        multilingual = True
+
+        def detect_language(self, audio, sr):
+            return "fr", 0.95
+
+    used = []
+    monkeypatch.setattr(sync_mod, "get_transcriber", lambda config, lang: fake)
+    monkeypatch.setattr(sync_mod, "get_model", lambda config, name: used.append(name) or Detector())
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(srt)), str(tmp_path / "o.srt"),
+        Config(),
+    )  # fmt: skip
+    assert used == [Config().model_multi]
+    assert fake.calls == []  # mismatch detected: no English transcription of French audio
+    assert r.method == "vad"
+
+
 def test_too_few_anchors_not_applied(tmp_path, synth, energy_vad):
     def f(t):
         return t + 6.0
@@ -299,6 +327,40 @@ def test_cuda_only_device_does_not_fall_back(monkeypatch):
     t = tr.WhisperTranscriber("base", device="cuda")
     with pytest.raises(RuntimeError, match="cudnn"):
         t.transcribe(np.zeros(16000, np.float32), 16000, "fr")
+
+
+def test_cuda_error_after_success_is_not_swallowed(monkeypatch):
+    """Once CUDA has worked, a later failure is a real error, not a reason to go CPU."""
+    import faster_whisper
+
+    Fake, created = _fake_whisper_model(fail_on_cuda_transcribe=False)
+    monkeypatch.setattr(faster_whisper, "WhisperModel", Fake)
+    monkeypatch.setattr(tr, "_cuda_available", lambda: True)
+    t = tr.WhisperTranscriber("base.en", device="auto")
+    t.transcribe(np.zeros(16000, np.float32), 16000, "en")
+    assert t.device == "cuda"
+
+    def boom(model):
+        raise ValueError("bad audio")
+
+    with pytest.raises(ValueError):
+        t._run(boom)
+    assert t.device == "cuda" and [c[1] for c in created] == ["cuda"]
+
+
+@pytest.mark.parametrize(
+    ("requested", "cpu"),
+    [("int8", "int8"), ("float32", "float32"), ("float16", "int8"), ("int8_float16", "int8")],
+)
+def test_cpu_fallback_uses_cpu_compute_type(monkeypatch, requested, cpu):
+    import faster_whisper
+
+    Fake, created = _fake_whisper_model(fail_load_cuda=True)
+    monkeypatch.setattr(faster_whisper, "WhisperModel", Fake)
+    monkeypatch.setattr(tr, "_cuda_available", lambda: True)
+    t = tr.WhisperTranscriber("base.en", device="auto", compute_type=requested)
+    t.transcribe(np.zeros(16000, np.float32), 16000, "en")
+    assert created == [("base.en", "cpu", cpu)]
 
 
 def test_detect_language(monkeypatch):

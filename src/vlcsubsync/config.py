@@ -49,7 +49,7 @@ class Config:
         if w and w != "auto":
             try:
                 return max(1, int(float(w)))
-            except ValueError:
+            except (ValueError, OverflowError):
                 pass
         return max(8, round(duration / 240.0))
 
@@ -118,7 +118,7 @@ class Config:
                     self.windows = w if w == "auto" else str(int(float(w)))
             elif value:
                 setattr(self, key, value)
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
 
 

@@ -51,6 +51,14 @@ class Transcriber(Protocol):
         ...
 
 
+_CPU_COMPUTE_TYPES = {"int8", "int8_float32", "int16", "float32", "default", "auto"}
+
+
+def _cpu_compute_type(compute_type: str) -> str:
+    """CUDA-only compute types (float16, int8_float16, bfloat16, ...) → int8 on CPU."""
+    return compute_type if compute_type in _CPU_COMPUTE_TYPES else "int8"
+
+
 def is_english_only(model_name: str) -> bool:
     return model_name.endswith(".en")
 
@@ -108,7 +116,7 @@ class WhisperTranscriber:
         out = []
         if _cuda_available():
             out.append(("cuda", cuda_ct))
-        out.append(("cpu", self.compute_type))
+        out.append(("cpu", _cpu_compute_type(self.compute_type)))
         return out
 
     def _load(self, skip_cuda: bool = False):
@@ -150,7 +158,10 @@ class WhisperTranscriber:
                 self._verified = True
                 return result
             except Exception as e:
-                if self.device != "cuda" or self.requested_device != "auto":
+                # Only a model that has never worked on CUDA falls back: missing
+                # cuDNN/cuBLAS surfaces on first use. Once CUDA has produced a result,
+                # later errors (bad input, transient OOM) are real errors.
+                if self.device != "cuda" or self.requested_device != "auto" or self._verified:
                     raise
                 log.warning("whisper on CUDA failed (%s); falling back to CPU", e)
                 self._model = None

@@ -37,6 +37,8 @@ def test_parsing_is_lenient(tmp_path):
         "threads=abc\n"  # invalid -> ignored
         "min_confidence=1.5\n"  # out of range -> ignored
         "windows=0\n"  # invalid -> ignored
+        "windows=inf\n"  # overflow -> ignored
+        "threads=inf\n"  # overflow -> ignored
         "compute_type='float32'\n"
         "garbage line\n",
         encoding="utf-8",

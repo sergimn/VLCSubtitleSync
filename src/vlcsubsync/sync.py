@@ -33,7 +33,7 @@ from .subtitles import (
     load_subtitles,
     save_subtitles,
 )
-from .transcribe import Transcriber, Word, get_transcriber
+from .transcribe import Transcriber, Word, get_model, get_transcriber
 
 log = logging.getLogger(__name__)
 
@@ -259,8 +259,14 @@ def sync_subtitles(
     if windows:
         best_w = max(windows, key=lambda s: speech_sec[int(s) : int(s + WINDOW_SECONDS)].sum())
         a, b = int(best_w * SAMPLE_RATE), int((best_w + WINDOW_SECONDS) * SAMPLE_RATE)
+        # English-only models can't identify the audio language (they always say
+        # "en"), so foreign audio with English subtitles would go undetected; ask the
+        # multilingual model instead.
+        detector = t
+        if transcriber is None and not getattr(t, "multilingual", True):
+            detector = get_model(config, config.model_multi)
         try:
-            audio_lang, lang_prob = t.detect_language(audio[a:b], SAMPLE_RATE)
+            audio_lang, lang_prob = detector.detect_language(audio[a:b], SAMPLE_RATE)
         except Exception as e:
             log.warning("language detection failed: %s", e)
     mismatch = (

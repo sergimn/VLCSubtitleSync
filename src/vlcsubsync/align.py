@@ -39,8 +39,14 @@ SCALE_CANDIDATES = (
     23.976 / 24,
     25 / 24,
     24 / 25,
+    # NTSC video vs film/PAL timings (e.g. subtitles made for a 29.97 fps TV
+    # release played against a 23.976 fps web/Blu-ray video).
+    29.97 / 23.976,
+    23.976 / 29.97,
+    29.97 / 25,
+    25 / 29.97,
 )
-SCALE_MIN, SCALE_MAX = 0.9, 1.11
+SCALE_MIN, SCALE_MAX = 0.78, 1.28
 
 INLIER_THRESHOLD = 1.0  # s, residual for an anchor to count as consistent
 CHARS_PER_SECOND = 15.0  # typical speaking rate used to place tokens inside a cue
@@ -369,11 +375,14 @@ def _best_candidate_scale(x, y, w, s0: float, o0: float) -> tuple[float, float]:
     for cand in SCALE_CANDIDATES:
         if cand != 1.0 and abs(cand - 1.0) * span < 0.4:
             continue  # indistinguishable from 1.0 over this span
+        if abs(cand - 1.0) > 0.1 and x.size < 10:
+            continue  # NTSC-sized drift (±17-25%) needs more evidence than a few anchors
         s, o = _irls(x, y, w, cand, o0 + (s0 - cand) * xm, True)
         r = y - (s * x + o)
         cost = float((w * np.minimum((r / 0.5) ** 2, 1.0)).sum())
-        if cand == 1.0:
-            cost *= 0.98
+        # Prior towards no drift, stronger for bigger ratios, so a coincidental fit of
+        # a few anchors can't pick an extreme scale on a near-tie.
+        cost *= 0.98 if cand == 1.0 else 1.0 + 2.0 * abs(cand - 1.0)
         if best is None or cost < best[0]:
             best = (cost, s, o)
     assert best is not None

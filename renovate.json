@@ -13,10 +13,21 @@
   "internalChecksFilter": "strict",
   "labels": ["dependencies"],
   "pre-commit": { "enabled": true },
+  "customManagers": [
+    {
+      "description": "ruff pinned in CI (RUFF_VERSION) follows the ruff-pre-commit rev in .pre-commit-config.yaml",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["RUFF_VERSION: \"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "astral-sh/ruff-pre-commit",
+      "datasourceTemplate": "github-tags",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    }
+  ],
   "packageRules": [
     {
       "description": "CI tooling and dev-only dependencies: group and automerge when CI passes",
-      "matchManagers": ["github-actions", "pre-commit"],
+      "matchManagers": ["github-actions", "pre-commit", "custom.regex"],
       "groupName": "CI tooling",
       "automerge": true
     },

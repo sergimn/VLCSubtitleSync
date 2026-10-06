@@ -13,6 +13,7 @@ external subtitle files) use as t=0.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -209,6 +210,73 @@ class _AudioBuffer:
         return self.buf[: self.n].copy() if self.n < self.buf.shape[0] else self.buf
 
 
+# Mid-stream timestamp jumps smaller than this are treated as jitter (MKV stores ms).
+PTS_TOLERANCE = 0.05
+
+
+class _AudioAssembler:
+    """Resamples decoded frames to 16 kHz mono and places them on the media timeline.
+
+    Sample position ``i`` of the result is media time ``i / SAMPLE_RATE`` (relative to
+    the container start). Frames are normally laid end to end; when a frame's pts says
+    it starts more than :data:`PTS_TOLERANCE` after the end of the previous one the gap
+    is filled with silence, and when it starts earlier (overlap) the overlapping
+    samples are dropped. The first frame is placed exactly: leading silence is inserted
+    if it starts after t=0, and audio before t=0 is trimmed.
+    """
+
+    def __init__(self, capacity: int):
+        self.buf = _AudioBuffer(capacity)
+        self.resampler = self._new_resampler()
+        self.cursor: float | None = None  # media time where the next frame would start
+        self.drop = 0  # output samples still to discard (overlap / before t=0)
+
+    @staticmethod
+    def _new_resampler():
+        import av
+
+        return av.AudioResampler(format="flt", layout="mono", rate=SAMPLE_RATE)
+
+    def feed(self, frame, t: float | None) -> None:
+        """Add one decoded frame starting at media time ``t`` (None if unknown)."""
+        rate = frame.sample_rate or SAMPLE_RATE
+        dur = frame.samples / rate
+        if t is None:
+            t = self.cursor if self.cursor is not None else 0.0
+        expected = 0.0 if self.cursor is None else self.cursor
+        tol = 0.5 / SAMPLE_RATE if self.cursor is None else PTS_TOLERANCE
+        delta = t - expected
+        if delta > tol:  # gap: flush what is buffered, then pad with silence
+            self._flush()
+            self.drop = 0
+            self.buf.pad_to(int(round(t * SAMPLE_RATE)))
+            self.cursor = t + dur
+        elif delta < -tol:  # overlap (or before t=0): drop what was already covered
+            self.drop += int(round(-delta * SAMPLE_RATE))
+            self.cursor = t + dur
+        else:
+            self.cursor = expected + dur
+        self._append(self.resampler.resample(frame))
+
+    def _append(self, outs) -> None:
+        for out in outs:
+            x = out.to_ndarray().reshape(-1)
+            if self.drop:
+                k = min(self.drop, x.shape[0])
+                x = x[k:]
+                self.drop -= k
+            if x.shape[0]:
+                self.buf.append(x)
+
+    def _flush(self) -> None:
+        self._append(self.resampler.resample(None))
+        self.resampler = self._new_resampler()
+
+    def result(self) -> np.ndarray:
+        self._flush()
+        return self.buf.result()
+
+
 # --------------------------------------------------------------------------------------
 # Subtitles
 # --------------------------------------------------------------------------------------
@@ -225,7 +293,7 @@ class _SubCollector:
         except Exception:
             pass
         self.header = (
-            extradata.decode("utf-8", "replace")
+            _clean_text(extradata.decode("utf-8", "replace"))
             if extradata and self.codec in ("ass", "ssa")
             else ""
         )
@@ -240,6 +308,8 @@ class _SubCollector:
         start = float(packet.pts * tb) - self.start_offset
         end = start + float(packet.duration * tb) if packet.duration else None
         text = self._payload(data)
+        if text is not None:
+            text = _clean_text(text)
         if text is None or not text.strip():
             return
         self.items.append((start, end, text))
@@ -284,6 +354,16 @@ class _SubCollector:
         return subs
 
 
+# C0/C1 control characters and DEL, except newline (muxers sometimes leave a trailing NUL).
+_CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+
+
+def _clean_text(text: str) -> str:
+    """Normalise line breaks to ``\\n``, tabs to spaces, and drop other control chars."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ")
+    return _CONTROL_CHARS.sub("", text)
+
+
 _ASS_EVENTS_HEADER = (
     "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
 )
@@ -294,7 +374,7 @@ def _ms(t: float) -> int:
 
 
 def _ass_event(start: float, end: float, payload: str) -> pysubs2.SSAEvent:
-    line = payload.strip("\r\n")
+    line = payload.strip("\n")
     if line.startswith("Dialogue:"):
         # Some muxers store full event lines: Layer,Start,End,Style,Name,ML,MR,MV,Effect,Text
         parts = line[len("Dialogue:") :].strip().split(",", 9)
@@ -327,7 +407,7 @@ def _ass_event(start: float, end: float, payload: str) -> pysubs2.SSAEvent:
                 "",
                 line,
             )
-    ev = pysubs2.SSAEvent(start=_ms(start), end=_ms(end), text=text.replace("\r\n", "\\N"))
+    ev = pysubs2.SSAEvent(start=_ms(start), end=_ms(end), text=text.replace("\n", "\\N"))
     ev.style = style.strip() or "Default"
     ev.name = name
     ev.effect = effect
@@ -405,14 +485,11 @@ def read_media(
         if not streams:
             return None, None, info
 
-        buf = None
-        resampler = None
-        first_audio = True
+        asm = None
         if astream is not None:
             astream.thread_type = "AUTO"
             est = int((info.duration or 60.0) * SAMPLE_RATE * 1.02) + SAMPLE_RATE
-            buf = _AudioBuffer(est)
-            resampler = av.AudioResampler(format="flt", layout="mono", rate=SAMPLE_RATE)
+            asm = _AudioAssembler(est)
 
         duration = info.duration or 0.0
         last_report = -1.0
@@ -431,24 +508,20 @@ def read_media(
                     log.debug("audio decode error: %s", e)
                 continue
             for frame in frames:
-                if first_audio and frame.pts is not None and frame.time_base is not None:
-                    t0 = float(frame.pts * frame.time_base) - start_offset
-                    if t0 > 0:
-                        buf.pad_to(int(round(t0 * SAMPLE_RATE)))
-                    first_audio = False
-                for out in resampler.resample(frame):
-                    buf.append(out.to_ndarray().reshape(-1))
+                t = None
+                if frame.pts is not None and frame.time_base is not None:
+                    t = float(frame.pts * frame.time_base) - start_offset
+                asm.feed(frame, t)
             if progress and duration > 0 and packet.pts is not None:
                 p = min(1.0, max(0.0, float(packet.pts * packet.time_base) / duration))
                 if p - last_report >= 0.01:
                     last_report = p
                     progress(p, "Decoding audio")
-        if astream is not None:
-            for out in resampler.resample(None):
-                buf.append(out.to_ndarray().reshape(-1))
-            if buf.n == 0:
+        audio = None
+        if asm is not None:
+            audio = asm.result()
+            if audio.shape[0] == 0:
                 raise MediaError("audio track decoded to no samples")
-        audio = buf.result() if buf is not None else None
         subs = collector.build() if collector is not None else None
         if audio is not None and info.duration <= 0:
             info.duration = audio.shape[0] / SAMPLE_RATE

@@ -92,6 +92,15 @@ service or desktop autostart entry on Linux, a LaunchAgent on macOS, a Startup-f
 shortcut on Windows. The two sides talk through small files in VLC's own data folder,
 which also works for the sandboxed snap and flatpak builds of VLC.
 
+Step 5 in more detail: SubSync first fits one timing line (offset and, if the
+subtitles were made for another frame rate, a drift factor) per section of the video.
+It then checks each section in the middle, transcribing one more sample there if
+needed. Where the check disagrees by more than a quarter second, the section is split
+in two and each half is refitted, recursively. Finally it fine-tunes each section:
+the median gap between the spoken words and the subtitle lines, the moments where
+speech starts, and a gentle correction that follows slow local wobble (never more
+than half a second, and smooth from line to line).
+
 If the subtitle language and the spoken language differ (say English audio with
 Spanish subtitles), there is no text to compare. SubSync then lines up the subtitle
 timing with the moments where people are speaking. That method is less precise but
@@ -138,6 +147,7 @@ model_multi=base        # model for every other language (tiny, base, small, med
 device=auto             # auto | cpu | cuda   (auto falls back to CPU if CUDA fails)
 compute_type=int8       # CTranslate2 compute type (int8, int8_float16, float16, float32)
 windows=auto            # number of 30 s audio samples to transcribe, or auto
+verify_windows=auto     # extra samples the section check may transcribe (0 = none)
 min_confidence=0.5      # below this the original timing is kept (0..1)
 threads=0               # CPU threads, 0 = automatic
 ```
@@ -167,9 +177,11 @@ them in `config.ini`.
 - **The first sync of a file takes ~30–90 s on CPU.** The synced track appears when
   it's ready, and results are cached afterwards.
 - **Small residual offsets are possible.** The fit is one timing line per section of
-  the video, built from a sample of the audio, so individual lines can still be a
-  fraction of a second early or late. Drift outside 0.78–1.28× (−22% / +28%)
-  isn't handled.
+  the video, built from a sample of the audio and fine-tuned locally, so individual
+  lines can still be a fraction of a second early or late (on a real TV episode the
+  typical line is within 0.3 s of the spoken words). Sections shorter than about four
+  minutes, or a timing change between two samples that no check landed on, may be
+  missed. Drift outside 0.78–1.28× (−22% / +28%) isn't handled.
 - Subtitles that don't match the dialogue at all (a different cut with re-edited
   lines, or a heavily paraphrased translation) may not be accepted. SubSync then keeps
   the original timing and tells you so instead of making things worse.

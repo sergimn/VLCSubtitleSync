@@ -168,14 +168,22 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    else multilingual model with `language=<guess>`; if audio language (whisper
    detect) ≠ subtitle language → skip to VAD fallback.
 4. Anchors: normalize words (lowercase, strip punctuation, numbers→digits); subtitle
-   tokens get times by interpolating within each cue. Match rare-ish n-grams (n=3, then
-   2) between transcript windows and the *whole* subtitle token stream (no assumption
-   on offset magnitude) → (sub_time, audio_time) pairs, weighted by n-gram uniqueness.
+   tokens get times inside each cue: `cue start + min(lead / scale, cap)`, where
+   `lead` = characters before the token at a nominal 15 chars/s and `cap` = the same
+   fraction of the cue's duration. The speaking rate is nominal in the *audio* clock,
+   so under drift the in-cue offset is divided by the fitted scale (without this, a
+   1.25× file biases later words by up to 25% of their in-cue offset; fit_mapping
+   refits once with the first line's scale). Match rare-ish n-grams (n=3, then 2)
+   between transcript windows and the *whole* subtitle token stream (no assumption on
+   offset magnitude) → (sub_time, audio_time) pairs, weighted by n-gram uniqueness.
 5. Fit `audio = scale*sub + offset` robustly (RANSAC + IRLS refine). Scales are bounded
    to 0.78–1.28 (−22% / +28%). Long segments use a free fit that snaps to a known
    framerate ratio (`align.SCALE_CANDIDATES`) when within 0.0015 of it; short or sparse
    segments pick the best-fitting ratio, with a prior towards 1.0 that grows with the
-   ratio's size. Ratios beyond ±10% also need at least 10 anchors:
+   ratio's size. Snapping is judged per anchor *or* per transcription window (median
+   residual of each window): a window's word timestamps share a bias of 0.2–0.4 s on
+   real audio, so one biased window must not tilt the line off an exact ratio. Ratios
+   beyond ±10% also need at least 10 anchors:
 
    | ratio | typical cause |
    |---|---|
@@ -190,15 +198,59 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    ≥2 clusters (cuts), fit piecewise-linear with DP over time-sorted anchors with a
    segment penalty (segments share `scale` unless evidence otherwise). If anchors are
    too sparse in a region, transcribe more windows there (adaptive, bounded).
-6. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
+6. Bisection verification (`align.subdivide`; differences below the 1 s inlier
+   threshold, e.g. 0.6 s steps that the fit absorbs into a tilted compromise line):
+   * Each segment is checked against the window nearest its midpoint (transcribed
+     there if none lies within `clamp(len/8, 30, 90)` s and the budget
+     `verify_windows` allows: auto = 2 + 1 per 30 min) and against every window
+     already inside it (free). A window *disagrees* if the mode of its own residuals
+     has a median > 0.25 s, or the segment line explains < 50% of what that mode does.
+   * On disagreement two cuts are tried: the best cue gap near the midpoint, and the
+     cue gap at the L1 change point of the per-window median residuals (sections at
+     1/3 and 2/3 leave both midpoint halves mixed). Each half is refitted with known
+     ratios only (dominant scale, parent scale, 1.0, or `_best_candidate_scale`; a free
+     scale over a few windows follows local wobble and extrapolates badly), judged by
+     the mean |window median| with 1.0, then the dominant scale, winning near-ties.
+   * A split is kept if the halves differ by > 0.25 s + 2·SE (SE from the spread of
+     per-window medians, so one window's timestamp bias is not a "section") and it
+     explains the disagreement: the per-window error halves, or one half verifies on
+     its own and drops it ≥ 20% (the other half is left to the recursion). Smooth
+     wobble fails this test and is left to step 7.
+   * A segment that is not split may still be replaced by a refit of its whole range
+     that verifies (or halves its error): the initial dominant line can be a
+     compromise. Recursion stops at 2×120 s, depth 5 or when the probe has nothing new.
+     Adjacent segments merge when one refit of both verifies. Boundaries of new splits
+     use the usual cue-gap / speech-overlap placement. Safety net: the result is
+     dropped if it explains < 97% of the inliers or its median residual grows > 0.05 s.
+7. Local refinement (`align.refine_local`), three steps that each work on the
+   residual of the previous one, so they cannot fight:
+   1. per segment: shift by the weighted median residual of its inlier anchors
+      (one candidate per transcript token), bounded ±0.5 s;
+   2. global: `refine_with_speech` snaps mapped cue starts to the nearest speech
+      onset (±0.5 s) and applies the median shift when it is *precise*: standard
+      error of the median ≤ 0.04 s and MAD ≤ 0.25 s (real dialogue has a 0.1–0.2 s
+      MAD; the old MAD ≤ 0.12 gate rejected useful shifts). Speech onsets are
+      independent of Whisper's timestamp bias, so they own the absolute level;
+   3. per segment: smooth correction knots every 120 s (subtitle clock), from the
+      ±120 s neighbourhood: per-window median anchor residuals (variance
+      SE² + 0.2² for the window's shared timestamp bias) and median speech-onset
+      deltas (SE²), each relative to its own segment baseline, combined by
+      precision, shrunk towards 0 with a 0.2 s prior, smoothed [¼ ½ ¼], bounded
+      ±0.5 s and linearly interpolated (`Segment.knots`). Slow wobble is followed;
+      single lines are not moved individually.
+8. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
    with the subtitle-on mask at 10 ms resolution over the same candidate scales
-   (FFT), pick best.
-7. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
+   (FFT). Each scale's peak height above its own baseline is divided by the same
+   prior as `_best_candidate_scale` (1.0: ×1/0.98, others: 1 + 2·|s − 1|), and the
+   winner must stand out against the best rival scale that maps the file > 3 s
+   differently (`cross_scale`): more candidates must not mean more chances for a
+   noise maximum to win.
+9. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)
 `model_en=base.en`, `model_multi=base`, `device=auto|cpu|cuda`, `compute_type=int8`,
-`windows=auto`, `min_confidence=0.5`, `threads=0`.
+`windows=auto`, `verify_windows=auto`, `min_confidence=0.5`, `threads=0`.
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 
 ## Installation UX

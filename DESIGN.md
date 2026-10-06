@@ -219,9 +219,17 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    * A segment that is not split may still be replaced by a refit of its whole range
      that verifies (or halves its error): the initial dominant line can be a
      compromise. Recursion stops at 2×120 s, depth 5 or when the probe has nothing new.
-     Adjacent segments merge when one refit of both verifies. Boundaries of new splits
+   * Segments too short to split get one probe at their point farthest from any
+     window (independent evidence) and are folded into a neighbour when at least as
+     many of their windows agree with the neighbour as with them (ties favour fewer
+     segments). Real case: with beam-1 CPU decoding, one cold-open window's
+     timestamps were 1.6 s late and created a false 90 s first segment.
+   * Adjacent segments merge when one refit of both verifies. Boundaries of new splits
      use the usual cue-gap / speech-overlap placement. Safety net: the result is
-     dropped if it explains < 97% of the inliers or its median residual grows > 0.05 s.
+     dropped if it explains < 90% of the inliers or its median residual grows > 0.05 s.
+   * Known limit: a section needs two windows of evidence (one window's timestamps
+     can be off by more than a second), so sections shorter than the window spacing
+     (~4 min by default) can be missed.
 7. Local refinement (`align.refine_local`), three steps that each work on the
    residual of the previous one, so they cannot fight:
    1. per segment: shift by the weighted median residual of its inlier anchors

@@ -595,3 +595,45 @@ def test_vad_align_unrelated_across_scales(synth, seed):
     r = vad_align(speech, cues)
     assert r.confidence < 0.3
     assert r.details["cross_scale"] < 0.3
+
+
+def test_short_segment_from_one_biased_window_is_folded(synth):
+    """A window whose timestamps are all 1.6 s late (seen with beam-1 CPU decoding at
+    an episode's cold open) must not keep a section of its own: an independent probe
+    inside the short segment sides with the neighbour, and the tie folds it."""
+    from vlcsubsync.align import AlignResult
+    from vlcsubsync.transcribe import Word
+
+    duration = 30 * 60
+    script = synth.script(duration - 30, seed=1)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    fake = synth.FakeTranscriber(synth.speech_spans(script, lambda t: t + 2.0))
+
+    def transcribe(st):
+        words = fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)
+        bias = 1.6 if st == 60.0 else 0.0
+        return [Word(w.start + bias, w.end + bias, w.text) for w in words]
+
+    windows = [(st, transcribe(st)) for st in (60.0, 300.0, 600.0, 900.0, 1200.0, 1500.0)]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    mapping = Mapping([Segment(-math.inf, 1.0, 3.6, 20), Segment(150.0, 1.0, 2.0, 200)])
+    fit = AlignResult(mapping, "whisper", 0.9, 200, len(anchors))
+    probes = []
+
+    def probe(centre, near):
+        nonlocal anchors
+        st = max(0.0, centre - 15.0)
+        if len(probes) >= 2 or any(abs(s + 15 - centre) <= near for s, _w in windows):
+            return anchors
+        probes.append(st)
+        windows.append((st, transcribe(st)))
+        anchors = find_anchors(tok, windows)
+        return anchors
+
+    out, _anchors = subdivide(fit, anchors, cues, probe, None, 0.01, len(windows))
+    assert len(probes) == 1 and not 60.0 <= probes[0] <= 90.0  # away from the bad window
+    assert out.details["verify_folded"] == 1
+    assert [(s.scale, s.offset) for s in out.mapping.segments] == pytest.approx(
+        [(1.0, 2.0)], abs=0.05
+    )

@@ -379,9 +379,11 @@ def sync_subtitles(
                 fit, anchors, cues, verify_probe, speech, vad.RESOLUTION, len(transcribed)
             )
             log.info(
-                "verification: %d checks, %d splits, +%d windows: conf %.2f, %d segments",
+                "verification: %d checks, %d splits, %d folded, +%d windows: conf %.2f, "
+                "%d segments",
                 fit.details.get("verify_checks", 0), fit.details.get("verify_splits", 0),
-                len(transcribed) - n_before, fit.confidence, len(fit.mapping.segments),
+                fit.details.get("verify_folded", 0), len(transcribed) - n_before,
+                fit.confidence, len(fit.mapping.segments),
             )  # fmt: skip
         if fit.anchors < MIN_WHISPER_ANCHORS:
             reason = f"too few transcript matches ({fit.anchors})"

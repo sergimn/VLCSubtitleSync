@@ -1265,8 +1265,55 @@ def subdivide(
                    p.depth + 1, p.split),
             _Piece(cut, p.hi, Segment(cut, rs.scale, rs.offset, rs.anchors), p.depth + 1, True),
         ]  # fmt: skip
+
+    # Segments too short to split (typically one or two windows that fit_mapping set
+    # apart): probe once more inside, and fold one into a neighbour when at least as
+    # many of its windows agree with the neighbour as with the segment itself (ties
+    # favour fewer segments).
+    folded = 0
+    i = 0
+    while len(done) > 1 and i < len(done):
+        p = done[i]
+        if p.hi - p.lo >= 2 * min_len:
+            i += 1
+            continue
+        a_lo, a_hi = sorted((p.seg.map(p.lo), p.seg.map(p.hi)))
+        if probe is not None and a_hi - a_lo >= 60.0:
+            # independent evidence: the point of the segment farthest from any window
+            # (one window's timestamps can be off by more than a second on its own)
+            taken = np.array(list(_window_centres(arr).values()))
+            grid = np.linspace(a_lo + 15.0, a_hi - 15.0, 32)
+            far = grid[int(np.argmax(np.min(np.abs(grid[:, None] - taken[None, :]), axis=1)))]
+            new = probe(float(far), 15.0)
+            if len(new) != len(cur):
+                cur = list(new)
+                arr = _AnchorArrays.build(cur)
+        centres = _window_centres(arr)
+        inside = [k for k, c in centres.items() if a_lo <= c <= a_hi]
+        checks += 1
+        own = sum(_window_verdict(arr, k, p.seg, tol)[0] == "agree" for k in inside)
+        target = None
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(done):
+                votes = sum(_window_verdict(arr, k, done[j].seg, tol)[0] == "agree" for k in inside)
+                if votes >= max(own, 1) and (target is None or votes > target[1]):
+                    target = (j, votes)
+        if target is None:
+            i += 1
+            continue
+        j = target[0]
+        a, b = done[min(i, j)], done[max(i, j)]
+        nb = done[j].seg
+        done[min(i, j) : max(i, j) + 1] = [
+            _Piece(a.lo, b.hi, Segment(a.seg.start, nb.scale, nb.offset, nb.anchors),
+                   max(a.depth, b.depth), a.split)
+        ]  # fmt: skip
+        folded += 1
+        changed = True
+        i = min(i, j)
+
     if not changed:
-        fit.details.update(verify_checks=checks, verify_splits=0)
+        fit.details.update(verify_checks=checks, verify_splits=0, verify_folded=0)
         if len(cur) != len(anchors):  # new windows: refresh statistics
             conf, n_in, n_groups, med, stats = _fit_stats(fit.mapping, arr, n_windows)
             fit = AlignResult(fit.mapping, fit.method, conf, n_in, n_groups, med,
@@ -1316,11 +1363,13 @@ def subdivide(
         final.append(seg)
     mapping = Mapping(final)
     conf, n_in, n_groups, med, stats = _fit_stats(mapping, arr, n_windows)
-    details = {**fit.details, **stats, "verify_checks": checks, "verify_splits": splits}
-    # Safety net: never trade a fit for one that explains fewer anchors or explains
-    # them worse (the confidence itself also pays a small per-segment penalty).
+    details = {**fit.details, **stats, "verify_checks": checks, "verify_splits": splits,
+               "verify_folded": folded}  # fmt: skip
+    # Safety net against a bad refit: never trade a fit for one that explains clearly
+    # fewer anchors (folding a biased window legitimately drops a few) or explains them
+    # worse (the confidence itself also pays a small per-segment penalty).
     _c0, n_in0, _g0, med0, _s0 = _fit_stats(fit.mapping, arr, n_windows)
-    if n_in < 0.97 * n_in0 or med > med0 + 0.05:
+    if n_in < 0.9 * n_in0 or med > med0 + 0.05:
         details.update(verify_splits=0, verify_rejected=True)
         conf0, n_in0, n_groups0, med0, stats0 = _fit_stats(fit.mapping, arr, n_windows)
         return AlignResult(fit.mapping, fit.method, conf0, n_in0, n_groups0, med0,

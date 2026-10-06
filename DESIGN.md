@@ -383,9 +383,12 @@ or running for 15 s, the daemon exits (code 0). A fresh daemon that has seen nei
 VLC nor a job waits up to 60 s first (VLC may still be starting, or a request
 started it); a `state=stopped` written in the last 60 s cuts that wait. So: VLC
 closed → exit ~15–17 s later; VLC killed → ~35 s (20 s staleness + 15 s); a job in
-flight always finishes first. Before exiting it polls `requests/` once more, and it
-deletes non-`.req` junk older than 60 s from `requests/` (else `DirectoryNotEmpty` /
-`QueueDirectories` would restart it forever). `serve --persistent` disables all this.
+flight always finishes first. Before exiting it polls `requests/` once more and then
+empties `requests/` (else `DirectoryNotEmpty` / `QueueDirectories` would restart it
+forever): non-`.req` entries older than 60 s (files and directories) are deleted, and
+`.req` files still there after 10 s are ones it could not read or delete. Whatever it
+cannot delete is moved to `<q>/rejected/` (cleaned after 7 days); if even that fails it
+logs it once. At startup only the non-`.req` junk is cleaned. `serve --persistent` disables all this.
 If a new instance starts while the old one is exiting, it waits up to 3 s for the lock.
 
 **Models**: 60 s after the last job that ran the engine, the *worker thread* calls
@@ -406,7 +409,11 @@ login, no process), with `PathModified=<q>/intf_state` and
 `DirectoryNotEmpty=<q>/requests` for each usable queue dir, `Unit=vlc-subsync.service`.
 The service is `Type=simple`, `Nice=10`, `IOSchedulingClass=idle`,
 `CPUSchedulingPolicy=batch`, no `Restart=` (VLC's next 5 s write starts it again) and
-no `[Install]` (never enabled by itself). The Lua intf's tmp+rename write triggers
+no `[Install]` (never enabled by itself). `StartLimitIntervalSec=600` +
+`StartLimitBurst=20` stop a crash loop (a VLC session normally starts it once);
+re-running setup does `reset-failed`. When re-setup changes the watched paths (e.g. a
+new snap install), it runs `daemon-reload` and then `restart vlc-subsync.path`, since
+a running path unit keeps its old watches. The Lua intf's tmp+rename write triggers
 `PathModified` (the watched inode is replaced).
 *Snap*: the queue dir is `~/snap/vlc/current/.local/share/vlc/subsync`, and
 `current` is a symlink to the revision dir that snapd switches on refresh. systemd

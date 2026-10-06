@@ -802,7 +802,10 @@ class Daemon:
         try:
             released = self.model_unloader()
         except Exception:  # noqa: BLE001
-            log.exception("unloading models failed")
+            log.exception("unloading models failed; retrying in %.0f s", self.model_idle)
+            with self._cond:
+                self._models_loaded = True  # still loaded: try again later
+                self._last_job_end = self.clock()
             return 0
         self.models_unloaded += 1
         after = L.rss_mb()
@@ -1061,7 +1064,7 @@ class Daemon:
         dirs: list[tuple[Path, float]] = []
         for q in self.queue_dirs:
             dirs += [(q / P.JOBS_DIR, self.max_age), (q / P.OUT_DIR, self.max_age)]
-            dirs += [(q / P.REQUESTS_DIR, 3600.0)]
+            dirs += [(q / P.REQUESTS_DIR, 3600.0), (q / L.REJECTED_DIR, self.max_age)]
         dirs.append((self.cache_dir, self.max_age))
         active_ids = set()
         with self._cond:
@@ -1159,7 +1162,9 @@ class Daemon:
                         if self.poll_requests() == 0:
                             self.exit_reason = "VLC is not running and no job is pending"
                             log.info("%s; exiting", self.exit_reason)
-                            L.clean_request_junk(self.queue_dirs, self.wall_clock())
+                            L.clean_request_junk(
+                                self.queue_dirs, self.wall_clock(), stuck_requests=True
+                            )
                             break
                         self.idle_policy.reset()
                 self.stop_event.wait(self.poll_interval)

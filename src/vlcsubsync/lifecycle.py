@@ -20,6 +20,7 @@ import contextlib
 import gc
 import logging
 import os
+import shutil
 import sys
 import time
 from collections.abc import Callable, Iterable
@@ -36,6 +37,8 @@ IDLE_GRACE_SECONDS = 15.0  # stay this long after the last VLC / job activity
 STARTUP_GRACE_SECONDS = 60.0  # a fresh daemon waits this long for VLC or a request
 MODEL_IDLE_SECONDS = 60.0  # unload Whisper after this long without a job
 STALE_REQUEST_JUNK_SECONDS = 60.0  # non-.req leftovers in requests/ older than this
+STUCK_REQUEST_SECONDS = 10.0  # at exit, a .req still there after this long is stuck
+REJECTED_DIR = "rejected"  # <q>/rejected/: what could not be removed from requests/
 
 
 # --------------------------------------------------------------------------- VLC liveness
@@ -131,32 +134,92 @@ class IdleExitPolicy:
 
 
 def clean_request_junk(
-    queue_dirs: Iterable[Path], now: float, max_age: float = STALE_REQUEST_JUNK_SECONDS
+    queue_dirs: Iterable[Path],
+    now: float,
+    max_age: float = STALE_REQUEST_JUNK_SECONDS,
+    *,
+    stuck_requests: bool = False,
+    stuck_age: float = STUCK_REQUEST_SECONDS,
 ) -> int:
-    """Remove stale non-request files from ``requests/``.
+    """Empty ``requests/`` of anything that would start the daemon over and over.
 
     The service managers start the daemon while ``requests/`` is non-empty (systemd
-    ``DirectoryNotEmpty=``, launchd ``QueueDirectories``), so an abandoned ``.tmp``
-    must not linger there or it would start the daemon over and over.
+    ``DirectoryNotEmpty=``, launchd ``QueueDirectories``), so nothing may linger there:
+
+    * non-``.req`` entries (abandoned ``.tmp`` files, directories) older than
+      ``max_age`` are deleted;
+    * with ``stuck_requests`` (used when the daemon exits, right after a last poll),
+      ``.req`` files older than ``stuck_age`` are ones the daemon could not read or
+      delete; they are moved to ``<q>/rejected/``.
+
+    Whatever cannot be deleted is moved to ``<q>/rejected/`` as well; if even that
+    fails it is logged once. Returns the number of entries removed or moved.
     """
-    removed = 0
+    done = 0
     for q in queue_dirs:
+        q = Path(q)
         try:
-            entries = list(os.scandir(Path(q) / P.REQUESTS_DIR))
+            entries = list(os.scandir(q / P.REQUESTS_DIR))
         except OSError:
             continue
         for e in entries:
-            if e.name.endswith(P.REQUEST_SUFFIX):
+            is_req = e.name.endswith(P.REQUEST_SUFFIX)
+            if is_req and not stuck_requests:
                 continue
             try:
-                if e.is_dir(follow_symlinks=False):
-                    continue
-                if now - e.stat().st_mtime > max_age:
-                    os.unlink(e.path)
-                    removed += 1
+                age = now - e.stat(follow_symlinks=False).st_mtime
             except OSError:
                 continue
-    return removed
+            if age <= (stuck_age if is_req else max_age):
+                continue
+            if is_req:
+                log.warning("request %s could not be processed; moving it aside", e.name)
+            elif _delete_entry(e):
+                done += 1
+                continue
+            if _move_aside(q, e):
+                done += 1
+    return done
+
+
+def _delete_entry(e: os.DirEntry[str]) -> bool:
+    try:
+        if e.is_dir(follow_symlinks=False):
+            shutil.rmtree(e.path)
+        else:
+            os.unlink(e.path)
+        return True
+    except OSError as exc:
+        log.debug("cannot delete %s: %s", e.path, exc)
+        return False
+
+
+_unmovable_reported: set[str] = set()
+
+
+def _move_aside(q: Path, e: os.DirEntry[str]) -> bool:
+    """Move a ``requests/`` entry to ``<q>/rejected/`` so the dir becomes empty."""
+    rejected = q / REJECTED_DIR
+    try:
+        rejected.mkdir(exist_ok=True)
+        dest = rejected / e.name
+        n = 1
+        while dest.exists() or dest.is_symlink():
+            dest = rejected / f"{e.name}.{n}"
+            n += 1
+        os.replace(e.path, dest)
+        log.warning("moved %s to %s (could not be removed)", e.path, dest)
+        return True
+    except OSError as exc:
+        if e.path not in _unmovable_reported:
+            _unmovable_reported.add(e.path)
+            log.warning(
+                "cannot remove or move %s (%s): it keeps the helper being restarted "
+                "until it is removed by hand",
+                e.path,
+                exc,
+            )
+        return False
 
 
 # --------------------------------------------------------------------------- models

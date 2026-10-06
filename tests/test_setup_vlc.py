@@ -693,3 +693,43 @@ def test_launcher_data_windows_and_posix():
     }
     p = S.launcher_data("service", ["/usr/bin/python3", "-m", "vlcsubsync.cli", "serve"], "linux")
     assert p["exe"] == "/usr/bin/python3" and p["args"] == "-m vlcsubsync.cli serve"
+
+
+def test_service_has_start_limit():
+    lines = S.systemd_service_text(["/x", "serve"]).splitlines()
+    unit = lines[: lines.index("[Service]")]
+    assert "StartLimitIntervalSec=600" in unit and "StartLimitBurst=20" in unit
+
+
+def test_resetup_restarts_path_unit_when_watches_change(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    restart = ["systemctl", "--user", "restart", "vlc-subsync.path"]
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    assert restart not in fs.commands  # first install: enable --now is enough
+
+    fs.commands.clear()
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    assert restart not in fs.commands  # unchanged watches
+
+    # a new VLC (the snap) shows up: the path unit must watch it too
+    (fs.home / "snap/vlc/current").mkdir(parents=True)
+    fs.commands.clear()
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    path_unit = (fs.home / ".config/systemd/user/vlc-subsync.path").read_text()
+    assert str(Path("snap/vlc/current")) in path_unit
+    reload_ = ["systemctl", "--user", "daemon-reload"]
+    assert reload_ in fs.commands and restart in fs.commands
+    assert fs.commands.index(reload_) < fs.commands.index(restart)
+
+
+def test_windows_percent_in_exe_path_warns(tmp_path, monkeypatch):
+    bindir = tmp_path / "50%off" / "Scripts"
+    bindir.mkdir(parents=True)
+    (bindir / "vlc-subsync-daemon.exe").write_text("")
+    monkeypatch.setattr(S, "_bin_dir", lambda: bindir)
+    fs = FakeSystem(tmp_path, "windows")
+    (fs.home / "AppData/Roaming/vlc").mkdir(parents=True)
+    ctx = fs.ctx()
+    assert S.run_setup(ctx, model=False) == 0
+    assert any("'%'" in w for w in ctx.warnings)

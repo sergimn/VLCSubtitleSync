@@ -691,6 +691,10 @@ def systemd_service_text(
         "Documentation=https://github.com/sergimn/VLCSubtitleSync\n"
         f"# Started on demand by {path_unit} when VLC starts or queues a job;\n"
         "# exits by itself ~15 s after VLC closes. Nothing runs while VLC is closed.\n"
+        "# A crash loop (VLC rewrites intf_state every 5 s) stops after 20 starts in\n"
+        "# 10 min; `vlc-subsync setup` or `systemctl --user reset-failed` clears it.\n"
+        "StartLimitIntervalSec=600\n"
+        "StartLimitBurst=20\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
@@ -959,15 +963,24 @@ def install_autostart(ctx: Context, installs: Sequence[VlcInstall] = ()) -> str:
         cmd = daemon_command(ctx)
         if _systemd_user_available(ctx):
             service, path_unit = systemd_unit_path(ctx), systemd_path_unit_path(ctx)
+            path_text = systemd_path_text(queue_dirs)
+            try:
+                old_path_text: str | None = path_unit.read_text(encoding="utf-8")
+            except OSError:
+                old_path_text = None
+            # an already running path unit keeps its old watches until restarted
+            watches_changed = old_path_text is not None and old_path_text != path_text
             if ctx.do(f"write systemd user units {path_unit.name} + {service.name}"):
                 P.write_text_atomic(service, systemd_service_text(cmd))
-                P.write_text_atomic(path_unit, systemd_path_text(queue_dirs))
+                P.write_text_atomic(path_unit, path_text)
                 ctx.ok(f"wrote {path_unit} (watches {len(queue_dirs)} VLC queue dir(s))")
                 ctx.ok(f"wrote {service} (ExecStart={' '.join(cmd)})")
             if ctx.do(f"systemctl --user enable --now {PATH_UNIT_NAME}"):
                 _systemctl(ctx, "daemon-reload")
                 _systemctl(ctx, "reset-failed", PATH_UNIT_NAME, SERVICE_NAME, warn=False)
                 if _systemctl(ctx, "enable", "--now", PATH_UNIT_NAME):
+                    if watches_changed and _systemctl(ctx, "restart", PATH_UNIT_NAME):
+                        ctx.ok(f"restarted {PATH_UNIT_NAME}: it watches the new paths")
                     ctx.ok(f"{PATH_UNIT_NAME} active: the helper starts when VLC starts")
             write_launchers(ctx, queue_dirs, "service", cmd)
             return "systemd-path"
@@ -1003,6 +1016,11 @@ def install_autostart(ctx: Context, installs: Sequence[VlcInstall] = ()) -> str:
 
     # windows: VLC's Lua interface launches the GUI exe itself (see DESIGN.md)
     cmd = daemon_command(ctx, gui=True)
+    if "%" in cmd[0]:
+        ctx.warn(
+            f"the helper's path contains '%' ({cmd[0]}); cmd.exe may expand it and VLC "
+            "then fails to start the helper. Reinstall SubSync to a path without '%'"
+        )
     write_launchers(ctx, queue_dirs, "spawn", cmd)
     ctx.ok(f"VLC starts the helper itself when it opens ({Path(cmd[0]).name})")
     return "vlc-spawn"

@@ -527,3 +527,107 @@ def test_serve_lowers_priority_before_running(monkeypatch, tmp_path):
     order.clear()
     D.serve([str(tmp_path)], log_to_stderr=False, persistent=True)
     assert ("daemon", False) in order
+
+
+# ------------------------------------------------------------------ review follow-ups
+
+
+def test_failed_unload_is_retried(denv, queue, clock):
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("busy")
+        return 1
+
+    d = make_daemon(denv, queue, clock, model_unloader=flaky)
+    d._models_loaded = True
+    clock.advance(61)
+    assert d.model_unload_due()
+    assert d.unload_models() == 0  # failed
+    assert not d.model_unload_due()  # retried after another model_idle, not at once
+    clock.advance(61)
+    assert d.model_unload_due()
+    assert d.unload_models() == 1
+    assert not d.model_unload_due() and d.models_unloaded == 1
+
+
+def _age(path, clock, seconds):
+    os.utime(path, (clock.wall - seconds, clock.wall - seconds))
+
+
+def test_clean_request_junk_removes_stale_directories(queue, clock):
+    sub = queue / "requests" / "junkdir"
+    (sub / "inner").mkdir(parents=True)
+    (sub / "inner" / "f").write_text("x")
+    _age(sub, clock, 120)
+    assert L.clean_request_junk([queue], clock.wall) == 1
+    assert list((queue / "requests").iterdir()) == []
+
+
+def test_undeletable_junk_is_moved_aside(queue, clock, monkeypatch, caplog):
+    junk = queue / "requests" / "x.req.tmp"
+    junk.write_text("x")
+    _age(junk, clock, 120)
+    real_unlink = os.unlink
+
+    def unlink(path, *a, **k):
+        if str(path).endswith("x.req.tmp"):
+            raise PermissionError("locked")
+        return real_unlink(path, *a, **k)
+
+    monkeypatch.setattr(L.os, "unlink", unlink)
+    assert L.clean_request_junk([queue], clock.wall) == 1
+    assert list((queue / "requests").iterdir()) == []
+    assert (queue / L.REJECTED_DIR / "x.req.tmp").read_text() == "x"
+
+
+def test_unmovable_junk_is_logged_once(queue, clock, monkeypatch, caplog):
+    junk = queue / "requests" / "y.tmp"
+    junk.write_text("x")
+    _age(junk, clock, 120)
+    monkeypatch.setattr(L.os, "unlink", lambda *a, **k: (_ for _ in ()).throw(OSError("no")))
+    monkeypatch.setattr(L.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("no")))
+    with caplog.at_level("WARNING", logger="vlcsubsync.lifecycle"):
+        assert L.clean_request_junk([queue], clock.wall) == 0
+        assert L.clean_request_junk([queue], clock.wall) == 0
+    assert sum("cannot remove or move" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_stuck_requests_only_moved_when_asked(queue, clock):
+    req = queue / "requests" / "r9.req"
+    req.write_text("x")
+    _age(req, clock, 30)
+    fresh = queue / "requests" / "r10.req"
+    fresh.write_text("x")
+    _age(fresh, clock, 1)
+    assert L.clean_request_junk([queue], clock.wall) == 0  # startup: never touch .req
+    assert L.clean_request_junk([queue], clock.wall, stuck_requests=True) == 1
+    assert (queue / L.REJECTED_DIR / "r9.req").exists()
+    assert sorted(p.name for p in (queue / "requests").iterdir()) == ["r10.req"]
+
+
+def test_daemon_exit_moves_unreadable_request_aside(denv, queue, clock, monkeypatch):
+    def unreadable(path):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(D.P, "read_request", unreadable)
+    req = queue / "requests" / "stuck.req"
+    req.write_text("version=1\n")
+    _age(req, clock, 30)
+    d = make_daemon(denv, queue, clock, idle_exit=True, poll_interval=0.01, idle_check_interval=0.0)
+    intf(queue, clock, state="stopped")
+    t = threading.Thread(target=d.run)
+    t.start()
+    try:
+        time.sleep(0.2)
+        assert req.exists()  # the daemon keeps retrying while it runs
+        clock.advance(16)
+        t.join(5)
+        assert not t.is_alive()
+        assert list((queue / "requests").iterdir()) == []
+        assert (queue / L.REJECTED_DIR / "stuck.req").exists()
+    finally:
+        d.request_stop()
+        t.join(5)

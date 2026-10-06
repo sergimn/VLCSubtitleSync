@@ -258,9 +258,14 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job w
      compromise. Recursion stops at 2×120 s, depth 5 or when the probe has nothing new.
    * Segments too short to split get one probe at their point farthest from any
      window (independent evidence) and are folded into a neighbour when at least as
-     many of their windows agree with the neighbour as with them (ties favour fewer
-     segments). Real case: with beam-1 CPU decoding, one cold-open window's
-     timestamps were 1.6 s late and created a false 90 s first segment.
+     many audio regions vote for the neighbour as for them (ties favour fewer
+     segments). A fold compares two lines, so each window votes for the line its
+     consensus is closer to (if within 0.5 s); overlapping windows (centres < 30 s
+     apart) share their audio and its timestamp bias and cast one vote. The safety
+     net below leaves the outvoted windows out of its comparison. Real cases: with
+     beam-1 CPU decoding the cold-open window(s) came back 1.6 s late and created a
+     false 90 s first segment; in thorough mode an adaptive window overlapped the
+     biased one and outvoted the probe 2:0 until overlapping windows voted once.
    * Adjacent segments merge when one refit of both *positively* verifies against all
      their windows (a genuine 10 s cut holding < 10% of the anchors stays: its windows
      disagree with any merged line). Boundaries of new splits

@@ -1160,6 +1160,38 @@ def _change_point(arr: _AnchorArrays, p: _Piece) -> tuple[float, float] | None:
     return (lo, hi) if hi > lo else None
 
 
+def _fold_votes(
+    own_v: dict[int, tuple[str, float]],
+    nb_v: dict[int, tuple[str, float]],
+    centres: dict[int, float],
+    tol: float,
+) -> tuple[int, int]:
+    """Votes (own, neighbour) of the windows inside a short segment. Each window
+    votes for the line its consensus is closer to, if that line is within 2x ``tol``
+    (a fold compares two lines; it is not a verification against one). Overlapping
+    windows (centres < 30 s apart) cover the same audio and share its timestamp bias,
+    so they cast one vote together (their majority)."""
+    prefs = []
+    for k in sorted(own_v, key=lambda k: centres[k]):
+        (vo, do), (vn, dn) = own_v[k], nb_v[k]
+        if vo == "unknown" or vn == "unknown":
+            continue
+        best = min(abs(do), abs(dn))
+        if best <= 2 * tol:
+            prefs.append((centres[k], 1 if abs(do) <= abs(dn) else -1))
+    own = nb = 0
+    i = 0
+    while i < len(prefs):
+        j = i
+        while j + 1 < len(prefs) and prefs[j + 1][0] - prefs[j][0] < 30.0:
+            j += 1
+        tally = sum(v for _c, v in prefs[i : j + 1])
+        own += tally > 0
+        nb += tally < 0
+        i = j + 1
+    return own, nb
+
+
 @dataclass
 class _Piece:
     lo: float  # subtitle clock
@@ -1354,6 +1386,7 @@ def subdivide(
     # many of its windows agree with the neighbour as with the segment itself (ties
     # favour fewer segments).
     folded = 0
+    folded_windows: set[int] = set()  # windows outvoted by a fold (biased timestamps)
     i = 0
     while len(done) > 1 and i < len(done):
         p = done[i]
@@ -1374,20 +1407,21 @@ def subdivide(
         centres = _window_centres(arr)
         inside = [k for k, c in centres.items() if a_lo <= c <= a_hi]
         checks += 1
-        own_v = [_window_verdict(arr, k, p.seg, tol)[0] for k in inside]
-        own = own_v.count("agree")
-        if "agree" not in own_v and "disagree" not in own_v:
+        own_v = {k: _window_verdict(arr, k, p.seg, tol) for k in inside}
+        if all(v[0] == "unknown" for v in own_v.values()):
             unverified += 1
         target = None
         for j in (i - 1, i + 1):
             if 0 <= j < len(done):
-                votes = sum(_window_verdict(arr, k, done[j].seg, tol)[0] == "agree" for k in inside)
+                nb_v = {k: _window_verdict(arr, k, done[j].seg, tol) for k in inside}
+                own, votes = _fold_votes(own_v, nb_v, centres, tol)
                 if votes >= max(own, 1) and (target is None or votes > target[1]):
                     target = (j, votes)
         if target is None:
             i += 1
             continue
         j = target[0]
+        folded_windows |= {k for k, v in own_v.items() if v[0] == "agree"}
         a, b = done[min(i, j)], done[max(i, j)]
         nb = done[j].seg
         done[min(i, j) : max(i, j) + 1] = [
@@ -1458,8 +1492,13 @@ def subdivide(
     # Safety net against a bad refit: never trade a fit for one that explains clearly
     # fewer anchors (folding a biased window legitimately drops a few) or explains them
     # worse (the confidence itself also pays a small per-segment penalty).
-    _c0, n_in0, _g0, med0, _s0 = _fit_stats(fit.mapping, arr, n_windows)
-    if n_in < 0.9 * n_in0 or med > med0 + 0.05:
+    # Windows outvoted by a fold are left out of the comparison: losing their
+    # (biased) inliers is the point of the fold.
+    kept = [a for a in cur if a.window not in folded_windows]
+    ref = _AnchorArrays.build(kept) if folded_windows and len(kept) >= 3 else arr
+    _c1, n_in1, _g1, med1, _s1 = _fit_stats(mapping, ref, n_windows)
+    _c0, n_in0, _g0, med0, _s0 = _fit_stats(fit.mapping, ref, n_windows)
+    if n_in1 < 0.9 * n_in0 or med1 > med0 + 0.05:
         details.update(verify_splits=0, verify_rejected=True)
         conf0, n_in0, n_groups0, med0, stats0 = _fit_stats(fit.mapping, arr, n_windows)
         return AlignResult(fit.mapping, fit.method, conf0, n_in0, n_groups0, med0,

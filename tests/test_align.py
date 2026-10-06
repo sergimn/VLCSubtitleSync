@@ -829,3 +829,51 @@ def test_wobble_periods_and_phases_not_chopped(synth, period, phase):
     assert len(fit.mapping.segments) == 1
     assert np.median(err) < 0.1
     assert np.percentile(err, 95) < np.percentile(err0, 95)
+
+
+@pytest.mark.parametrize("bias", [1.0, 1.6])
+@pytest.mark.parametrize("biased_starts", [(60.0,), (60.0, 72.0)])
+def test_biased_cold_open_windows_end_as_one_segment(synth, bias, biased_starts):
+    from vlcsubsync.align import AlignResult
+
+    """One exact line, but the window(s) over the cold open come back with timestamps
+    ``bias`` s late (seen with beam-1 CPU decoding; two overlapping windows when an
+    adaptive window lands on the same audio). Whether or not fit_mapping sets them
+    apart, verification must end with one segment: overlapping windows share their
+    bias and vote once, and an independent probe votes for the line it is closer to."""
+    from vlcsubsync.transcribe import Word
+
+    duration = 30 * 60
+    script = synth.script(duration - 30, seed=1)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    fake = synth.FakeTranscriber(synth.speech_spans(script, lambda t: t + 2.0))
+
+    def transcribe(st):
+        words = fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)
+        b = bias if st in biased_starts else 0.0
+        return [Word(w.start + b, w.end + b, w.text) for w in words]
+
+    starts = [*biased_starts, 300.0, 540.0, 780.0, 1020.0, 1260.0, 1500.0, 1700.0]
+    windows = [(st, transcribe(st)) for st in starts]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    fit = fit_mapping(anchors, cues, None, n_windows=len(windows))
+    if len(fit.mapping.segments) == 1:  # make sure the fold path is exercised
+        mapping = Mapping([Segment(-math.inf, 1.0, 2.0 + bias, 20), Segment(150.0, 1.0, 2.0, 200)])
+        fit = AlignResult(mapping, "whisper", 0.9, 200, len(anchors))
+    probes = []
+
+    def probe(centre, near):
+        nonlocal anchors
+        st = max(0.0, centre - 15.0)
+        if len(probes) >= 3 or any(abs(s + 15 - centre) <= near for s, _w in windows):
+            return anchors, False
+        probes.append(st)
+        windows.append((st, transcribe(st)))
+        anchors = find_anchors(tok, windows)
+        return anchors, True
+
+    out, _ = subdivide(fit, anchors, cues, probe, None, 0.01, len(starts))
+    segs = out.mapping.segments
+    assert len(segs) == 1, [(s.start, s.offset) for s in segs]
+    assert segs[0].scale == 1.0 and segs[0].offset == pytest.approx(2.0, abs=0.1)

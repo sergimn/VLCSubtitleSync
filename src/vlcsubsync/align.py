@@ -39,8 +39,14 @@ SCALE_CANDIDATES = (
     23.976 / 24,
     25 / 24,
     24 / 25,
+    # NTSC video vs film/PAL timings (e.g. subtitles made for a 29.97 fps TV
+    # release played against a 23.976 fps web/Blu-ray video).
+    29.97 / 23.976,
+    23.976 / 29.97,
+    29.97 / 25,
+    25 / 29.97,
 )
-SCALE_MIN, SCALE_MAX = 0.9, 1.11
+SCALE_MIN, SCALE_MAX = 0.78, 1.28
 
 INLIER_THRESHOLD = 1.0  # s, residual for an anchor to count as consistent
 CHARS_PER_SECOND = 15.0  # typical speaking rate used to place tokens inside a cue

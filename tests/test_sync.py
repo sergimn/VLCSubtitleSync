@@ -66,6 +66,10 @@ def _check(err):
         ("negative", lambda t: t - 2.4),
         ("drift", lambda t: t * 25 / 23.976 - 2.0),
         ("slowdown", lambda t: t * 23.976 / 25 + 1.0),
+        # Subtitles timed for a 29.97 fps NTSC release over a 23.976 fps video
+        # (seen on a real TV episode: +25% drift).
+        ("ntsc", lambda t: t * 29.97 / 23.976 + 0.4),
+        ("ntsc_inverse", lambda t: t * 23.976 / 29.97 + 3.0),
     ],
 )
 def test_sync_whisper_path(tmp_path, synth, energy_vad, name, transform):

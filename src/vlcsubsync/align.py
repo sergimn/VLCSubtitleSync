@@ -830,33 +830,71 @@ def vad_align(
 def retime(
     times: Sequence[tuple[float, float]], mapping: Mapping, min_duration: float = 0.2
 ) -> list[tuple[float, float]]:
-    """Map ``(start, end)`` pairs (seconds). Each cue uses the segment of its start;
-    durations scale with that segment; overlaps introduced by the mapping (e.g. at a
-    backwards cut) are clamped; negative times are clamped to 0. Nothing is dropped."""
-    out: list[tuple[float, float]] = []
-    for st, en in times:
+    """Map ``(start, end)`` pairs (seconds); the result is in input order and nothing
+    is dropped. Each cue uses the segment of its start and durations scale with it.
+
+    Afterwards, in original start order:
+
+    * start order is preserved: a cue mapped after a later cue (backwards cut) is
+      pulled to ``min_duration`` before it;
+    * nothing starts before 0: cues mapped before 0 get ordered slots from 0 on
+      (up to ``min_duration`` apart); a cue straddling 0 keeps its duration, one
+      entirely before 0 gets a minimal one;
+    * a cue ends at or before the next cue's start unless the two overlapped in the
+      original (those overlaps are intentional), and every duration is positive.
+    """
+    n = len(times)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: (times[i][0], times[i][1], i))
+    starts: list[float] = []
+    durs: list[float] = []
+    for i in order:
+        st, en = times[i]
         seg = mapping.segment_for(st)
-        ns = seg.map(st)
-        ne = ns + max(en - st, 0.0) * seg.scale
-        out.append((ns, ne))
-    order = sorted(range(len(times)), key=lambda i: (times[i][0], times[i][1]))
-    for a, b in zip(order, order[1:], strict=False):
-        orig_overlap = times[a][1] > times[b][0] + 1e-3
-        if orig_overlap:
-            continue
-        sa, ea = out[a]
-        sb, _eb = out[b]
-        if ea > sb:
-            out[a] = (sa, max(sb, sa + min_duration) if sb > sa else ea)
-    fixed = []
-    for s, e in out:
-        if s < 0:
-            e = max(e, 0.0)
-            s = 0.0
+        starts.append(seg.map(st))
+        durs.append(max(en - st, 0.0) * seg.scale)
+
+    # Backwards cut: keep start order by pulling earlier cues back (cascades).
+    for k in range(n - 2, -1, -1):
+        if starts[k] > starts[k + 1]:
+            starts[k] = starts[k + 1] - min_duration
+
+    # Negative starts (a prefix, starts are non-decreasing now): give each one an
+    # ordered slot from 0 on, squeezed before the first non-negative cue if there is
+    # room, else ``min_duration`` wide (pushing later cues just as far as needed).
+    m = 0
+    while m < n and starts[m] < 0.0:
+        m += 1
+    if m:
+        room = starts[m] if m < n else math.inf
+        step = min(min_duration, room / m)
+        if step < 0.01:
+            step = min_duration
+        floor = 0.0
+        for k in range(n):
+            if k >= m and starts[k] >= floor:
+                break
+            if k < m and starts[k] + durs[k] <= 0.0:
+                durs[k] = step
+            starts[k] = max(starts[k], floor)
+            floor = starts[k] + step
+
+    out: list[tuple[float, float]] = [(0.0, 0.0)] * n
+    for k, i in enumerate(order):
+        s, e = starts[k], starts[k] + durs[k]
+        nxt = math.inf
+        if k + 1 < n:
+            j = order[k + 1]
+            orig_overlap = times[i][1] > times[j][0] + 1e-3
+            if not orig_overlap:
+                nxt = starts[k + 1]
+        if e > nxt:
+            e = nxt
         if e <= s:
-            e = s + min_duration
-        fixed.append((s, e))
-    return fixed
+            e = min(s + min_duration, nxt) if nxt > s else s + min_duration
+        out[i] = (s, e)
+    return out
 
 
 def apply_mapping(subs, mapping: Mapping) -> None:

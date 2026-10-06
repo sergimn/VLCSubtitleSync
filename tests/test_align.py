@@ -273,28 +273,97 @@ def test_vad_align_empty():
 # --- applying a mapping ---------------------------------------------------------------
 
 
+def _check_retimed(times, out, min_gap=0.0):
+    """Invariants of :func:`retime`: nothing dropped, starts ≥ 0 and sorted in original
+    order, positive durations, and no overlap between cues that did not overlap."""
+    assert len(out) == len(times)
+    order = sorted(range(len(times)), key=lambda i: (times[i][0], times[i][1], i))
+    for i in order:
+        s, e = out[i]
+        assert s >= 0.0 and e > s, (i, s, e)
+    for a, b in zip(order, order[1:], strict=False):
+        assert out[a][0] <= out[b][0], (a, b, out[a], out[b])
+        if times[a][1] <= times[b][0]:
+            assert out[a][1] <= out[b][0] + 1e-9, (a, b, out[a], out[b])
+
+
 def test_retime_keeps_everything_and_fixes_overlaps():
     m = Mapping(
         [Segment(-math.inf, 1.0, 10.0), Segment(100.0, 1.0, 4.0)]  # backwards jump at 100 s
     )
     times = [(90.0, 99.0), (99.5, 102.0), (100.5, 103.0), (200.0, 201.0)]
     out = retime(times, m)
-    assert len(out) == 4
-    assert out[0] == (100.0, 109.0)
-    # cue 1 still uses segment 0 (its start < 100); cue 2 jumps back; overlaps clamped
-    for s1, e1 in out:
-        assert e1 > s1
-    assert out[1][1] <= out[2][0] or out[2][0] < out[1][0]
+    _check_retimed(times, out)
+    # cue 1 still uses segment 0 (its start < 100) and would land after cue 2, which
+    # jumps back: it is pulled in front of cue 2 instead, and cue 0 ends before it.
+    assert out[0][0] == 100.0
+    assert out[2] == (104.5, 107.0)
+    assert out[1] == pytest.approx((104.3, 106.8))  # overlapped cue 2 originally: kept
+    assert out[0][1] == pytest.approx(104.3)
     assert out[3] == (204.0, 205.0)
+
+
+def test_retime_overlap_clamp_when_next_cue_maps_before_this_one():
+    # Old clamp kept the overlap when the next cue's mapped start was <= this one's.
+    m = Mapping([Segment(-math.inf, 1.0, 0.0), Segment(10.0, 1.0, -3.0)])
+    times = [(8.0, 9.5), (10.0, 12.0), (12.5, 14.0)]
+    out = retime(times, m)
+    _check_retimed(times, out)
+    assert out[1] == (7.0, 9.0) and out[2] == (9.5, 11.0)
+    assert out[0][1] <= out[1][0]
+
+
+def test_retime_backward_cut_keeps_order_and_every_cue():
+    m = Mapping([Segment(-math.inf, 1.0, 10.0), Segment(100.0, 1.0, 4.0)])
+    times = [(90.0 + i, 90.8 + i) for i in range(21)]  # 90 … 110 s
+    out = retime(times, m)
+    _check_retimed(times, out)
+    starts = [s for s, _e in out]
+    assert starts == sorted(starts)
+    # cues away from the cut are untouched
+    assert out[0] == (100.0, 100.8)
+    assert out[-1] == pytest.approx((114.0, 114.8))
+
+
+def test_retime_negative_times_keep_order():
+    m = Mapping.linear(1.0, -10.0)
+    times = [(1.0, 2.0), (3.0, 4.0), (9.0, 11.0), (12.0, 13.0)]
+    out = retime(times, m)
+    _check_retimed(times, out)
+    assert [s for s, _e in out[:3]] == pytest.approx([0.0, 0.2, 0.4])
+    assert out[0][1] == pytest.approx(0.2)  # entirely before 0: minimal duration
+    assert out[2][1] == pytest.approx(2.0)  # straddles 0: keeps its duration, clamped
+    assert out[3] == (2.0, 3.0)  # untouched
+
+
+def test_retime_negative_times_squeeze_before_first_good_cue():
+    m = Mapping.linear(1.0, -10.0)
+    times = [(1.0, 2.0), (2.0, 3.0), (3.0, 4.0), (4.0, 5.0), (10.3, 11.0)]
+    out = retime(times, m)
+    _check_retimed(times, out)
+    assert out[4] == pytest.approx((0.3, 1.0))  # not pushed
+    assert all(e <= 0.3 + 1e-9 for _s, e in out[:4])
 
 
 def test_retime_preserves_original_overlaps_and_clamps_negative():
     m = Mapping.linear(1.0, -5.0)
     times = [(1.0, 4.0), (2.0, 3.0), (10.0, 12.0)]  # first two overlap on purpose
     out = retime(times, m)
+    _check_retimed(times, out)
     assert out[0][0] == 0.0 and out[0][1] > 0.0
-    assert out[1][0] == 0.0 and out[1][1] > out[1][0]
+    assert out[1][0] > out[0][0] and out[1][1] > out[1][0]
     assert out[2] == (5.0, 7.0)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_retime_invariants_random(seed):
+    rng = np.random.default_rng(seed)
+    segs = [Segment(-math.inf, float(rng.uniform(0.95, 1.05)), float(rng.uniform(-20, 20)))]
+    for b in sorted(rng.uniform(10, 290, size=int(rng.integers(0, 4)))):
+        segs.append(Segment(float(b), segs[-1].scale, segs[-1].offset + float(rng.uniform(-8, 8))))
+    starts = np.sort(rng.uniform(0, 300, size=80))
+    times = [(float(t), float(t + rng.uniform(0.0, 4.0))) for t in starts]
+    _check_retimed(times, retime(times, Mapping(segs)))
 
 
 def test_retime_scales_durations():

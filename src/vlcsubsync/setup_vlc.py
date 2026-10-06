@@ -16,6 +16,7 @@ filesystem root and subprocess calls.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import plistlib
 import re
@@ -214,10 +215,13 @@ def detect_vlc_installs(ctx: Context, *, include_default: bool = True) -> list[V
         snap_user = home / "snap" / "vlc"
         if _exists(_under_root(ctx, "snap/vlc")) or _exists(snap_user):
             current = snap_user / "current"
+            # The snap's launcher (vlc-snap-wrapper.sh) runs
+            # `vlc --config=$SNAP_USER_COMMON/vlcrc`, so VLC reads ~/snap/vlc/common/vlcrc,
+            # not the XDG path inside the revision directory.
             inst = VlcInstall(
                 "snap",
                 dirs["snap"],
-                current / ".config" / "vlc" / "vlcrc",
+                snap_user / "common" / "vlcrc",
                 f"snap ({current})",
             )
             if not _exists(current):
@@ -499,6 +503,43 @@ def unconfigure_vlcrc(ctx: Context, inst: VlcInstall) -> None:
         if extra.exists() and ctx.do(f"remove {extra}"):
             with contextlib.suppress(OSError):
                 extra.unlink()
+
+
+def cleanup_legacy_snap_vlcrc(ctx: Context, inst: VlcInstall) -> None:
+    """Undo what versions <= 0.1.0 wrote to the snap vlcrc that VLC never reads.
+
+    Those versions edited ~/snap/vlc/current/.config/vlc/vlcrc, but the snap launcher
+    passes --config=~/snap/vlc/common/vlcrc. Only files carrying our state marker are
+    touched. A vlcrc we created ourselves is removed only if, after reverting our keys,
+    no active settings remain (the user or VLC may have added some since).
+    """
+    if inst.kind != "snap":
+        return
+    legacy = dataclasses.replace(
+        inst, vlcrc=ctx.home / "snap" / "vlc" / "current" / ".config" / "vlc" / "vlcrc"
+    )
+    if legacy.vlcrc == inst.vlcrc or not legacy.state_file.exists():
+        return
+    state = P.read_kv(legacy.state_file) or {}
+    ctx.info(f"cleaning up settings from an earlier version in {legacy.vlcrc}")
+    unconfigure_vlcrc(ctx, legacy)
+    if state.get("created_vlcrc") != "1" or not legacy.vlcrc.exists():
+        return
+    if ctx.dry_run:
+        ctx.do(f"remove {legacy.vlcrc} if no other settings remain")
+        return
+    if _has_active_settings(_read_text(legacy.vlcrc)):
+        ctx.info(f"keeping {legacy.vlcrc}: it now contains other settings")
+        return
+    if ctx.do(f"remove {legacy.vlcrc}"):
+        with contextlib.suppress(OSError):
+            legacy.vlcrc.unlink()
+
+
+def _has_active_settings(text: str) -> bool:
+    """True if a vlcrc has any `key=value` line that isn't commented out."""
+    _bom, lines, _nl = _split_lines(text)
+    return any("=" in ln and not ln.lstrip().startswith(("#", ";", "[")) for ln in lines)
 
 
 # --------------------------------------------------------------------------- Lua scripts
@@ -987,6 +1028,7 @@ def run_setup(
             continue
         try:
             install_scripts(ctx, inst, scripts)
+            cleanup_legacy_snap_vlcrc(ctx, inst)
             configure_vlcrc(ctx, inst)
             create_queue_dir(ctx, inst)
         except OSError as exc:
@@ -1043,6 +1085,7 @@ def run_uninstall(
         ctx.step(f"{inst.label()}: {inst.data_dir}")
         try:
             remove_scripts(ctx, inst)
+            cleanup_legacy_snap_vlcrc(ctx, inst)
             unconfigure_vlcrc(ctx, inst)
             remove_queue_dir(ctx, inst)
         except OSError as exc:

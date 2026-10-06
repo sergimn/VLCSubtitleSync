@@ -2,7 +2,8 @@
 
 Automatically re-times the **currently selected subtitle track** to the **currently
 selected audio track** in VLC, fixing both constant delays and progressive drift
-(e.g. 23.976↔25 fps conversions, ad-break cuts) with zero user input.
+(e.g. 23.976↔25 fps or 29.97↔23.976 fps conversions, ad-break cuts) with zero user
+input.
 
 ## Why this architecture
 
@@ -170,13 +171,26 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    tokens get times by interpolating within each cue. Match rare-ish n-grams (n=3, then
    2) between transcript windows and the *whole* subtitle token stream (no assumption
    on offset magnitude) → (sub_time, audio_time) pairs, weighted by n-gram uniqueness.
-5. Fit `audio = scale*sub + offset` robustly (RANSAC + IRLS refine). If residuals show
+5. Fit `audio = scale*sub + offset` robustly (RANSAC + IRLS refine). Scales are bounded
+   to 0.78–1.28, and free fits snap to the known framerate ratios
+   (`align.SCALE_CANDIDATES`):
+
+   | ratio | typical cause |
+   |---|---|
+   | 1 | same release, only an offset |
+   | 25/23.976, 23.976/25 | PAL ↔ film/NTSC-film (±4.3%) |
+   | 24/23.976, 23.976/24 | 24 ↔ 23.976 fps (±0.1%) |
+   | 25/24, 24/25 | PAL ↔ 24 fps (±4.2%) |
+   | 29.97/23.976, 23.976/29.97 | NTSC TV ↔ film (±25%), seen on real TV episodes |
+   | 29.97/25, 25/29.97 | NTSC TV ↔ PAL (±20%) |
+
+   If residuals show
    ≥2 clusters (cuts), fit piecewise-linear with DP over time-sorted anchors with a
    segment penalty (segments share `scale` unless evidence otherwise). If anchors are
    too sparse in a region, transcribe more windows there (adaptive, bounded).
 6. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
-   with the subtitle-on mask at 10 ms resolution over candidate scales
-   {1, 25/23.976, 23.976/25, 24/23.976, 23.976/24, 25/24, 24/25} (FFT), pick best.
+   with the subtitle-on mask at 10 ms resolution over the same candidate scales
+   (FFT), pick best.
 7. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 

@@ -11,7 +11,8 @@ synced copy. It fixes:
 
 - **constant delays** (subtitles always 3 s early or late),
 - **drift** (subtitles that slowly slide out of sync, e.g. a 25 fps subtitle on a
-  23.976 fps video),
+  23.976 fps video, or subtitles made for a 29.97 fps TV broadcast, which drift
+  by 25%: minutes off by the end of an episode),
 - **cuts** (the subtitle was made for a version with an extra scene or ad break, so
   it jumps out of sync halfway through).
 
@@ -165,6 +166,9 @@ them in `config.ini`.
   are not supported.
 - **The first sync of a file takes ~30–90 s on CPU.** The synced track appears when
   it's ready, and results are cached afterwards.
+- **Small residual offsets are possible.** The fit is one timing line per section of
+  the video, built from a sample of the audio, so individual lines can still be a
+  fraction of a second early or late. Drift beyond ±28% (0.78–1.28×) isn't handled.
 - Subtitles that don't match the dialogue at all (a different cut with re-edited
   lines, or a heavily paraphrased translation) may not be accepted. SubSync then keeps
   the original timing and tells you so instead of making things worse.

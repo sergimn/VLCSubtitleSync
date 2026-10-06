@@ -422,6 +422,51 @@ def test_control_auto_off_and_sync_now(h):
     assert h.intf_state()["auto"] == "1"
 
 
+def test_default_requests_have_no_mode(h):
+    h.set_input()
+    h.settle()
+    assert "mode" not in h.requests()[0]
+    assert "Syncing subtitles…" in h.osd()
+
+
+def test_sync_now_exhaustive_writes_mode_and_warns(h):
+    h.control(auto=0, sync_now=1)  # baseline
+    h.set_input()
+    h.settle()
+    assert h.requests() == []
+    h.control(auto=0, sync_now=2, sync_now_mode="exhaustive")
+    h.tick()
+    reqs = h.requests()
+    assert len(reqs) == 1
+    r = reqs[0]
+    assert r["mode"] == "exhaustive" and r["force"] == "0"
+    assert "Syncing subtitles (exhaustive, may take a while)…" in h.osd()
+    assert "may take a while" in h.intf_state()["message"]
+    # progress OSD keeps the warning
+    h.status(r["id"], state="running", progress="0.42", message="Transcribing 20/58")
+    h.tick(8)
+    assert any(
+        o.startswith("Syncing subtitles (exhaustive, may take a while)… 42%") for o in h.osd()
+    )
+    out = h.finish(r["id"])
+    h.tick(2)
+    assert h.added() == [(out, True)]
+    # a later plain "Sync now" (no mode key) goes back to the default
+    h.control(auto=0, sync_now=3)
+    h.tick()
+    reqs = h.requests()
+    assert len(reqs) == 1 and "mode" not in reqs[0]
+
+
+def test_sync_now_unknown_mode_is_ignored(h):
+    h.control(auto=0, sync_now=1)
+    h.set_input()
+    h.settle()
+    h.control(auto=0, sync_now=2, sync_now_mode="bogus")
+    h.tick()
+    assert "mode" not in h.requests()[0]
+
+
 def test_sync_now_without_subtitle_track(h):
     h.control(sync_now=1)
     h.set_input(spu_sel=-1)
@@ -538,17 +583,22 @@ def test_ext_descriptor_and_menu(ext):
     ext.lua.eval("activate()")
     assert (ext.q / "requests").is_dir()
     menu = dict(ext.lua.eval("menu()").items())
-    assert menu == {1: "Sync subtitles now", 2: "Auto-sync: ON", 3: "Status…"}
+    assert menu == {
+        1: "Sync subtitles now",
+        2: "Sync now (exhaustive)",
+        3: "Auto-sync: ON",
+        4: "Status…",
+    }
 
 
 def test_ext_toggle_auto_writes_control(ext):
     write_intf_state(ext)
     ext.control(auto=1, sync_now=3)
-    ext.lua.eval("trigger_menu(2)")
+    ext.lua.eval("trigger_menu(3)")
     c = parse_kv(ext.q / "control")
     assert c == {"auto": "0", "sync_now": "3"}
-    assert dict(ext.lua.eval("menu()").items())[2] == "Auto-sync: OFF"
-    ext.lua.eval("trigger_menu(2)")
+    assert dict(ext.lua.eval("menu()").items())[3] == "Auto-sync: OFF"
+    ext.lua.eval("trigger_menu(3)")
     assert parse_kv(ext.q / "control")["auto"] == "1"
 
 
@@ -572,7 +622,7 @@ def test_ext_fallback_sync_and_load(ext):
     assert r["media"] == MOVIE_PATH and r["audio_index"] == "1" and r["sub_index"] == "1"
     dlg = ext.mock.last_dialog
     assert dlg.shown and "Load synced result" in [w.text for w in dlg.widgets.values()]
-    assert dict(ext.lua.eval("menu()").items())[4] == "Load synced result"
+    assert dict(ext.lua.eval("menu()").items())[5] == "Load synced result"
     # not done yet
     dlg.button(dlg, "Load synced result").cb()
     assert ext.added() == []
@@ -584,6 +634,33 @@ def test_ext_fallback_sync_and_load(ext):
     # the loaded track is excluded from ordinals next time
     ext.lua.eval("input_changed()")
     assert ext.spu_ids()[-1] in [k for k in ext.E.state.ours.keys()]
+
+
+def test_ext_sync_now_exhaustive_signals_running_intf(ext):
+    write_intf_state(ext)
+    ext.lua.eval("trigger_menu(2)")
+    c = parse_kv(ext.q / "control")
+    assert c == {"auto": "1", "sync_now": "1", "sync_now_mode": "exhaustive"}
+    assert any("may take a while" in o for o in ext.osd())
+    # a plain "Sync subtitles now" afterwards drops the mode again
+    ext.lua.eval("trigger_menu(1)")
+    assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "2"}
+    assert ext.requests() == []
+
+
+def test_ext_fallback_exhaustive_request(ext):
+    ext.heartbeat()
+    ext.set_input()
+    ext.lua.eval("trigger_menu(2)")
+    reqs = ext.requests()
+    assert len(reqs) == 1 and reqs[0]["mode"] == "exhaustive"
+    assert "Syncing subtitles (exhaustive, may take a while)…" in ext.osd()
+    ext.status(reqs[0]["id"], state="running", progress="0.3", message="Transcribing 3/58")
+    assert "exhaustive, may take a while" in ext.E.check_job(False)
+    # the default item still writes no mode
+    (ext.q / "requests" / f"{reqs[0]['id']}.req").unlink()
+    ext.lua.eval("trigger_menu(1)")
+    assert "mode" not in ext.requests()[0]
 
 
 def test_ext_fallback_loads_on_input_changed(ext):
@@ -603,13 +680,13 @@ def test_ext_fallback_requires_subtitle(ext):
 
 
 def test_ext_status_dialog_hints(ext):
-    ext.lua.eval("trigger_menu(3)")
+    ext.lua.eval("trigger_menu(4)")
     html = ext.mock.last_dialog.widgets[1].text
     assert "never seen" in html
     assert "vlc-subsync setup" in html and "restart VLC" in html
     ext.heartbeat()
     write_intf_state(ext, state="done", last_result="synced: offset +1.00s")
-    ext.lua.eval("trigger_menu(3)")
+    ext.lua.eval("trigger_menu(4)")
     html = ext.mock.last_dialog.widgets[1].text
     assert "Helper daemon:</b> running" in html
     assert "interface script running" in html

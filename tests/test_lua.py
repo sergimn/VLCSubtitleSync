@@ -924,15 +924,46 @@ def test_delay_toggle_overrides_helper_config(h):
     assert delay_sets(h) == []
 
 
-def test_delay_mode_without_segments_never_adds_a_track(h):
+def test_delay_mode_without_segments_resyncs_once_then_gives_up(h):
+    """A result without mapping (cached before mappings were sent, or an old
+    helper): re-sync once with force; never add a track; never remember it as
+    "not applied" (a later selection asks again)."""
+    h.control(auto=1, sync_now=0, sync_mode="delay")
+    h.set_input()
+    h.mock.set_time(10)
+    h.settle()
+    req = h.requests()[0]
+    assert req["force"] == "0"
+    h.finish(req["id"])  # no segments
+    h.tick()
+    retry = h.requests()
+    assert len(retry) == 1 and retry[0]["force"] == "1" and retry[0]["id"] != req["id"]
+    assert retry[0]["sub_index"] == req["sub_index"]
+    assert retry[0]["audio_label"] == req["audio_label"]
+    assert not any("needs a newer helper" in o for o in h.osd())
+    # the fresh sync has the mapping: applied live
+    h.finish(retry[0]["id"], **seg_status((None, None, 1.0, 2.0)))
+    h.tick()
+    assert spu_delay(h) == 2_000_000 and h.added() == []
+
+
+def test_delay_mode_old_helper_gives_up_without_memoizing(h):
     h.control(auto=1, sync_now=0, sync_mode="delay")
     h.set_input()
     h.settle()
-    req = h.requests()[0]
-    h.finish(req["id"])  # an older helper: no segments
+    h.finish(h.requests()[0]["id"])
+    h.tick()
+    h.finish(h.requests()[0]["id"])  # the forced retry has no mapping either
     h.tick(3)
     assert h.added() == [] and delay_sets(h) == []
     assert any("live delay needs a newer helper" in o for o in h.osd())
+    assert h.requests() == []  # no loop
+    # nothing memoized as "not applied": re-selecting the track asks again
+    h.select("spu-es", 21)
+    h.settle()
+    h.select("spu-es", 20)
+    h.settle()
+    assert [r["sub_index"] for r in h.requests()][-1] == "0"
 
 
 def test_default_track_mode_ignores_segments(h):
@@ -1002,6 +1033,117 @@ def test_parse_segments_rejects_bad_input(h):
         {"segments": "0"},
     ):
         assert h.S.parse_segments(h.lua.table_from(bad)) is None, bad
+
+
+def test_delay_same_uri_replay_is_a_new_input(h):
+    """Repeat-one / loop / replay: a new input object with the same URI and a fresh
+    spu-delay. Its 0 must not become a +5.36 s "user bias"; the mapping is applied
+    again from memory, without a new request."""
+    start_delay(h, (None, None, 23.976 / 25, 1.44), t0=170)
+    assert spu_delay(h) < -5_000_000
+    assert h.selected("subsync-delay").split("|")[1:] == ["0", str(spu_delay(h))]
+    # the same file starts again inside one tick: new input, spu-delay from sub-delay
+    h.set_input()
+    h.mock.set_time(0.5)
+    h.tick()
+    assert h.S.state.delay is None
+    assert not any("bias now" in line for line in h.logs())
+    assert any("new input object for the same media" in line for line in h.logs())
+    h.settle()
+    assert spu_delay(h) == expected_us(0.5, 23.976 / 25, 1.44)
+    assert h.S.state.delay.bias == 0
+    assert h.requests() == []  # remembered, no new sync
+
+
+def test_delay_restarted_intf_does_not_take_its_old_correction_as_bias(h, runtime, tmp_path):
+    start_delay(h, (None, None, 1.0, 3.0), t0=10)
+    h.select("spu-delay", 3_200_000)  # the user adds 0.2 s
+    h.tick()
+    assert h.S.state.delay.bias == 200_000
+    # the intf restarts (VLC keeps playing the same input and its variables)
+    h.S.reset()
+    h.tick()
+    h.settle()
+    h.finish(h.requests()[0]["id"], **seg_status((None, None, 1.0, 3.0)))
+    h.tick()
+    assert h.S.state.delay.bias == 200_000  # the user's part, not 3.2 s
+    assert spu_delay(h) == 3_200_000
+    assert any("found an earlier correction" in line for line in h.logs())
+
+
+def test_delay_intf_exit_restores_user_delay(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    h.select("spu-delay", 2_100_000)  # pressed H twice just before closing
+    h.S.shutdown()  # what run() does when VLC interrupts mwait()
+    assert spu_delay(h) == 100_000
+    assert h.selected("subsync-delay") == ""
+    assert any("stop (exit)" in line for line in h.logs())
+    assert h.intf_state()["state"] == "stopped"
+
+
+def test_run_calls_shutdown(runtime, tmp_path):
+    src = INTF.read_text(encoding="utf-8")
+    run = src[src.index("function M.run()") :]
+    assert "M.shutdown()" in run[: run.index("\nend\n")]
+
+
+def test_delay_stop_keeps_last_user_change_of_the_tick(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    # G pressed (-50 ms) and the track switched within the same tick
+    h.select("spu-delay", 1_950_000)
+    h.select("spu-es", 21)
+    h.tick()
+    assert spu_delay(h) == -50_000
+
+
+def test_delay_replace_keeps_last_user_change(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    h.select("spu-delay", 2_050_000)
+    # a forced re-sync of the same combination finishes before the next tick
+    h.control(auto=1, sync_now=1, sync_mode="delay")
+    h.tick(2)
+    req = h.requests()[0]
+    h.select("spu-delay", 2_100_000)
+    h.finish(req["id"], **seg_status((None, None, 1.0, 4.0)))
+    h.tick()
+    assert h.S.state.delay.bias == 100_000
+    assert spu_delay(h) == 4_100_000
+
+
+def test_delay_ignores_sub_millisecond_differences(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    h.select("spu-delay", 2_000_400)  # rounding somewhere, not the user
+    h.tick()
+    assert h.S.state.delay.bias == 0
+    assert not any("bias now" in line for line in h.logs())
+
+
+def test_delay_many_segments_and_knots_are_fast(h):
+    import time as _time
+
+    n, per = 256, 16  # 4096 knots: the cap
+    segs, knots = [], {}
+    for i in range(n):
+        lo = None if i == 0 else i * 30.0
+        hi = None if i == n - 1 else (i + 1) * 30.0
+        segs.append((lo, hi, 1.0 + (i % 3) * 0.001, 0.5 * i))
+        knots[i] = [(i * 30.0 + j * 2.0, 0.01 * ((j % 5) - 2)) for j in range(per)]
+    st = seg_status(*segs, knots=knots)
+    parsed = h.S.parse_segments(h.lua.table_from(st))
+    assert parsed is not None and len(parsed) == n
+    t0 = _time.perf_counter()
+    for k in range(2000):
+        h.S.delay_at(parsed, (k * 3.7) % (n * 30.0))
+    h.S.min_delay(parsed, n * 30.0)
+    assert _time.perf_counter() - t0 < 2.0
+    # more than the knot cap: the extra knots are ignored, the segments kept
+    st["seg5_knots"] = ";".join(f"{150 + j * 0.01:.3f}:0.0100" for j in range(50))
+    parsed = h.S.parse_segments(h.lua.table_from(st))
+    assert parsed is not None and len(parsed) == n
+    total = sum(len(parsed[i].knots) for i in range(1, n + 1))
+    assert total <= 4096 and len(parsed[6].knots) == 50
+    assert len(parsed[n].knots) == 0
+    assert any("more than 4096 knots" in line for line in h.logs())
 
 
 # ========================================================================== extension

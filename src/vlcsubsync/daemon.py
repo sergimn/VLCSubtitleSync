@@ -896,6 +896,11 @@ class Daemon:
             if m != own and not P._to_bool(hit[1].get("applied")):
                 log.debug("ignoring unapplied cached %s result for a %s job", m, own)
                 continue
+            if P._to_bool(hit[1].get("applied")) and not hit[1].get("segments"):
+                # cached before results carried their mapping: delay mode cannot
+                # use it, so re-sync once (the new result replaces it)
+                log.info("cached %s result has no mapping; re-syncing", m)
+                continue
             return hit
         return None
 

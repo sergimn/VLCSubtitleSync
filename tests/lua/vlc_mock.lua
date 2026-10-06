@@ -136,6 +136,13 @@ function Mock.new(opts)
             process_adds()
             return m.input.sel[name]
         end,
+        -- like VLC: creates the variable (if missing) and sets it; get() of a
+        -- variable that does not exist returns nothing
+        create = function(obj, name, value)
+            assert(obj and obj._input, "create on non-input object")
+            if m.input.sel[name] == nil then m.input.sel[name] = value end
+            m.creates = (m.creates or 0) + 1
+        end,
         set = function(obj, name, value)
             assert(obj and obj._input, "set on non-input object")
             m.input.sel[name] = value

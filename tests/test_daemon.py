@@ -25,7 +25,11 @@ def wait_for(cond, timeout=10.0, interval=0.02):
 class FakeRunner:
     """Writes a fake SRT; optionally blocks until released."""
 
-    def __init__(self, fail_for=(), block=False, applied=True, mapping_segments=None):
+    def __init__(self, fail_for=(), block=False, applied=True, mapping_segments="default"):
+        # the engine always returns its mapping when applied; None = an engine
+        # from before mappings were sent
+        if mapping_segments == "default":
+            mapping_segments = [P.MapSegment(None, None, 1.0417, 2.35)]
         self.mapping_segments = mapping_segments
         self.calls: list[D.JobSpec] = []
         self.fail_for = set(fail_for)
@@ -609,3 +613,33 @@ def test_status_reports_configured_sync_mode_also_on_cache_hit(env):
         assert len(runner.calls) == 1  # cache hit...
         assert st.sync_mode == "track"  # ...with today's setting
         assert st.segments == SEGS
+
+
+def test_applied_cache_entry_without_mapping_is_resynced(env):
+    """Results cached before this change have no seg* keys: delay mode could not
+    use them, so they are a miss (once: the new result replaces them)."""
+    media = make_media(env)
+    runner = FakeRunner(mapping_segments=None)  # like the engine before mappings
+    with Harness(env, runner) as h:
+        h.submit("o_1", media, sub_index=0)
+        h.wait_state("o_1", "done")
+        runner.mapping_segments = SEGS
+        h.submit("o_2", media, sub_index=0)
+        st = h.wait_state("o_2", "done")
+        assert len(runner.calls) == 2  # re-synced, not served from the old entry
+        assert st.segments == SEGS
+        h.submit("o_3", media, sub_index=0)
+        st = h.wait_state("o_3", "done")
+        assert len(runner.calls) == 2  # the new entry is a normal hit
+        assert st.segments == SEGS
+
+
+def test_unapplied_cache_entry_without_mapping_is_still_a_hit(env):
+    media = make_media(env)
+    runner = FakeRunner(applied=False)
+    with Harness(env, runner) as h:
+        h.submit("n_1", media, sub_index=0)
+        h.wait_state("n_1", "done")
+        h.submit("n_2", media, sub_index=0)
+        h.wait_state("n_2", "done")
+        assert len(runner.calls) == 1  # hopeless work is not redone

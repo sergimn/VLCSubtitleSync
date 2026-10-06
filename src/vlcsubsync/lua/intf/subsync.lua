@@ -481,16 +481,46 @@ end
 -- seg<i>_knots=<t>:<c>;... with audio = scale*sub + offset + c(sub), all in
 -- seconds of the subtitle clock (DESIGN.md "Mapping segments").
 
+M.MAX_SEGMENTS = 256
+M.MAX_KNOTS = 4096          -- knots of all segments together (more are ignored)
+M.BIAS_MIN_US = 1000        -- spu-delay differences below this are not the user's
+-- String variable we create on the input object: "<token>|<bias>|<last set>".
+-- A new input object (same file played again, repeat, playlist loop) lacks it,
+-- and a restarted intf finds its predecessor's correction in it.
+M.MARK_VAR = "subsync-delay"
+
 local function num(s)
     local v = tonumber(s)
     if v == nil or v ~= v or v == math.huge or v == -math.huge then return nil end
     return v
 end
 
+-- Local refinement c(t): linear between knots, flat outside (binary search).
+function M.seg_correction(seg, t)
+    local k = seg.knots
+    local n = #k
+    if n == 0 then return 0 end
+    if t <= k[1][1] then return k[1][2] end
+    if t >= k[n][1] then return k[n][2] end
+    local lo, hi = 1, n -- k[lo][1] < t <= k[hi][1]
+    while hi - lo > 1 do
+        local mid = math.floor((lo + hi) / 2)
+        if k[mid][1] < t then lo = mid else hi = mid end
+    end
+    local x0, y0, x1, y1 = k[lo][1], k[lo][2], k[hi][1], k[hi][2]
+    if x1 <= x0 then return y0 end
+    return y0 + (y1 - y0) * (t - x0) / (x1 - x0)
+end
+
+function M.seg_audio(seg, s)
+    return seg.scale * s + seg.offset + M.seg_correction(seg, s)
+end
+
 function M.parse_segments(st)
     local n = tonumber(st and st.segments)
-    if not n or n < 1 or n > 256 then return nil end
+    if not n or n < 1 or n > M.MAX_SEGMENTS then return nil end
     local segs = {}
+    local total = 0
     for i = 0, n - 1 do
         local v = st["seg" .. i]
         if not v then return nil end
@@ -509,47 +539,28 @@ function M.parse_segments(st)
                 if not kt or not kc then return nil end
                 seg.knots[#seg.knots + 1] = { kt, kc }
             end
+            if total + #seg.knots > M.MAX_KNOTS then
+                log_err("mapping has more than " .. M.MAX_KNOTS .. " knots; ignoring those of segment " .. i)
+                seg.knots = {}
+            end
+            total = total + #seg.knots
             table.sort(seg.knots, function(x, y) return x[1] < y[1] end)
         end
+        -- audio-domain span [alo, ahi), computed once (open bounds -> +-huge)
+        seg.alo = seg.lo and M.seg_audio(seg, seg.lo) or -math.huge
+        seg.ahi = seg.hi and M.seg_audio(seg, seg.hi) or math.huge
         segs[#segs + 1] = seg
     end
     return segs
 end
 
--- Local refinement c(t): linear between knots, flat outside.
-function M.seg_correction(seg, t)
-    local k = seg.knots
-    local n = #k
-    if n == 0 then return 0 end
-    if t <= k[1][1] then return k[1][2] end
-    for i = 2, n do
-        if t <= k[i][1] then
-            local x0, y0, x1, y1 = k[i - 1][1], k[i - 1][2], k[i][1], k[i][2]
-            if x1 <= x0 then return y0 end
-            return y0 + (y1 - y0) * (t - x0) / (x1 - x0)
-        end
-    end
-    return k[n][2]
-end
-
-function M.seg_audio(seg, s)
-    return seg.scale * s + seg.offset + M.seg_correction(seg, s)
-end
-
--- Audio-domain span [lo, hi) of a segment (open bounds -> +-huge).
-local function audio_span(seg)
-    local lo = seg.lo and M.seg_audio(seg, seg.lo) or -math.huge
-    local hi = seg.hi and M.seg_audio(seg, seg.hi) or math.huge
-    return lo, hi
-end
-
 -- Segment index for audio time T (s): the (last) segment whose audio span
 -- contains T; in a gap (forward cut) the upcoming one; after the end the
--- nearest preceding one.
+-- nearest preceding one. O(segments), spans are precomputed.
 function M.segment_at(segs, T)
     local hit, up, up_lo, prev, prev_hi
     for i, seg in ipairs(segs) do
-        local lo, hi = audio_span(seg)
+        local lo, hi = seg.alo, seg.ahi
         if T >= lo and T < hi then hit = i end
         if lo > T and (not up_lo or lo < up_lo) then up, up_lo = i, lo end
         if hi <= T and (not prev_hi or hi >= prev_hi) then prev, prev_hi = i, hi end
@@ -573,15 +584,14 @@ function M.delay_at(segs, T)
 end
 
 -- Most negative delay over playback times [0, len] (len <= 0: unknown, then
--- only the segment boundaries and 0 are looked at). Delays are linear within
--- a segment (up to the small knot corrections), so the ends of each audio span
--- are enough.
+-- only 0 and the segment boundaries are looked at, so an open last segment
+-- drifting further negative is underestimated). Delays are linear within a
+-- segment (up to the small knot corrections), so the span ends are enough.
 function M.min_delay(segs, len)
     local ts = { 0 }
     if len and len > 0 then ts[#ts + 1] = len end
     for _, seg in ipairs(segs) do
-        local lo, hi = audio_span(seg)
-        for _, t in ipairs({ lo, hi - 0.001 }) do
+        for _, t in ipairs({ seg.alo, seg.ahi - 0.001 }) do
             if t > 0 and t < math.huge and (not len or len <= 0 or t < len) then
                 ts[#ts + 1] = t
             end
@@ -611,16 +621,67 @@ local function get_int(input, var)
     return nil
 end
 
+-- Our mark on the input: token, bias, last set value (nil if absent).
+local function read_mark(input)
+    local ok, v = pcall(vlc.var.get, input, M.MARK_VAR)
+    if not ok or type(v) ~= "string" or v == "" then return nil end
+    local tok, b, l = v:match("^([^|]*)|(-?%d+)|(-?%d+)$")
+    if not tok then return nil end
+    return tok, tonumber(b), tonumber(l)
+end
+
+local function write_mark(input, D)
+    if D.no_mark then return end
+    local value = ""
+    if D.last_set then value = D.token .. "|" .. D.bias .. "|" .. D.last_set end
+    local ok = pcall(vlc.var.set, input, M.MARK_VAR, value)
+    if not ok then D.no_mark = true end
+end
+
+-- Fold a change of spu-delay made by someone else (hotkeys G/H, the Track
+-- Synchronization dialog) into the user's bias: it stays on top of ours.
+local function fold_user_change(input, D)
+    if not D.last_set then return end
+    local cur = get_int(input, "spu-delay")
+    if cur and math.abs(cur - D.last_set) >= M.BIAS_MIN_US then
+        D.bias = D.bias + (cur - D.last_set)
+        D.last_set = cur
+        write_mark(input, D)
+        log_info(string.format("delay mode: user adjusted spu-delay, bias now %d us", D.bias))
+    end
+end
+
+-- True if `input` is still the input object we started on (our mark is there).
+local function same_input(input, D)
+    if D.no_mark or not D.last_set then return true end
+    local tok = read_mark(input)
+    return tok == D.token
+end
+
 -- Start correcting the selected original track live. `entry` is the memo
 -- entry ({segs, message, ...}), `key` its audio|sub key.
 function M.delay_start(input, snap, entry, key)
     if S.delay then M.delay_stop(input, "replaced") end
-    S.delay = {
+    local cur = round(get_int(input, "spu-delay") or 0)
+    local bias = cur
+    local _, mbias, mlast = read_mark(input)
+    if mbias and mlast and math.abs(cur - mlast) < M.BIAS_MIN_US then
+        -- a previous SubSync run (a restarted intf) left its correction here:
+        -- the user's own part is the bias it recorded, not the current value
+        bias = mbias
+        log_info(string.format("delay mode: found an earlier correction (%d us),"
+            .. " user bias %d us", cur, bias))
+    end
+    S.mark_counter = (S.mark_counter or 0) + 1
+    local D = {
         key = key, spu_id = snap.spu, audio_id = snap.audio, segs = entry.segs,
-        bias = round(get_int(input, "spu-delay") or 0), entry = entry,
+        bias = bias, entry = entry,
+        token = tostring(os.time()) .. "_" .. S.mark_counter,
     }
+    if not pcall(vlc.var.create, input, M.MARK_VAR, "") then D.no_mark = true end
+    S.delay = D
     log_info(string.format("delay mode: start (es=%s, %d segment(s), user bias %d us)",
-        tostring(snap.spu), #entry.segs, S.delay.bias))
+        tostring(snap.spu), #entry.segs, D.bias))
     M.delay_update(input, true)
     local text = "Subtitles synced (live delay, experimental): "
         .. ((entry.message and entry.message ~= "") and entry.message or "done")
@@ -635,30 +696,42 @@ function M.delay_start(input, snap, entry, key)
     S.state_dirty = true
 end
 
--- Stop, putting the user's own delay (normally 0) back.
+-- Stop, putting the user's own delay (normally 0) back, including a change
+-- the user made since our last tick.
 function M.delay_stop(input, why)
     local D = S.delay
     if not D then return end
     S.delay = nil
     S.state_dirty = true
-    if input then set_spu_delay(input, D.bias) end
+    if input and same_input(input, D) then
+        fold_user_change(input, D)
+        set_spu_delay(input, D.bias)
+        D.last_set = nil
+        write_mark(input, D) -- cleared
+    end
     log_info(string.format("delay mode: stop (%s), spu-delay back to %d us",
         tostring(why), D.bias))
 end
 
 -- One tick of delay mode: follow "time", keep the user's manual adjustments.
+-- Returns false if the input turned out to be a new one (state was reset).
+function M.delay_check_input(input)
+    if not S.delay or same_input(input, S.delay) then return true end
+    -- same file, new input object (replay, repeat, loop): its spu-delay is
+    -- fresh, nothing to restore or fold. Start over as for a new input (the
+    -- next tick); the mapping is remembered per media, no new request.
+    log_info("delay mode: new input object for the same media, starting over")
+    S.delay = nil
+    M.reset_input()
+    return false
+end
+
 function M.delay_update(input, force)
+    if not M.delay_check_input(input) then return false end
     local D = S.delay
     local T = get_int(input, "time")
-    if not T then return end
-    local cur = get_int(input, "spu-delay")
-    if D.last_set and cur and cur ~= D.last_set then
-        -- somebody else (hotkeys, the Track Synchronization dialog) moved it:
-        -- that difference is the user's bias and stays on top of ours
-        D.bias = D.bias + (cur - D.last_set)
-        D.last_set = cur
-        log_info(string.format("delay mode: user adjusted spu-delay, bias now %d us", D.bias))
-    end
+    if not T then return true end
+    fold_user_change(input, D)
     local wall = now_us()
     local seek = false
     if D.last_T then
@@ -680,8 +753,10 @@ function M.delay_update(input, force)
             log_dbg(string.format("spu-delay=%d us (time=%.3fs seg=%d bias=%d us%s)",
                 target, T / 1000000, i - 1, D.bias, seek and " seek" or ""))
             D.last_set = target
+            write_mark(input, D)
         end
     end
+    return true
 end
 
 ---------------------------------------------------------------- tracks
@@ -839,7 +914,8 @@ function M.submit(sel, force, mode)
         id, sel.audio, sel.sub, mode ~= "" and mode or "default", S.media_path))
     S.job = {
         id = id, key = sel.key, audio = sel.audio, sub = sel.sub,
-        sub_label = sel.sub_label, req_path = path, started = now_us(), mode = mode,
+        audio_label = sel.audio_label, sub_label = sel.sub_label, force = force,
+        req_path = path, started = now_us(), mode = mode,
         status_path = join(join(S.q, "jobs"), id .. ".status"),
     }
     local text = M.syncing_text(mode)
@@ -951,7 +1027,7 @@ function M.fire(input, snap, sel, force)
                 return
             end
             -- no mapping remembered (synced in track mode by an older helper):
-            -- ask the helper again, it answers from its cache
+            -- ask the helper again; it re-syncs cached results without one
             M.submit(sel, false)
             return
         end
@@ -1010,7 +1086,18 @@ function M.handle_status(input, snap)
         if st.applied == "1" and M.current_sync_mode() == "delay" then
             -- experimental: no extra track, correct the original one live
             if not segs then
-                memo[job.key] = { applied = false, message = message }
+                -- nothing is remembered for this key, so a later selection asks again
+                memo[job.key] = nil
+                if not job.force then
+                    -- e.g. a result cached before mappings were sent: ask for a
+                    -- fresh sync once (bypasses the helper's cache)
+                    log_info("job " .. job.id .. ": result has no mapping; re-syncing")
+                    M.submit({
+                        audio = job.audio, audio_label = job.audio_label, sub = job.sub,
+                        sub_label = job.sub_label, key = job.key,
+                    }, true, job.mode)
+                    return
+                end
                 M.osd("SubSync: live delay needs a newer helper – keeping original timing")
                 M.set_state("error", "no mapping in result (helper too old?)", nil)
                 log_err("job " .. job.id .. ": delay mode but the status has no segments")
@@ -1158,6 +1245,11 @@ function M.tick()
             sel.is_ours and " [synced]" or ""))
     end
 
+    -- delay mode: a replay of the same file is a new input object
+    if not M.delay_check_input(input) then
+        M.write_state()
+        return
+    end
     -- delay mode: the corrected combination is no longer selected -> give the
     -- user's own delay back (re-selecting it re-applies the remembered mapping)
     if S.delay and (snap.spu ~= S.delay.spu_id or snap.audio ~= S.delay.audio_id) then
@@ -1167,7 +1259,10 @@ function M.tick()
         S.sync_mode_changed = nil
         M.switch_sync_mode(input, snap, sel)
     end
-    if S.delay then M.delay_update(input, false) end
+    if S.delay and not M.delay_update(input, false) then
+        M.write_state()
+        return
+    end
 
     if (audio_changed or spu_changed) and S.auto then
         if not sel.key then
@@ -1267,8 +1362,21 @@ function M.run()
         local okw = pcall(vlc.misc.mwait, vlc.misc.mdate() + M.TICK_US)
         if not okw then break end
     end
+    M.shutdown()
+end
+
+-- Interface closing: give the input its user's delay back (VLC keeps the
+-- variable until the input ends), withdraw a request not picked up yet, and
+-- tell the helper we are gone.
+function M.shutdown()
     pcall(function()
-        -- withdraw a request the daemon has not picked up yet
+        if S.delay then
+            local get_input = vlc.object and vlc.object.input
+            local input = type(get_input) == "function" and get_input() or nil
+            M.delay_stop(input, "exit")
+        end
+    end)
+    pcall(function()
         if S.job and S.job.req_path then os.remove(S.job.req_path) end
         M.set_state("stopped", "", nil)
         M.write_state(true)

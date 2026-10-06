@@ -7,6 +7,7 @@ tolerant (ignore blank lines, comments, unknown keys, a UTF-8 BOM and CRLF endin
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -18,6 +19,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from .config import normalize_mode, normalize_sync_mode
+
+log = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
 
@@ -36,7 +39,7 @@ STATES = ("queued", "running", "done", "error")
 
 # Mapping segments in a done status (see DESIGN.md "Mapping segments").
 MAX_SEGMENTS = 256
-MAX_KNOTS = 4096  # per segment
+MAX_KNOTS = 4096  # all segments together (the Lua reader has the same cap)
 
 _ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,128}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -387,12 +390,25 @@ class Status:
         if self.confidence is not None:
             out["confidence"] = f"{self.confidence:.3f}"
         if self.segments:
-            segs = list(self.segments)[:MAX_SEGMENTS]
+            segs = list(self.segments)
+            if len(segs) > MAX_SEGMENTS:
+                log.warning(
+                    "mapping has %d segments; only the first %d are sent", len(segs), MAX_SEGMENTS
+                )
+                segs = segs[:MAX_SEGMENTS]
             out["segments"] = len(segs)
+            total = 0
             for i, seg in enumerate(segs):
                 out[f"seg{i}"] = format_segment(seg)
-                if seg.knots:
-                    out[f"seg{i}_knots"] = format_knots(seg.knots)
+                if not seg.knots:
+                    continue
+                if total + len(seg.knots) > MAX_KNOTS:
+                    log.warning(
+                        "mapping has more than %d knots; segment %d is sent without", MAX_KNOTS, i
+                    )
+                    continue
+                total += len(seg.knots)
+                out[f"seg{i}_knots"] = format_knots(seg.knots)
         sync_mode = normalize_sync_mode(self.sync_mode)
         if sync_mode:
             out["sync_mode"] = sync_mode
@@ -411,7 +427,13 @@ class Status:
             ]
             # all or nothing: a partial mapping would mis-time the gaps
             if all(p is not None for p in parsed):
-                segments = [p for p in parsed if p is not None]
+                segments, total = [], 0
+                for p in parsed:
+                    assert p is not None
+                    if total + len(p.knots) > MAX_KNOTS:  # same cap as the writer
+                        p = MapSegment(p.sub_start, p.sub_end, p.scale, p.offset)
+                    total += len(p.knots)
+                    segments.append(p)
         return cls(
             id=data.get("id", ""),
             state=data.get("state", "queued"),

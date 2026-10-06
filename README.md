@@ -263,6 +263,9 @@ Limitations, why it is experimental:
   prepared just before a large change (your own −1 s) was cut short.
 - At a cut (an ad break missing from the subtitles) the switch happens about a second
   early, so a line next to the cut can be off by the size of the cut.
+- After seeking backwards in a file that needed subtitles earlier, VLC keeps its larger
+  buffer, so lines can be a little late (about 0.2 s in the test above).
+- The pause estimate in the message is low when VLC does not know the file's length.
 - The delay applies to every subtitle track of the file, and VLC's track
   synchronization dialog shows SubSync's value, not yours.
 - When the helper finds nothing to fix confidently, the original timing is kept, as

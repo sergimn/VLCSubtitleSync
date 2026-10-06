@@ -152,10 +152,14 @@ sync_mode=track                        # the helper's configured sync_mode (trac
 `sub_start` of the next. `c` is #8's local refinement (`align.Segment.knots`, at most
 ±0.5 s): `seg<i>_knots=<sub_time>:<seconds>;…`, linearly interpolated and flat outside
 the knots; absent = 0. This is exactly the mapping `retime` applies to the output file
-(except its overlap/negative-time clean-up of individual cues). At most 256 segments;
-a reader drops the whole mapping if any line is malformed. Written only when
+(except its overlap/negative-time clean-up of individual cues). At most 256 segments
+and 4096 knots in total: the writer logs a warning and drops the extra segments, or the
+knots of the segments past the cap; readers (Python and Lua) apply the same knot cap.
+A reader drops the whole mapping if any line is malformed. Written only when
 `applied=1`; the result cache meta stores the same keys, so a cache hit returns them.
-Track mode ignores them and still loads `output`.
+An *applied* cache entry without `segments` (stored before mappings were sent) is
+treated as a miss and re-synced once; the new result replaces it. Track mode ignores
+the keys and still loads `output`.
 `<q>/heartbeat` (daemon): `time=<unix seconds>\npid=<pid>\nversion=<x.y.z>`; refreshed every ≤2 s.
 Lua considers the daemon alive if `os.time() - time <= 10`.
 
@@ -253,24 +257,51 @@ gap, a forward cut, the upcoming one; after the end the last). Subtitle time
 when knots exist (c is bounded and slow); delay `d = T − s`. Because a subtitle takes
 its delay when decoded, d is evaluated at `T + lead`, `lead = 1 s + max(0, −d(T))`
 (the caching plus the extra buffering of a negative delay; measured: median error
-+0.19 s without the lookahead, +0.06 s with it, same as track mode's +0.07 s). Set
++0.19 s without the lookahead, +0.06 s with it, same as track mode's +0.07 s). The
+lead assumes the buffering of the *current* delay, but VLC never shrinks `pts_delay`:
+after a backward seek (or once the delay rises again) the real buffering stays at the
+historical low, so the lookahead is too short by that difference and the error is
+about drift × difference (≈ 0.2 s after seeking back over −5 s at −4% drift). Set
 `spu-delay = round(d·1e6) + bias` when it differs from the value we last set by
 > 40 ms, at once on a seek (T moved > 2 s away from wall-clock progress), and on
 start. Every set logs `[subsync] spu-delay=<µs> us (time=<T>s seg=<i> bias=<µs>)`
 (dbg).
 
 User bias: at start `bias` = the current `spu-delay` (normally 0). If the variable
-differs from what we last set (hotkeys g/h, Track Synchronization), the difference is
-added to `bias` and kept on top of every later correction. On a switch of the
-subtitle or audio track, `spu-delay` is set back to `bias`; re-selecting the synced
-combination re-applies the remembered mapping (memo per input/audio/sub, no new
-request). A new input has a new `spu-delay` (from `sub-delay`), so nothing is restored
-on input change or stop. Toggling the mode while playing moves the result over (delay
-→ track: restore the bias, load `output`; track → delay: select the original track).
-"Sync now" with the corrected track selected forces a re-sync. A done status without
-segments (older helper) is not applied in delay mode (OSD says so). OSD on start:
-`"Subtitles synced (live delay, experimental): <message>"`, plus "– may pause playback
-up to N s in total" when the mapping needs a delay below −0.5 s over `[0, length]`.
+differs from what we last set by ≥ 1 ms (hotkeys g/h, Track Synchronization), the
+difference is added to `bias` and kept on top of every later correction; smaller
+differences are ignored. On a switch of the subtitle or audio track, `spu-delay` is
+set back to `bias`; re-selecting the synced combination re-applies the remembered
+mapping (memo per media/audio/sub, no new request). Stopping (track switch, mode
+toggle, a replacing result, intf exit) first folds a change the user made since the
+last tick into `bias`. When the interface closes (`M.shutdown`, from `M.run`), the input
+gets `bias` back, since VLC keeps the variable until the input ends.
+
+Input identity: the intf creates a string variable `subsync-delay` on the input object
+(`vlc.var.create`) holding `<token>|<bias>|<last set>`, updated on every set. A new
+input object for the *same* URI (repeat one, a one-item playlist loop, stop and play
+again) lacks it, so the intf drops its delay state without restoring or folding
+anything (that input's `spu-delay` is fresh, from `sub-delay`) and starts over as for a
+new input; the remembered mapping is applied again without a request. A restarted intf
+that finds the variable with `last set` equal to the current `spu-delay` takes the
+recorded bias instead of capturing its predecessor's correction as the user's. A
+different URI or no input resets the state as before (nothing to restore).
+
+Toggling the mode while playing moves the result over (delay → track: restore the bias,
+load `output`; track → delay: select the original track). "Sync now" with the
+corrected track selected forces a re-sync. A done status without segments is re-requested
+once with `force=1` (bypassing a stale cache entry); if that one has none either (a helper
+older than this protocol), it is not applied, the OSD says so, and nothing is remembered,
+so a later selection asks again. OSD on start: `"Subtitles synced (live delay,
+experimental): <message>"`, plus "– may pause playback up to N s in total" when the
+mapping needs a delay below −0.5 s over `[0, length]`. With an unknown length (0) only 0
+and the segment boundaries are evaluated, so an open last segment that keeps drifting
+negative is underestimated.
+
+Cost per tick: segment spans in the audio domain are computed once when the status is
+parsed; `segment_at` is O(segments) and the knot lookup a binary search, so with the caps
+(256 segments, 4096 knots) a tick is cheap; `min_delay` (once per start) is
+O(segments²).
 
 Real VLC 3.0.24 (snap) check, `tests/test_integration.py::test_vlc_delay_mode_end_to_end`
 plus a screen-recorded run (Xvfb + x11grab, testsrc video, sidecar with −4% drift):

@@ -269,3 +269,24 @@ def test_map_segment_evaluates_knots():
     assert P.parse_segment(P.format_segment(s), P.format_knots(s.knots)) == s
     assert P.Status.from_dict({"id": "a", "sync_mode": "Delay"}).sync_mode == "delay"
     assert P.Status.from_dict({"id": "a", "sync_mode": "x"}).sync_mode is None
+
+
+def test_status_caps_segments_and_knots_with_a_log(caplog):
+    many = [P.MapSegment(float(i), float(i + 1), 1.0, 0.0) for i in range(P.MAX_SEGMENTS + 5)]
+    with caplog.at_level("WARNING", logger="vlcsubsync.protocol"):
+        d = P.Status(id="a", state="done", segments=many).to_dict()
+    assert d["segments"] == P.MAX_SEGMENTS
+    assert "only the first 256" in caplog.text
+    caplog.clear()
+    k = tuple((float(j), 0.01) for j in range(3000))
+    segs = [P.MapSegment(None, 1.0, 1.0, 0.0, k), P.MapSegment(1.0, None, 1.0, 0.0, k)]
+    with caplog.at_level("WARNING", logger="vlcsubsync.protocol"):
+        d = P.Status(id="a", state="done", segments=segs).to_dict()
+    assert "seg0_knots" in d and "seg1_knots" not in d  # 6000 > 4096 in total
+    assert "more than 4096 knots" in caplog.text
+    back = P.Status.from_dict({k2: str(v) for k2, v in d.items()})
+    assert len(back.segments) == 2 and back.segments[1].knots == ()
+    # a reader also caps the total
+    d["seg1_knots"] = d["seg0_knots"]
+    back = P.Status.from_dict({k2: str(v) for k2, v in d.items()})
+    assert sum(len(sg.knots) for sg in back.segments) <= P.MAX_KNOTS

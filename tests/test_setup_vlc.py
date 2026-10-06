@@ -218,7 +218,8 @@ def test_linux_detection(tmp_path):
     (fs.home / "snap/vlc/current").mkdir(parents=True)
     snap = {i.kind: i for i in S.detect_vlc_installs(ctx)}["snap"]
     assert snap.usable
-    assert snap.vlcrc == fs.home / "snap/vlc/current/.config/vlc/vlcrc"
+    # The snap launcher runs `vlc --config=$SNAP_USER_COMMON/vlcrc`.
+    assert snap.vlcrc == fs.home / "snap/vlc/common/vlcrc"
     assert snap.queue_dir == fs.home / "snap/vlc/current/.local/share/vlc/subsync"
     fp = installs["flatpak"]
     assert fp.vlcrc == fs.home / ".var/app/org.videolan.VLC/config/vlc/vlcrc"
@@ -234,8 +235,9 @@ def test_snap_binary_on_path_is_not_native(tmp_path):
 
 def test_setup_and_uninstall_linux_systemd(tmp_path):
     fs = FakeSystem(tmp_path, "linux")
-    (fs.home / "snap/vlc/current/.config/vlc").mkdir(parents=True)
-    rc_path = fs.home / "snap/vlc/current/.config/vlc/vlcrc"
+    (fs.home / "snap/vlc/current").mkdir(parents=True)
+    (fs.home / "snap/vlc/common").mkdir(parents=True)
+    rc_path = fs.home / "snap/vlc/common/vlcrc"
     rc_path.write_text(VLC_STYLE.replace("#extraintf=", "extraintf=http"), encoding="utf-8")
     original = rc_path.read_bytes()
 
@@ -434,3 +436,23 @@ def test_daemon_command_prefers_venv_script(tmp_path, monkeypatch):
     wctx = S.Context(platform="windows", home=tmp_path, env={}, which=lambda n: None)
     (bindir / "vlc-subsync-daemon.exe").write_text("")
     assert S.daemon_command(wctx, gui=True) == [str(bindir / "vlc-subsync-daemon.exe")]
+
+
+def test_setup_cleans_legacy_snap_vlcrc(tmp_path):
+    """0.1.0 wrote the snap vlcrc VLC never reads; setup moves the settings to common/."""
+    fs = FakeSystem(tmp_path, "linux")
+    (fs.home / "snap/vlc/current").mkdir(parents=True)
+    legacy_dir = fs.home / "snap/vlc/current/.config/vlc"
+    legacy_dir.mkdir(parents=True)
+    legacy = legacy_dir / "vlcrc"
+    legacy.write_text("[core]\nextraintf=luaintf\n[lua]\nlua-intf=subsync\n", encoding="utf-8")
+    (legacy_dir / "vlcrc.subsync-state").write_text(
+        "added_luaintf=1\nprevious_lua_intf=\ncreated_vlcrc=1\n", encoding="utf-8"
+    )
+
+    assert S.run_setup(fs.ctx(), model=False, autostart=False) == 0
+    assert not legacy.exists()
+    assert not (legacy_dir / "vlcrc.subsync-state").exists()
+    text = (fs.home / "snap/vlc/common/vlcrc").read_text(encoding="utf-8")
+    assert active(text, "extraintf") == ["luaintf"]
+    assert active(text, "lua-intf") == ["subsync"]

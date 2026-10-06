@@ -72,9 +72,8 @@ mf = _load_fixture_module()
 def engine():
     """Import the engine lazily; skip (not fail) while it isn't importable."""
     try:
-        from vlcsubsync.config import Config
-
         from vlcsubsync import sync as sync_mod
+        from vlcsubsync.config import Config
     except ImportError as exc:  # pragma: no cover - depends on concurrent work
         pytest.skip(f"vlcsubsync engine not importable yet: {exc}")
     for name in ("sync_subtitles", "SubtitleSource"):

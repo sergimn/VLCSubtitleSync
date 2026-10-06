@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vlc-subsync"
+version = "0.1.0"
+description = "Automatically sync VLC subtitles to the selected audio track using Whisper"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+  "faster-whisper>=1.1",
+  "av>=12",
+  "numpy>=1.24",
+  "pysubs2>=1.7",
+  "platformdirs>=4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "lupa>=2.0"]
+
+[project.scripts]
+vlc-subsync = "vlcsubsync.cli:main"
+
+[project.gui-scripts]
+vlc-subsync-daemon = "vlcsubsync.cli:daemon_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vlcsubsync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: needs Whisper model download / real decoding", "vlc: needs a real VLC binary"]
+addopts = "-m 'not slow and not vlc'"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

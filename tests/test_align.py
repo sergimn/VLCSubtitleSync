@@ -889,3 +889,23 @@ def test_fit_stats_allows_a_shared_bias_per_window(bias, expect):
             anchors.append(Anchor(t, t + 2.0 + b + rng.normal(0, 0.05), 1.0, k, -1, j))
     _conf, _n, _g, med, _d = _fit_stats(Mapping.linear(1.0, 2.0), _AnchorArrays.build(anchors), 6)
     assert med == pytest.approx(expect, abs=0.03)
+
+
+def test_probe_window_without_inliers_does_not_lower_coverage():
+    """A verification probe (window id >= n_windows) on music adds only stray matches:
+    it must not count against coverage; one with inliers counts as covered."""
+    from vlcsubsync.align import _AnchorArrays, _fit_stats
+
+    rng = np.random.default_rng(0)
+    anchors = []
+    for k in range(6):
+        for j in range(20):
+            t = 100.0 + 200.0 * k + j
+            anchors.append(Anchor(t, t + 2.0 + rng.normal(0, 0.05), 1.0, k, -1, j))
+    stray = [Anchor(50.0 + j, 900.0 + 37.0 * j, 1.0, 6, -1, j) for j in range(5)]
+    mapping = Mapping.linear(1.0, 2.0)
+    *_, d = _fit_stats(mapping, _AnchorArrays.build(anchors + stray), 6)
+    assert d["coverage"] == pytest.approx(1.0)
+    good = [Anchor(1300.0 + j, 1302.0, 1.0, 6, -1, j) for j in range(5)]
+    *_, d = _fit_stats(mapping, _AnchorArrays.build(anchors + good), 6)
+    assert d["coverage"] == pytest.approx(1.0)

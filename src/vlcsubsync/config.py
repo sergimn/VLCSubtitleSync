@@ -29,7 +29,7 @@ _VALID_DEVICES = ("auto", "cpu", "cuda")
 MODES = ("fast", "thorough", "exhaustive")
 DEFAULT_MODE = "fast"
 
-# How VLC applies a result (see DESIGN.md "Delay mode"):
+# How VLC applies a result (the VLC side of "delay" follows in the delay-mode PR):
 #   track   load the re-timed file as an extra subtitle track (default)
 #   delay   EXPERIMENTAL: keep the original track and correct it live through the
 #           input's "spu-delay" variable, following the piecewise mapping

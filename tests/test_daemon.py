@@ -266,6 +266,32 @@ def test_same_params_does_not_cancel_running(env):
     assert [c.id for c in runner.calls] == ["p_1"]  # p_2 came from the cache
 
 
+@pytest.mark.parametrize(
+    "first,second,cancels",
+    [
+        ({}, {"mode": "exhaustive"}, True),  # "Sync now (exhaustive)" during a fast run
+        ({"mode": "exhaustive"}, {"force": True}, True),  # forced plain "Sync now"
+        ({"mode": "exhaustive"}, {}, False),  # an automatic request waits
+        ({"mode": "exhaustive"}, {"mode": "exhaustive"}, False),
+    ],
+)
+def test_mode_switch_cancels_running(env, first, second, cancels):
+    m1 = make_media(env)
+    runner = FakeRunner(block=True)
+    with Harness(env, runner) as h:
+        h.submit("m_1", m1, sub_index=0, **first)
+        h.wait_state("m_1", "running")
+        h.submit("m_2", m1, sub_index=0, **second)
+        h.wait_state("m_2", "queued", "running", "done")
+        if cancels:
+            assert "Superseded" in h.wait_state("m_1", "error").message
+        else:
+            time.sleep(0.2)
+            assert h.status("m_1").state == "running"
+        runner.release.set()
+        h.wait_state("m_2", "done")
+
+
 def test_cache_hit_and_force(env):
     media = make_media(env)
     runner = FakeRunner()
@@ -643,3 +669,19 @@ def test_unapplied_cache_entry_without_mapping_is_still_a_hit(env):
         h.submit("n_2", media, sub_index=0)
         h.wait_state("n_2", "done")
         assert len(runner.calls) == 1  # hopeless work is not redone
+
+
+def test_cache_key_includes_configured_mode(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    d = D.Daemon(
+        [env.queue], use_default_queues=False, runner=FakeRunner(),
+        resolver=external_resolver, cache_dir=env.tmp / "c",
+        lock_path=env.tmp / "state" / "daemon.lock",
+    )  # fmt: skip
+    src = D.ResolvedSource("embedded", index=0)
+    job = D._Job(P.Request(id="k", media=media, sub_index=0), env.queue)
+    keys = {m: d.cache_key(job, src, Config(mode=m)) for m in ("fast", "thorough", "exhaustive")}
+    assert len(set(keys.values())) == 3
+    assert d.cache_key(job, src, Config(mode="bogus")) == keys["fast"]

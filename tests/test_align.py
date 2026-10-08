@@ -270,6 +270,17 @@ def test_vad_align_empty():
     assert vad_align(np.zeros(100, bool), [Cue(0, 1, "x")]).method == "none"
 
 
+@pytest.mark.parametrize("seed", [99, 7, 13, 21, 42, 5, 6])
+def test_vad_align_unrelated_across_scales(synth, seed):
+    """More scale candidates must not raise the odds of a noise maximum: the winner
+    is compared with the best distinguishable rival scale."""
+    cues, _ = _masks(synth, lambda t: t, 20 * 60, seed=4)
+    _, speech = _masks(synth, lambda t: t, 20 * 60, seed=seed)
+    r = vad_align(speech, cues)
+    assert r.confidence < 0.3
+    assert r.details["cross_scale"] < 0.3
+
+
 # --- applying a mapping ---------------------------------------------------------------
 
 

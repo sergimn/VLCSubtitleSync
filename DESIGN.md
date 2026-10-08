@@ -192,7 +192,11 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    too sparse in a region, transcribe more windows there (adaptive, bounded).
 6. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
    with the subtitle-on mask at 10 ms resolution over the same candidate scales
-   (FFT), pick best.
+   (FFT). Each scale's peak height above its own baseline is divided by the same
+   prior as `_best_candidate_scale` (1.0: ×1/0.98, others: 1 + 2·|s − 1|), and the
+   winner must stand out against the best rival scale that maps the file > 3 s
+   differently (`cross_scale`): more candidates must not mean more chances for a
+   noise maximum to win.
 7. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 

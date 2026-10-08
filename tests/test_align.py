@@ -637,3 +637,20 @@ def test_wobble_periods_and_phases_not_chopped(synth, period, phase):
     assert len(fit.mapping.segments) == 1
     assert np.median(err) < 0.1
     assert np.percentile(err, 95) < np.percentile(err0, 95)
+
+
+@pytest.mark.parametrize("bias,expect", [(0.2, 0.05), (0.6, 0.4)])
+def test_fit_stats_allows_a_shared_bias_per_window(bias, expect):
+    """Each window's words share a timestamp bias: up to 0.2 s of it is not misfit,
+    anything beyond still shows in the residual."""
+    from vlcsubsync.align import _AnchorArrays, _fit_stats
+
+    rng = np.random.default_rng(0)
+    anchors = []
+    for k in range(6):
+        b = bias if k % 2 else -bias
+        for j in range(40):
+            t = 100.0 + 200.0 * k + j
+            anchors.append(Anchor(t, t + 2.0 + b + rng.normal(0, 0.05), 1.0, k, -1, j))
+    _conf, _n, _g, med, _d = _fit_stats(Mapping.linear(1.0, 2.0), _AnchorArrays.build(anchors), 6)
+    assert med == pytest.approx(expect, abs=0.03)

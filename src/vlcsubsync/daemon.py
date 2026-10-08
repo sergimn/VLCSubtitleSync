@@ -748,6 +748,8 @@ class Daemon:
             str(getattr(config, "model_en", "")),
             str(getattr(config, "model_multi", "")),
             self.version,
+            # the configured sync mode: changing it must not reuse another mode's result
+            str(getattr(config, "effective_mode", "fast")),
         ]
         return hashlib.sha1("\0".join(parts).encode("utf-8")).hexdigest()
 

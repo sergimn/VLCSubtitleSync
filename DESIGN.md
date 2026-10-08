@@ -144,7 +144,8 @@ Lua considers the daemon alive if `os.time() - time <= 10`.
 
 Daemon housekeeping: delete `.req` once picked up; delete jobs/out older than 7 days.
 Result cache key = sha1(media path, size, mtime, audio_index, sub source identity,
-model, version) → reuse previous output instantly unless `force=1`.
+model, version, configured sync mode) → reuse previous output instantly unless
+`force=1`.
 
 ### Lua behaviour (intf)
 Loop every ~500 ms (`vlc.misc.mwait`); VLC 3 has no `should_die()` — `mwait` raises "Interrupted." when the interface is closing, which ends the loop.

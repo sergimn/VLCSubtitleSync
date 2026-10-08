@@ -247,6 +247,22 @@ def test_audio_assembler_ignores_huge_pts_jumps(caplog):
     assert sum("timestamp jump" in r.getMessage() for r in caplog.records) >= 2
 
 
+def test_audio_assembler_rebases_on_a_persistent_clock_jump(caplog):
+    """After a discontinuity the new clock stays (e.g. concatenated recordings): one
+    warning, and a real gap later on is still filled with silence."""
+    one = np.full(16000, 0.5, dtype=np.float32)  # 1 s
+    asm = media._AudioAssembler(16000)
+    asm.feed(_frame(one), 0.0)
+    for k in range(1, 5):
+        asm.feed(_frame(one), 3600.0 + k)  # new clock from here on
+    asm.feed(_frame(one), 3600.0 + 7.0)  # a real 2 s gap on the new clock
+    a = asm.result()
+    assert a.shape[0] == 8 * 16000
+    assert np.all(np.abs(a[: 5 * 16000] - 0.5) < 1e-3)
+    assert np.all(np.abs(a[5 * 16000 + 100 : 7 * 16000 - 100]) < 1e-6)
+    assert sum("timestamp jump" in r.getMessage() for r in caplog.records) == 1
+
+
 # --- subtitle text cleanup -------------------------------------------------------------
 
 

@@ -224,9 +224,11 @@ class _AudioAssembler:
     the container start). Frames are normally laid end to end; when a frame's pts says
     it starts more than :data:`PTS_TOLERANCE` after the end of the previous one the gap
     is filled with silence, and when it starts earlier (overlap) the overlapping
-    samples are dropped; jumps above :data:`MAX_PTS_JUMP` are ignored (the frame stays
-    contiguous). The first frame is placed exactly: leading silence is inserted
-    if it starts after t=0, and audio before t=0 is trimmed.
+    samples are dropped; a jump above :data:`MAX_PTS_JUMP` is a clock discontinuity:
+    the frame stays contiguous and the new clock becomes the reference for what
+    follows (later gaps and overlaps are measured against it). The first frame is
+    placed exactly: leading silence is inserted if it starts after t=0, and audio
+    before t=0 is trimmed.
     """
 
     def __init__(self, capacity: int):
@@ -234,6 +236,7 @@ class _AudioAssembler:
         self.resampler = self._new_resampler()
         self.cursor: float | None = None  # media time where the next frame would start
         self.drop = 0  # output samples still to discard (overlap / before t=0)
+        self.offset = 0.0  # pts clock minus media timeline (changes at discontinuities)
 
     @staticmethod
     def _new_resampler():
@@ -247,6 +250,8 @@ class _AudioAssembler:
         dur = frame.samples / rate
         if t is None:
             t = self.cursor if self.cursor is not None else 0.0
+        else:
+            t -= self.offset
         expected = 0.0 if self.cursor is None else self.cursor
         tol = 0.5 / SAMPLE_RATE if self.cursor is None else PTS_TOLERANCE
         delta = t - expected
@@ -256,7 +261,8 @@ class _AudioAssembler:
                 delta,
                 expected,
             )
-            delta = 0.0
+            self.offset += delta
+            t, delta = expected, 0.0
         if delta > tol:  # gap: flush what is buffered, then pad with silence
             self._flush()
             self.drop = 0

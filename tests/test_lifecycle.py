@@ -161,3 +161,18 @@ def test_serve_lowers_priority_before_running(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "setup_logging", lambda **kw: None)
     assert D.serve([str(tmp_path)], log_to_stderr=False) == 0
     assert order == ["priority", "daemon", "run"]
+
+
+@pytest.mark.parametrize(
+    "kernel,pointer,nr", [("x86_64", 8, 251), ("x86_64", 4, 289), ("aarch64", 4, 314)]
+)
+def test_priority_ioprio_uses_the_process_abi(allow_priority, monkeypatch, kernel, pointer, nr):
+    """32-bit Python on a 64-bit kernel must use the 32-bit syscall number."""
+    import platform
+    import struct
+
+    libc = FakeLibc()
+    monkeypatch.setattr(platform, "machine", lambda: kernel)
+    monkeypatch.setattr(struct, "calcsize", lambda fmt: pointer)
+    L._linux_idle_io(FakeCtypes(libc), None)
+    assert libc.calls and libc.calls[0][0] == nr

@@ -548,3 +548,19 @@ def test_external_output_keeps_format(env):
         h.submit("f_1", media, sub_index=0)
         st = h.wait_state("f_1", "done")
     assert st.output.endswith("f_1.ass")
+
+
+def test_cache_key_includes_configured_mode(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    d = D.Daemon(
+        [env.queue], use_default_queues=False, runner=FakeRunner(),
+        resolver=external_resolver, cache_dir=env.tmp / "c",
+        lock_path=env.tmp / "state" / "daemon.lock",
+    )  # fmt: skip
+    src = D.ResolvedSource("embedded", index=0)
+    job = D._Job(P.Request(id="k", media=media, sub_index=0), env.queue)
+    keys = {m: d.cache_key(job, src, Config(mode=m)) for m in ("fast", "thorough", "exhaustive")}
+    assert len(set(keys.values())) == 3
+    assert d.cache_key(job, src, Config(mode="bogus")) == keys["fast"]

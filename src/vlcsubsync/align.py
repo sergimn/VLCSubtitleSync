@@ -1224,13 +1224,15 @@ def subdivide(
     tried while the budget lasts, and a segment with no evidence at all is left as it
     is and counted in ``details["verify_unverified"]``. If the
     window disagrees (see :func:`_window_verdict`), the segment is split at the best
-    cue gap near its midpoint and both halves are refitted on their own (known-ratio
-    snapping, scale prior, short halves share the dominant scale). A split is kept
+    cue gap near its midpoint (or at the change point of the per-window residuals) and
+    both halves are refitted on their own with known ratios only (dominant, parent,
+    1.0 or the best-fitting candidate, prior towards 1.0). A split is kept
     only if the halves differ by more than ``tol`` plus twice the standard error
     implied by the spread of per-window residuals (a single window's timestamp bias
     is not a section of different timing). Recursion stops at ``min_len``,
-    ``max_depth`` or when the probe has nothing new; finally, adjacent segments that
-    agree within ``tol`` are merged.
+    ``max_depth`` or when the probe has nothing new. Segments too short to split are
+    folded into a neighbour their windows agree with as much; finally, adjacent
+    segments are merged when one refit of both positively verifies.
 
     Returns ``(fit, anchors)`` (anchors include probe windows).
     """
@@ -1499,7 +1501,7 @@ def subdivide(
     _c1, n_in1, _g1, med1, _s1 = _fit_stats(mapping, ref, n_windows)
     _c0, n_in0, _g0, med0, _s0 = _fit_stats(fit.mapping, ref, n_windows)
     if n_in1 < 0.9 * n_in0 or med1 > med0 + 0.05:
-        details.update(verify_splits=0, verify_rejected=True)
+        details.update(verify_splits=0, verify_folded=0, verify_rejected=True)
         conf0, n_in0, n_groups0, med0, stats0 = _fit_stats(fit.mapping, arr, n_windows)
         return AlignResult(fit.mapping, fit.method, conf0, n_in0, n_groups0, med0,
                            fit.ambiguous, fit.sparse, {**details, **stats0}), cur  # fmt: skip

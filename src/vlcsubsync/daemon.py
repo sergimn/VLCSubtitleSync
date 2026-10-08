@@ -1,9 +1,10 @@
 """``vlc-subsync serve``: watches the VLC queue dirs and runs sync jobs.
 
-See DESIGN.md ("File protocol").  One worker thread runs jobs one at a time; the main
-thread polls the ``requests/`` dirs, writes heartbeats and does housekeeping.  The job
-runner and the subtitle-source resolver are injectable so the daemon can be tested
-without the sync engine.
+See DESIGN.md ("File protocol").  One worker thread runs jobs one at a time and
+unloads the Whisper models after a minute without jobs; the main thread polls the
+``requests/`` dirs, writes heartbeats and does housekeeping.  The job runner, the
+subtitle-source resolver, the model unloader and the clock are injectable so the
+daemon can be tested without the sync engine and without sleeping.
 """
 
 from __future__ import annotations
@@ -447,8 +448,9 @@ def load_config() -> Any:
 class EngineRunner:
     """Default job runner: calls ``vlcsubsync.sync.sync_subtitles``.
 
-    Whisper models stay warm between jobs through ``vlcsubsync.transcribe``'s
-    module-level model cache (the daemon process is long-lived).
+    Whisper models stay warm between back-to-back jobs through
+    ``vlcsubsync.transcribe``'s module-level model cache; the daemon unloads them
+    after ``model_idle`` seconds without a job.
     """
 
     def __call__(self, spec: JobSpec, progress: ProgressFn) -> Any:
@@ -538,6 +540,10 @@ class Daemon:
         rescan_interval: float = 30.0,
         max_age: float = MAX_AGE_SECONDS,
         version: str = __version__,
+        model_idle: float = L.MODEL_IDLE_SECONDS,
+        model_unloader: Callable[[], int] | None = None,
+        worker_wait: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.extra_queue_dirs = [Path(q) for q in queue_dirs]
         self.use_default_queues = use_default_queues
@@ -555,6 +561,14 @@ class Daemon:
         self.rescan_interval = rescan_interval
         self.max_age = max_age
         self.version = version
+        # unload the Whisper models after model_idle seconds without a job
+        self.model_idle = model_idle
+        self.model_unloader = model_unloader or L.unload_models
+        self.worker_wait = worker_wait
+        self.clock = clock
+        self.models_unloaded = 0  # number of unloads (for tests / logs)
+        self._models_loaded = False  # the engine ran since the last unload
+        self._last_job_end = clock()
 
         self.queue_dirs: list[Path] = []
         self.stop_event = threading.Event()
@@ -720,13 +734,22 @@ class Daemon:
     # ---------------------------------------------------------------- worker
     def _worker_loop(self) -> None:
         while True:
+            job: _Job | None = None
             with self._cond:
                 while not self._pending and not self.stop_event.is_set():
-                    self._cond.wait(timeout=1.0)
+                    if self.model_unload_due():
+                        break
+                    self._cond.wait(timeout=self.worker_wait)
                 if self.stop_event.is_set():
                     return
-                job = self._pending.pop(0)
-                self._running = job
+                if self._pending:
+                    job = self._pending.pop(0)
+                    self._running = job
+            if job is None:
+                # Unloading runs on the worker thread itself, so it can never race
+                # with a job using the model; a job queued meanwhile just waits.
+                self.unload_models()
+                continue
             try:
                 self.run_job(job)
             except Exception:  # noqa: BLE001 - never let a job kill the worker
@@ -734,7 +757,39 @@ class Daemon:
             finally:
                 with self._cond:
                     self._running = None
+                    self._last_job_end = self.clock()
                 self.jobs_completed += 1
+
+    # ---------------------------------------------------------------- model unloading
+    def model_unload_due(self, now: float | None = None) -> bool:
+        """True when the engine ran and no job has run for ``model_idle`` seconds."""
+        if not self._models_loaded:
+            return False
+        now = self.clock() if now is None else now
+        return now - self._last_job_end >= self.model_idle
+
+    def unload_models(self) -> int:
+        """Free the Whisper models (called on the worker thread when idle)."""
+        self._models_loaded = False
+        before = L.rss_mb()
+        try:
+            released = self.model_unloader()
+        except Exception:  # noqa: BLE001
+            log.exception("unloading models failed; retrying in %.0f s", self.model_idle)
+            with self._cond:
+                self._models_loaded = True  # still loaded: try again later
+                self._last_job_end = self.clock()
+            return 0
+        self.models_unloaded += 1
+        after = L.rss_mb()
+        mem = f"; RSS {before:.0f} -> {after:.0f} MiB" if before and after else ""
+        log.info(
+            "unloaded %d Whisper model(s) after %.0f s without jobs%s",
+            released,
+            self.model_idle,
+            mem,
+        )
+        return released
 
     def cache_key(self, job: _Job, source: ResolvedSource, config: Any) -> str:
         r = job.request
@@ -843,6 +898,7 @@ class Daemon:
                     )
                 )
 
+            self._models_loaded = True
             result = self.runner(spec, progress)
             if job.cancel.is_set():
                 raise JobCancelled(job.cancel_reason or "Cancelled")

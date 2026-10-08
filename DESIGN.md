@@ -59,7 +59,7 @@ src/vlcsubsync/
   sync.py                      # orchestration: sync_subtitles(...) -> SyncResult
   protocol.py                  # key=value file format, request/status dataclasses, atomic writes
   daemon.py                    # queue watcher, heartbeat, job runner, result cache
-  lifecycle.py                 # process priority of the daemon
+  lifecycle.py                 # model unloading, process priority of the daemon
   setup_vlc.py                 # install/uninstall Lua scripts, vlcrc edits, autostart, dirs
   lua/intf/subsync.lua         # shipped as package data, copied into VLC by `setup`
   lua/extensions/subsync_ext.lua
@@ -204,6 +204,12 @@ leaving half the cores to VLC).
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 
 ## Daemon resources
+
+**Models**: 60 s after the last job that ran the engine, the *worker thread* calls
+`transcribe.clear_cache()` (drops each model under its transcriber lock), drops the
+Silero VAD, runs `gc.collect()` and `malloc_trim(0)`, and logs the RSS before/after.
+Running on the worker means it can never overlap a job. The 7-day result cache is
+unchanged.
 
 **Priority** (`lifecycle.lower_priority`, at `serve` start before any thread, since
 Linux nice/ioprio are per thread and inherited): nice ≥ 10 (never lowered), Linux

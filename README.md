@@ -94,7 +94,8 @@ which also works for the sandboxed snap and flatpak builds of VLC.
 
 While it runs a sync, the helper uses low priority (nice 10 and idle disk priority on
 Linux, background priority on macOS, "below normal" on Windows) and at most half your
-CPU cores, so playback stays smooth.
+CPU cores, so playback stays smooth. It frees the speech model from memory a minute
+after the last sync.
 
 If the subtitle language and the spoken language differ (say English audio with
 Spanish subtitles), there is no text to compare. SubSync then lines up the subtitle

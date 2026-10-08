@@ -666,3 +666,39 @@ def test_priority_ioprio_uses_the_process_abi(allow_priority, monkeypatch, kerne
     monkeypatch.setattr(struct, "calcsize", lambda fmt: pointer)
     L._linux_idle_io(FakeCtypes(libc), None)
     assert libc.calls and libc.calls[0][0] == nr
+
+
+def test_service_start_waits_for_the_lock_while_vlc_runs(denv, queue, clock, monkeypatch):
+    """Under systemd a second instance stays up instead of exiting at once (each exit
+    would count toward the unit's start limit while VLC keeps triggering it)."""
+    other = D.InstanceLock(denv.tmp / "state" / "daemon.lock")
+    assert other.acquire()
+    try:
+        d = make_daemon(denv, queue, clock, idle_exit=True, lock_wait=0.0, idle_check_interval=0.01)
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        assert not d._acquire_lock()  # not under systemd: give up as before
+        monkeypatch.setenv("INVOCATION_ID", "x")
+        intf(queue, clock)  # VLC is running
+        got = []
+        t = threading.Thread(target=lambda: got.append(d._acquire_lock()))
+        t.start()
+        time.sleep(0.1)
+        assert t.is_alive()  # still waiting
+        other.release()
+        t.join(5)
+        assert got == [True]
+    finally:
+        other.release()
+        d.lock.release()
+
+
+def test_service_start_gives_up_on_the_lock_once_vlc_is_gone(denv, queue, clock, monkeypatch):
+    other = D.InstanceLock(denv.tmp / "state" / "daemon.lock")
+    assert other.acquire()
+    try:
+        monkeypatch.setenv("INVOCATION_ID", "x")
+        intf(queue, clock, state="stopped")
+        d = make_daemon(denv, queue, clock, idle_exit=True, lock_wait=0.0, idle_check_interval=0.01)
+        assert not d._acquire_lock()
+    finally:
+        other.release()

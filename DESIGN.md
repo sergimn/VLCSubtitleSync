@@ -250,6 +250,10 @@ forever): non-`.req` entries older than 60 s (files and directories) are deleted
 cannot delete is moved to `<q>/rejected/` (cleaned after 7 days); if even that fails it
 logs it once. At startup only the non-`.req` junk is cleaned. `serve --persistent` disables all this.
 If a new instance starts while the old one is exiting, it waits up to 3 s for the lock.
+Started by systemd (`INVOCATION_ID` set) while another instance keeps the lock (e.g. a
+manual `serve --persistent`), it stays up while VLC runs, retrying the lock, instead
+of exiting: every exit would count toward the unit's start limit as VLC keeps
+triggering the path unit, and hitting it fails the path unit until `reset-failed`.
 
 **Models**: 60 s after the last job that ran the engine, the *worker thread* calls
 `transcribe.clear_cache()` (drops each model under its transcriber lock), drops the

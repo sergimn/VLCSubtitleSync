@@ -1032,9 +1032,27 @@ class Daemon:
         deadline = time.monotonic() + self.lock_wait
         while not self.lock.acquire():
             if time.monotonic() >= deadline:
-                return False
+                return self._wait_for_lock_while_vlc_runs()
             time.sleep(0.25)
         return True
+
+    def _wait_for_lock_while_vlc_runs(self) -> bool:
+        """Started by systemd while another instance holds the lock (e.g. a manual
+        ``serve --persistent``): exiting at once would let VLC's next ``intf_state``
+        write start us again every few seconds, which hits the unit's start limit and
+        fails the path unit. Instead stay active (so further triggers are no-ops) until
+        the lock frees up or VLC is gone."""
+        if not (self.idle_exit and os.environ.get("INVOCATION_ID")):
+            return False
+        log.info("another instance holds the lock; waiting while VLC runs")
+        self.scan_queue_dirs()
+        while not self.stop_event.is_set():
+            if self.lock.acquire():
+                return True
+            if not L.vlc_activity(self.queue_dirs, self.wall_clock()).alive:
+                return False
+            self.stop_event.wait(self.idle_check_interval)
+        return False
 
     def run(self, *, acquire_lock: bool = True) -> int:
         if acquire_lock and not self._acquire_lock():

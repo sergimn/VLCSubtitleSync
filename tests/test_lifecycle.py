@@ -14,7 +14,6 @@ from vlcsubsync import lifecycle as L
 from vlcsubsync import protocol as P
 from vlcsubsync import transcribe as T
 
-
 # ------------------------------------------------------------------ model unloading
 
 

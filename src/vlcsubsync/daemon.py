@@ -501,6 +501,16 @@ class _Job:
         return (r.audio_index, r.sub_index, r.sub_path)
 
 
+def _mode_switch(running: _Job, new: _Job) -> bool:
+    """The user asked for another sync mode for the running job's tracks: an explicit
+    ``mode=`` that differs ("Sync now (exhaustive)" during a fast run), or a forced
+    request in another mode ("Sync subtitles now" during an exhaustive run). Automatic
+    requests (no mode, no force) never cancel a running job."""
+    a = normalize_mode(running.request.mode)
+    b = normalize_mode(new.request.mode)
+    return a != b and (b is not None or new.request.force)
+
+
 class _StatusWriter:
     """Throttled status-file writer for one job."""
 
@@ -706,7 +716,7 @@ class Daemon:
             if (
                 running is not None
                 and running.media_key == job.media_key
-                and running.params != job.params
+                and (running.params != job.params or _mode_switch(running, job))
             ):
                 running.cancel_reason = "Superseded by a newer request"
                 running.cancel.set()

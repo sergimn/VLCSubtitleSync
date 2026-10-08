@@ -186,6 +186,10 @@ thorough mode also answers a later cheaper request for the same file and tracks
   exhaustive run that lost its windows to CUDA OOM and fell back to VAD with
   `applied=0` must not block a fast sync that might succeed. The job's own mode
   reuses unapplied results as before, so hopeless work is not redone.
+* A request for the running job's media and tracks cancels it when the user asked
+  for another mode: an explicit different `mode=` ("Sync now (exhaustive)" during a
+  fast run), or `force=1` in another mode ("Sync subtitles now" during an exhaustive
+  run). Automatic requests (no `mode`, no `force`) wait for it.
 * A forced run (`force=1`) stores its result and deletes the other modes' entries
   for the same file and tracks, so the newest forced result wins on the next open.
 * The order assumes the mode defaults. Explicit `windows=N` / `verify_windows=N` are

@@ -163,7 +163,9 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
 1. Decode selected audio stream → 16 kHz mono float32.
 2. VAD → speech segments over whole file (cheap).
 3. Choose K windows (default ~ max(8, duration/240s), 30 s each) evenly across the
-   file, snapped to speech-dense regions; transcribe with word timestamps.
+   file, snapped to speech-dense regions; transcribe with word timestamps. The
+   count and the later verification budget depend on the sync mode (see "Sync
+   modes"); exhaustive mode transcribes consecutive windows instead.
    Language: guess from subtitle text (stopword heuristic); English → `*.en` model,
    else multilingual model with `language=<guess>`; if audio language (whisper
    detect) ≠ subtitle language → skip to VAD fallback.
@@ -285,9 +287,30 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
 10. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 
+## Sync modes (`mode=` in config, `vlc-subsync sync --mode`)
+
+| mode | windows (step 3) | adaptive (step 5) | verification budget (step 6) |
+|---|---|---|---|
+| `fast` (default) | `max(8, d/240 s)` sampled | ≤ `max(4, K/2)` | `2 + 1 per 30 min` |
+| `thorough` | `max(20, d/96 s)` sampled (~2.5×) | ≤ `max(4, K/2)` | 3× fast |
+| `exhaustive` | consecutive `[0,30) [30,60) …` up to `d`, minus silent ones | none | 0 |
+
+* Exhaustive skips a window with < 0.5 s of VAD speech (`sync.MIN_SPEECH_SECONDS`);
+  the last window may be shorter than 30 s. Every window with speech is transcribed,
+  so adaptive and verification probes have nothing left to add (they could only pick
+  silent windows); the fit, bisection verification (with the windows already
+  inside each segment) and local refinement run on all anchors as usual.
+* Explicit `windows=N` / `verify_windows=N` keep overriding the per-mode defaults
+  (`windows` is ignored by exhaustive, which covers everything).
+* Cost is roughly linear in the number of transcribed windows: exhaustive is one
+  Whisper pass over all dialogue. On a 28.7 min episode it transcribed 50 windows,
+  against fast's 12–13 (8 sampled + adaptive). That took 1.9× fast's runtime on GPU
+  and 2.3× on CPU, because decoding and VAD (~7.5 s) are fixed. README has the table.
+
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)
-`model_en=base.en`, `model_multi=base`, `device=auto|cpu|cuda`, `compute_type=int8`,
-`windows=auto`, `verify_windows=auto`, `min_confidence=0.5`, `threads=0`.
+`mode=fast|thorough|exhaustive`, `model_en=base.en`, `model_multi=base`,
+`device=auto|cpu|cuda`, `compute_type=int8`, `windows=auto`, `verify_windows=auto`,
+`min_confidence=0.5`, `threads=0`. Invalid values are ignored (default kept).
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 
 ## Installation UX

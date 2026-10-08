@@ -77,3 +77,47 @@ def test_verify_windows(tmp_path):
     assert Config.load(p).verify_windows == "5"
     p.write_text("verify_windows=-1\nverify_windows=lots\n", encoding="utf-8")
     assert Config.load(p).verify_windows == "auto"  # invalid values ignored
+
+
+def test_mode_parsing(tmp_path):
+    assert Config().mode == "fast"
+    p = tmp_path / "config.ini"
+    for raw, want in [
+        ("exhaustive", "exhaustive"),
+        (" Thorough ", "thorough"),
+        ("FAST", "fast"),
+        ("turbo", "fast"),  # invalid -> default kept
+        ("", "fast"),
+    ]:
+        p.write_text(f"mode={raw}\n", encoding="utf-8")
+        assert Config.load(p).mode == want, raw
+    c = Config(mode="exhaustive", windows="12")
+    c.save(p)
+    assert Config.load(p) == c
+    # with_mode: copy with an override; None/invalid keeps the current mode
+    assert c.with_mode("thorough").mode == "thorough" and c.mode == "exhaustive"
+    assert c.with_mode(None).mode == "exhaustive"
+    assert c.with_mode("bogus").mode == "exhaustive"
+    assert Config(mode="bogus").effective_mode == "fast"
+
+
+def test_window_count_per_mode():
+    d = 28.7 * 60
+    fast, thorough = Config(mode="fast"), Config(mode="thorough")
+    assert fast.window_count(d) == 8
+    assert thorough.window_count(d) == 20  # 2.5x
+    assert thorough.window_count(2 * 3600) == 75 and fast.window_count(2 * 3600) == 30
+    assert thorough.window_count(60) == 20  # capped by the file length in pick_windows
+    # explicit windows= still wins in fast/thorough, exhaustive covers the whole file
+    assert Config(mode="thorough", windows="5").window_count(3600) == 5
+    assert Config(mode="exhaustive", windows="5").window_count(3600) == 120
+    assert Config(mode="exhaustive").window_count(d) == 58  # ceil(1722 / 30)
+
+
+def test_verify_budget_per_mode():
+    d = 45 * 60
+    assert Config(mode="fast").verify_budget(d) == 3
+    assert Config(mode="thorough").verify_budget(d) == 9
+    assert Config(mode="exhaustive").verify_budget(d) == 0  # every window is transcribed
+    assert Config(mode="exhaustive", verify_windows="4").verify_budget(d) == 4
+    assert Config(mode="thorough", verify_windows="1").verify_budget(d) == 1

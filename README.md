@@ -64,6 +64,7 @@ From the menu **View → SubSync** you can:
 | Sync now (exhaustive) | re-sync by transcribing the whole file, 30 s at a time: for files the normal sync gets wrong. Much slower, especially on a CPU (see [Sync modes](#sync-modes)) |
 | Auto-sync: ON/OFF | turn automatic syncing on or off (remembered) |
 | Status… | show what SubSync is doing and the last result |
+| Experimental: no extra track (live delay): ON/OFF | correct the subtitle track you picked instead of adding a synced copy (remembered; see [below](#experimental-no-extra-subtitle-track-live-delay)) |
 
 > The extension has to be enabled once per VLC session from the View menu. Automatic
 > syncing does not need it.
@@ -160,6 +161,7 @@ windows=auto            # number of 30 s audio samples to transcribe, or auto (p
 verify_windows=auto     # extra samples the section check may transcribe (0 = none)
 min_confidence=0.5      # below this the original timing is kept (0..1)
 threads=0               # CPU threads, 0 = automatic
+sync_mode=track         # track | delay (EXPERIMENTAL, see below)
 ```
 
 `vlc-subsync doctor` prints the location it uses. The helper reads the file when it
@@ -211,6 +213,49 @@ Rough exhaustive-mode cost per hour of video: about 1 minute on this GPU and abo
 number of windows with speech. Fast mode stays under a minute per hour on either
 device.
 
+### Experimental: no extra subtitle track (live delay)
+
+**Off by default.** Normally SubSync adds the synced subtitles as a new track. With
+`sync_mode=delay` in `config.ini`, or **View → SubSync → Experimental: no extra track
+(live delay)**, it keeps the track you picked selected and corrects it while you
+watch, through VLC's own subtitle delay (the one the <kbd>G</kbd>/<kbd>H</kbd> keys
+change). The helper sends the timing it found (offset, drift and sections); twice a
+second the script sets the delay that fits the current playback position. The menu
+toggle wins over `config.ini` once you have used it.
+
+You see *"Subtitles synced (live delay, experimental): …"*. Your own
+<kbd>G</kbd>/<kbd>H</kbd> adjustments are kept on top of the correction. Switching to
+another subtitle or audio track gives the delay back to your own value (normally 0).
+
+Checked in a real VLC 3.0.24 (snap) on a 3-minute test video whose subtitles drift
+−4% (25 fps subtitles on 23.976 fps audio): the median line appeared 0.06 s after
+its speech started (0.07 s in the default mode, measured the same way), seeking
+forward and back was corrected at once, and changing the delay while a line was on
+screen never made it flicker.
+
+Limitations, why it is experimental:
+
+- **Subtitles that must appear earlier make VLC pause.** A negative subtitle delay
+  makes VLC buffer that much more, and every time the delay reaches a new low VLC
+  pauses playback (sound and picture) for the difference. With an offset that's a
+  single pause; with drift towards earlier subtitles it is a short pause every second
+  or two, adding up to the largest correction needed (about 5 s over the 3-minute test
+  above; at −4% a 2-hour film would add up to almost 5 minutes). The message says
+  *"may pause playback up to N s in total"* when this applies. Drift the other way
+  (subtitles that must appear later) and positive offsets cost nothing.
+- A line that VLC has already prepared keeps its old timing, so a correction takes
+  effect from the next line or two, not on the line on screen. In the test, a line
+  prepared just before a large change (your own −1 s) was cut short.
+- At a cut (an ad break missing from the subtitles) the switch happens about a second
+  early, so a line next to the cut can be off by the size of the cut.
+- After seeking backwards in a file that needed subtitles earlier, VLC keeps its larger
+  buffer, so lines can be a little late (about 0.2 s in the test above).
+- The pause estimate in the message is low when VLC does not know the file's length.
+- The delay applies to every subtitle track of the file, and VLC's track
+  synchronization dialog shows SubSync's value, not yours.
+- When the helper finds nothing to fix confidently, the original timing is kept, as
+  in the default mode.
+
 ## Languages
 
 - **English** subtitles use the English-only model (`base.en`), which is downloaded
@@ -238,6 +283,8 @@ them in `config.ini`.
   typical line is within 0.3 s of the spoken words). Sections shorter than about four
   minutes, or a timing change between two samples that no check landed on, may be
   missed. Drift outside 0.78–1.28× (−22% / +28%) isn't handled.
+- The live delay mode (no extra track) is experimental and off by default; see its
+  section above for what it cannot do.
 - Subtitles that don't match the dialogue at all (a different cut with re-edited
   lines, or a heavily paraphrased translation) may not be accepted. SubSync then keeps
   the original timing and tells you so instead of making things worse.

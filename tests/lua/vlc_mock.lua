@@ -65,12 +65,18 @@ function Mock.new(opts)
             obj = { _input = true },
             audio = audio or {},
             spu = spu or {},
-            sel = { ["audio-es"] = audio_sel or -1, ["spu-es"] = spu_sel or -1 },
+            -- "time" (playback position) and "spu-delay" are integers in microseconds
+            sel = { ["audio-es"] = audio_sel or -1, ["spu-es"] = spu_sel or -1,
+                    ["time"] = 0, ["spu-delay"] = 0, ["length"] = opts.length or 0 },
         }
         m.adds_pending = {}
     end
     function m.select(var, id)
         m.input.sel[var] = id
+    end
+    -- tests: playback position in seconds
+    function m.set_time(sec)
+        m.input.sel["time"] = math.floor(sec * 1000000 + 0.5)
     end
     function m.stop()
         m.input = nil
@@ -129,6 +135,13 @@ function Mock.new(opts)
             assert(obj and obj._input, "get on non-input object")
             process_adds()
             return m.input.sel[name]
+        end,
+        -- like VLC: creates the variable (if missing) and sets it; get() of a
+        -- variable that does not exist returns nothing
+        create = function(obj, name, value)
+            assert(obj and obj._input, "create on non-input object")
+            if m.input.sel[name] == nil then m.input.sel[name] = value end
+            m.creates = (m.creates or 0) + 1
         end,
         set = function(obj, name, value)
             assert(obj and obj._input, "set on non-input object")

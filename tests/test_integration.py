@@ -667,3 +667,131 @@ def test_vlc_end_to_end(tmp_path: Path):
                 for p in (q / sub).glob("*"):
                     p.unlink(missing_ok=True)
             shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.mark.slow
+@pytest.mark.vlc
+def test_vlc_delay_mode_end_to_end(tmp_path: Path):
+    """Experimental delay mode in a real VLC: the original (drifting) sidecar stays
+    selected, no track is added, and the intf moves the input's spu-delay along the
+    mapping as playback advances.
+
+    Same isolation as :func:`test_vlc_end_to_end`, plus: the intf is installed under
+    another name (``subsync_e2e``; VLC prefers a ``subsync.lua`` in the user data
+    dir, i.e. a real installation) and uses its own queue dir name, so an installed
+    SubSync helper watching the real snap queue never sees these requests.
+    """
+    import re
+
+    vlc = _vlc_binary()
+    if not vlc:
+        pytest.skip("VLC not installed")
+    engine()
+    require_model(FAST_MODEL)
+    snap = _is_snap(vlc)
+    if snap and os.environ.get("VLC_SUBSYNC_E2E_ALLOW_SNAP") != "1":
+        pytest.skip("snap VLC: set VLC_SUBSYNC_E2E_ALLOW_SNAP=1 to run anyway")
+
+    qname = "subsync-e2e"
+    base = tmp_path
+    if snap:
+        base = ROOT / ".cache" / "vlc-e2e" / tmp_path.name
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True)
+    home = base / "home"
+    data_home = home / ".local" / "share"
+    lua_root = base / "vlcdata"
+    (lua_root / "lua" / "intf").mkdir(parents=True)
+    src = (ROOT / "src" / "vlcsubsync" / "lua" / "intf" / "subsync.lua").read_text("utf-8")
+    patched = src.replace('return join(base, "subsync")', f'return join(base, "{qname}")')
+    assert patched != src
+    (lua_root / "lua" / "intf" / "subsync_e2e.lua").write_text(patched, encoding="utf-8")
+
+    if snap:
+        q = Path.home() / "snap" / "vlc" / "current" / ".local" / "share" / "vlc" / qname
+    elif sys.platform == "darwin":
+        q = home / "Library" / "Application Support" / "org.videolan.vlc" / qname
+    else:
+        q = data_home / "vlc" / qname
+    for d in ("requests", "jobs", "out"):
+        (q / d).mkdir(parents=True, exist_ok=True)
+
+    media_dir = base / "media"
+    copy_fixtures(media_dir, "multi_audio.mkv", "multi_audio.en.srt")
+    env = isolated_env(base / "subsync")
+    with (base / "subsync" / "config" / "config.ini").open("a", encoding="utf-8") as fh:
+        fh.write("sync_mode=delay\n")  # the experimental mode, from the helper's config
+    env.update(
+        HOME=str(home),
+        XDG_DATA_HOME=str(data_home),
+        XDG_CONFIG_HOME=str(home / ".config"),
+        XDG_CACHE_HOME=str(home / ".cache"),
+        VLC_DATA_PATH=str(lua_root),
+    )
+    env.pop("DISPLAY", None)
+    env.pop("WAYLAND_DISPLAY", None)
+    denv = dict(env, HOME=os.environ.get("HOME", str(home)))
+    denv.pop("XDG_CACHE_HOME")
+    dlog = (base / "daemon.log").open("w", encoding="utf-8")
+    daemon_proc = subprocess.Popen(
+        cli("serve", "--queue-dir", str(q), "--no-default-queues", "-v"),
+        env=denv,
+        stdout=dlog,
+        stderr=subprocess.STDOUT,
+    )
+    vlog_path = base / "vlc.log"
+    vlog = vlog_path.open("w", encoding="utf-8", errors="replace")
+    vlc_cmd = [
+        vlc, "-I", "dummy", "--extraintf", "luaintf", "--lua-intf", "subsync_e2e",
+        "-vv", "--no-metadata-network-access",
+        "--vout", "dummy", "--aout", "dummy",
+        # English audio, and the sidecar: timed for 25 fps on 23.976 audio, -1.5 s
+        "--audio-track", "1", "--sub-track", "1",
+        "--play-and-exit",
+        str(media_dir / "multi_audio.mkv"),
+    ]  # fmt: skip
+    pat = re.compile(r"\[subsync\] spu-delay=(-?\d+) us \(time=([0-9.]+)s")
+    vlc_proc = None
+    try:
+        deadline = time.monotonic() + 60
+        while not read_kv(q / "heartbeat").get("time"):
+            assert daemon_proc.poll() is None, "daemon died"
+            assert time.monotonic() < deadline, "no daemon heartbeat"
+            time.sleep(0.2)
+        vlc_proc = subprocess.Popen(vlc_cmd, env=env, stdout=vlog, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + 300
+        text, sets = "", []
+        while time.monotonic() < deadline:
+            text = vlog_path.read_text(encoding="utf-8", errors="replace")
+            sets = [(float(t), int(d) / 1e6) for d, t in pat.findall(text)]
+            if len(sets) >= 12 or vlc_proc.poll() is not None:
+                break
+            time.sleep(0.5)
+        print("\n".join(ln for ln in text.splitlines() if "[subsync]" in ln)[-6000:])
+        assert "[subsync] delay mode: start" in text, "delay mode never started"
+        assert "synced track es=" not in text and "added subtitle" not in text
+        assert len(sets) >= 12, f"spu-delay was set only {len(sets)} times"
+        # the sidecar is truth * 25/23.976 - 1.5, so at playback time T the delay is
+        # T - (T * 25/23.976 - 1.5), aimed (lookahead) at T + 1 s + the negative part
+        k = 25 / 23.976
+
+        def want(t):
+            d = t - (t * k - 1.5)
+            t2 = t + 1.0 + max(0.0, -d)
+            return t2 - (t2 * k - 1.5)
+
+        errs = [abs(d - want(t)) for t, d in sets]
+        assert max(errs) < 0.3, list(zip(sets, errs, strict=True))
+        delays = [d for _t, d in sets]
+        assert delays == sorted(delays, reverse=True)  # drift: it keeps decreasing
+        assert delays[0] - delays[-1] > 0.3
+    finally:
+        if vlc_proc is not None:
+            stop(vlc_proc)
+        stop(daemon_proc)
+        vlog.close()
+        dlog.close()
+        print((base / "daemon.log").read_text(encoding="utf-8")[-3000:])
+        if snap:
+            shutil.rmtree(q, ignore_errors=True)  # our own queue dir, nothing else
+            shutil.rmtree(base, ignore_errors=True)

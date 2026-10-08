@@ -201,15 +201,39 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    ≥2 clusters (cuts), fit piecewise-linear with DP over time-sorted anchors with a
    segment penalty (segments share `scale` unless evidence otherwise). If anchors are
    too sparse in a region, transcribe more windows there (adaptive, bounded).
-6. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
+6. Local refinement (`align.refine_local`), three steps that each work on the
+   residual of the previous one, so they cannot fight, assembled into **one
+   continuous correction curve relative to the fitted lines, bounded by ±0.5 s in
+   total** (`_assemble_correction`): each segment contributes its shift (steps 1–2)
+   and wobble knots (step 3), every segment boundary gets a shared knot (mean of both
+   sides), and all values are clipped to ±0.5 s. The curve is linear between knots
+   and flat outside them, so the total never exceeds the bound, and the mapping jumps
+   at a boundary exactly as much as the fitted lines do. Refinement alone never
+   creates a backward jump (which `retime` would resolve by squeezing earlier cues);
+   genuine cuts keep theirs.
+   1. per segment: shift by the weighted median residual of its inlier anchors
+      (one candidate per transcript token);
+   2. global: `refine_with_speech` snaps mapped cue starts to the nearest speech
+      onset (±0.5 s) and applies the median shift when it is *precise*: standard
+      error of the median ≤ 0.04 s and MAD ≤ 0.25 s (real dialogue has a 0.1–0.2 s
+      MAD; the old MAD ≤ 0.12 gate rejected useful shifts). Speech onsets are
+      independent of Whisper's timestamp bias, so they own the absolute level;
+   3. per segment: smooth correction knots every 120 s (subtitle clock), from the
+      ±120 s neighbourhood: per-window median anchor residuals (variance
+      SE² + 0.2² for the window's shared timestamp bias) and median speech-onset
+      deltas (SE²), each relative to its own segment baseline, combined by
+      precision, shrunk towards 0 with a 0.2 s prior, smoothed [¼ ½ ¼] and linearly
+      interpolated (`Segment.knots`). Slow wobble is followed; single lines are not
+      moved individually.
+7. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
    with the subtitle-on mask at 10 ms resolution over the same candidate scales
    (FFT), pick best.
-7. Confidence: (1 − e^(−inliers/12)) · (0.35 + 0.65·inlier weight ratio) ·
+8. Confidence: (1 − e^(−inliers/12)) · (0.35 + 0.65·inlier weight ratio) ·
    (0.4 + 0.6·window coverage) · e^(−max(0, residual − 0.25)/0.4) · 0.95^(segments−1).
    The residual is the median |inlier residual| after removing up to 0.2 s of each
    window's median (its shared timestamp bias is not misfit; a line off by more still
    shows the excess).
-8. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
+9. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)

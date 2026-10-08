@@ -9,11 +9,14 @@ Pipeline (see DESIGN.md):
    RANSAC candidate lines → Viterbi labelling of time-sorted anchors with a segment
    switch penalty → per-segment IRLS refit (short segments share the dominant scale)
    → boundaries placed at cue gaps (using the speech mask when available).
-4. :func:`refine_local` – per-segment median residual, global speech-onset bias
+4. :func:`subdivide` – bisection verification: check each segment at its midpoint
+   (and every window inside it), split where it disagrees by more than 0.25 s and
+   the split explains it, refit halves with known ratios, merge what agrees.
+5. :func:`refine_local` – per-segment median residual, global speech-onset bias
    (:func:`refine_with_speech`), smooth local wobble knots; each bounded ±0.5 s.
-5. :func:`vad_align` – fallback: FFT cross-correlation of the speech mask with the
+6. :func:`vad_align` – fallback: FFT cross-correlation of the speech mask with the
    subtitle-on mask over framerate scale candidates.
-6. :func:`apply_mapping` – retime every event (cue durations scale with the
+7. :func:`apply_mapping` – retime every event (cue durations scale with the
    segment, introduced overlaps are clamped, nothing is dropped).
 
 Everything is deterministic (seeded RNG).
@@ -798,7 +801,7 @@ def fit_mapping(
 def _fit_stats(mapping: Mapping, arr: _AnchorArrays, n_windows: int):
     """Confidence and statistics of ``mapping`` against the anchors: one vote per
     transcript token (its candidates are alternatives), so repeated phrases do not
-    dilute the inlier ratio. ``n_windows`` = windows transcribed.
+    dilute the inlier ratio. ``n_windows`` = windows transcribed before verification.
     Returns ``(confidence, inliers, groups, median, details)``.
     """
     x = arr.x_for(mapping)
@@ -819,9 +822,13 @@ def _fit_stats(mapping: Mapping, arr: _AnchorArrays, n_windows: int):
         mk = inl & (win == k)
         adj[mk] -= np.clip(np.median(signed[mk]), -WINDOW_BIAS, WINDOW_BIAS)
     med = float(np.median(np.abs(adj[inl]))) if inl.any() else 99.0
-    win_with = len(set(win[inl].tolist())) if inl.any() else 0
-    n_win = max(n_windows, len(set(win.tolist())), 1)
-    coverage = min(1.0, win_with / n_win)
+    with_inliers = set(win[inl].tolist()) if inl.any() else set()
+    # Windows numbered >= n_windows were added by verification probes: they count
+    # only when they contribute inliers (a probe on music must not lower coverage).
+    probes_used = sum(1 for k in with_inliers if n_windows and k >= n_windows)
+    base_windows = {k for k in set(win.tolist()) if not n_windows or k < n_windows}
+    n_win = max(n_windows, len(base_windows), 1) + probes_used
+    coverage = min(1.0, len(with_inliers) / n_win)
     conf = (
         (1.0 - math.exp(-n_in / 12.0))
         * (0.35 + 0.65 * ratio)
@@ -914,9 +921,12 @@ def refine_with_speech(
 
 
 # --------------------------------------------------------------------------------------
-# Local refinement
+# Bisection verification and local refinement
 # --------------------------------------------------------------------------------------
 
+VERIFY_TOLERANCE = 0.25  # s, disagreement of a verification window with its segment
+MIN_SEGMENT = 120.0  # s (subtitle clock), no split below 2x this
+MAX_DEPTH = 5
 LOCAL_MAX_SHIFT = 0.5  # s, bound of each local correction
 WOBBLE_PRIOR = 0.2  # s, prior std-dev of slow local wobble (shrinkage)
 WOBBLE_STEP = 120.0  # s (subtitle clock) between correction knots
@@ -940,6 +950,560 @@ def _best_per_group(r: np.ndarray, grp: np.ndarray, mask: np.ndarray) -> np.ndar
     first[1:] = grp[order][1:] != grp[order][:-1]
     out[order[first]] = True
     return out
+
+
+def _window_centres(arr: _AnchorArrays) -> dict[int, float]:
+    # every candidate of a window has its audio time inside that window
+    return {int(k): float(0.5 * (arr.y[arr.win == k].min() + arr.y[arr.win == k].max()))
+            for k in np.unique(arr.win)}  # fmt: skip
+
+
+def _window_verdict(
+    arr: _AnchorArrays, k: int, seg: Segment, tol: float, min_groups: int = 6
+) -> tuple[str, float]:
+    """Does window ``k`` agree with ``seg``? → ("agree"|"disagree"|"unknown", deviation).
+
+    The window's own consensus is the mode of the residuals of *all* its candidate
+    anchors (whatever their distance from the line), kept if ≥ ``min_groups``
+    transcript tokens support it. Disagreement: that consensus is more than ``tol``
+    off the line (10 s off is a disagreement, not missing evidence), or the line
+    explains less than half of what the consensus explains. "unknown" means the
+    window has no coherent evidence at all (music, silence, garbled transcript).
+    """
+    m = arr.win == k
+    if not m.any():
+        return "unknown", 0.0
+    r_all = arr.y - seg.line(arr.x(seg.scale))
+    rr, ww, gg = r_all[m], arr.w[m], arr.grp[m]
+    if len(np.unique(gg)) < min_groups:
+        return "unknown", 0.0
+    kern = np.clip(1.0 - ((rr[None, :] - rr[:, None]) / 0.3) ** 2, 0, None)
+    sup = (ww[None, :] * kern).sum(1)
+    mode = float(rr[int(np.argmax(sup))])
+    near = np.flatnonzero(np.abs(rr - mode) < 0.5)
+    # one candidate per transcript token: the closest to the mode
+    near = near[np.lexsort((np.abs(rr[near] - mode), gg[near]))]
+    keep = np.ones(near.size, dtype=bool)
+    keep[1:] = gg[near][1:] != gg[near][:-1]
+    core = near[keep]
+    if core.size < min_groups:
+        return "unknown", 0.0
+    dev = _wmedian(rr[core], ww[core])
+    b0 = _best_per_group(rr, gg, np.abs(rr) < 0.5)
+    sup0 = float((ww[b0] * np.clip(1.0 - (rr[b0] / 0.3) ** 2, 0, None)).sum())
+    supm = float((ww[core] * np.clip(1.0 - ((rr[core] - mode) / 0.3) ** 2, 0, None)).sum())
+    inconsistent = sup0 < 0.5 * supm
+    return ("disagree" if abs(dev) > tol or inconsistent else "agree"), dev
+
+
+def _split_point(cues: Sequence[Cue] | None, lo: float, hi: float) -> float:
+    """Best cue gap near the middle of [lo, hi] (subtitle clock): the largest gap
+    between consecutive cues, discounted with the distance from the midpoint."""
+    mid = 0.5 * (lo + hi)
+    q = 0.25 * (hi - lo)
+    if not cues:
+        return mid
+    best, best_t = -math.inf, mid
+    prev_end = -math.inf
+    for c in cues:
+        if mid - q < c.start < mid + q and prev_end > -math.inf:
+            gap = c.start - prev_end
+            score = gap * (1.0 - 0.5 * abs(c.start - mid) / q)
+            if score > best:
+                best, best_t = score, c.start
+        prev_end = max(prev_end, c.end)
+    return best_t
+
+
+def _refit_range(
+    arr: _AnchorArrays,
+    lo: float,
+    hi: float,
+    parent: Segment,
+    dom_s: float,
+    rng: np.random.Generator,
+    gate: float = 5.0,
+) -> tuple[Segment, np.ndarray] | None:
+    """Fit ``[lo, hi)`` (subtitle clock) on its own: RANSAC line among candidates
+    within ``gate`` s of the parent line selects the inliers, then a fixed known
+    ratio is fitted (see below).
+    Returns the segment and its inlier mask (one candidate per transcript token)."""
+    xp = arr.x(parent.scale)
+    rp = arr.y - parent.line(xp)
+    m = (arr.x0 >= lo) & (arr.x0 < hi) & (np.abs(rp) < gate)
+    if len(np.unique(arr.grp[m])) < 6:
+        return None
+    found = _ransac_line(xp[m], arr.y[m], arr.w[m], rng)
+    if found is None:
+        return None
+    s, o, _sup = found
+    x = arr.x(s)
+    r = arr.y - (s * x + o)
+    inl = _best_per_group(r, arr.grp, m & (np.abs(r) < INLIER_THRESHOLD))
+    if inl.sum() < 6:
+        return None
+    # Known ratios only (a free scale over a few windows follows local wobble and
+    # extrapolates badly): the dominant scale, the parent's, and the best-fitting known
+    # ratio (prior towards 1.0). Judged per window (mean |median residual|); 1.0, then
+    # the dominant scale, win near-ties.
+    best_s, best_o = _best_candidate_scale(x[inl], arr.y[inl], arr.w[inl], s, o)
+    options = {best_s: best_o}
+    for sc in (dom_s, parent.scale, 1.0):
+        if sc not in options:
+            xs = arr.x(sc)
+            options[sc] = _irls(xs[inl], arr.y[inl], arr.w[inl], sc,
+                                float(np.median((arr.y - sc * xs)[inl])), True)[1]  # fmt: skip
+    per_option = {}
+    for sc, of in options.items():
+        rr = arr.y - (sc * arr.x(sc) + of)
+        mm = _best_per_group(rr, arr.grp, m & (np.abs(rr) < INLIER_THRESHOLD))
+        per_option[sc] = {
+            int(k): abs(float(np.median(rr[mm & (arr.win == k)])))
+            for k in np.unique(arr.win[mm])
+            if (mm & (arr.win == k)).sum() >= 3
+        }
+    # windows with evidence under any option; one without inliers costs a full second
+    wins = set().union(*per_option.values())
+    if not wins:
+        return None
+    scored = []
+    for sc, of in options.items():
+        e = float(np.mean([per_option[sc].get(k, INLIER_THRESHOLD) for k in wins]))
+        e -= 0.02 if sc == 1.0 else (0.01 if sc == dom_s else 0.0)
+        scored.append((e, sc, of))
+    _e, s2, o2 = min(scored)
+    x2 = arr.x(s2)
+    r2 = arr.y - (s2 * x2 + o2)
+    inl = _best_per_group(r2, arr.grp, m & (np.abs(r2) < INLIER_THRESHOLD))
+    if inl.sum() < 6:
+        return None
+    return Segment(lo, s2, o2, int(inl.sum())), inl
+
+
+def _window_spread(arr: _AnchorArrays, seg: Segment, mask: np.ndarray) -> tuple[float, int]:
+    """Robust std-dev of per-window median residuals under ``seg`` (≥ the within-window
+    standard error) and the number of windows with evidence."""
+    x = arr.x(seg.scale)
+    r = arr.y - seg.line(x)
+    meds, ses = [], []
+    for k in np.unique(arr.win[mask]):
+        mk = mask & (arr.win == k)
+        if mk.sum() >= 3:
+            med, _mad, se = _median_se(r[mk])
+            meds.append(med)
+            ses.append(se)
+    if not meds:
+        return WINDOW_BIAS, 0
+    d = np.array(meds)
+    spread = 1.4826 * float(np.median(np.abs(d - np.median(d)))) if d.size >= 3 else WINDOW_BIAS
+    return max(spread, float(np.median(ses)), 0.03), len(meds)
+
+
+def _range_error(
+    arr: _AnchorArrays, lo: float, hi: float, parts: list[tuple[float, float, Segment]]
+) -> float:
+    """Mean |per-window median residual| over [lo, hi) under piecewise ``parts``."""
+    meds = []
+    for a, b, seg in parts:
+        r = arr.y - seg.line(arr.x(seg.scale))
+        m = _best_per_group(
+            r, arr.grp, (arr.x0 >= a) & (arr.x0 < b) & (np.abs(r) < INLIER_THRESHOLD)
+        )
+        for k in np.unique(arr.win[m]):
+            mk = m & (arr.win == k)
+            if mk.sum() >= 3:
+                meds.append(abs(float(np.median(r[mk]))))
+    return float(np.mean(meds)) if meds else 0.0
+
+
+def _verifies(arr: _AnchorArrays, lo: float, hi: float, seg: Segment, tol: float) -> bool:
+    """Positive verification of ``seg`` over [lo, hi]: at least one transcription
+    window inside agrees with it, and every window inside that has coherent evidence
+    agrees (no evidence is not agreement, and a window far off the line disagrees)."""
+    a_lo, a_hi = sorted((seg.map(lo), seg.map(hi)))
+    verdicts = [
+        _window_verdict(arr, k, seg, tol)[0]
+        for k, c in _window_centres(arr).items()
+        if a_lo <= c <= a_hi
+    ]
+    return "agree" in verdicts and "disagree" not in verdicts
+
+
+def _change_point(arr: _AnchorArrays, p: _Piece) -> tuple[float, float] | None:
+    """Best single change point of the per-window median residuals under ``p.seg``
+    (L1 cost, ≥ 2 windows per side). Returns the subtitle-time gap between the last
+    window before and the first window after it, or None."""
+    x = arr.x(p.seg.scale)
+    r = arr.y - p.seg.line(x)
+    m = _best_per_group(
+        r, arr.grp, (arr.x0 >= p.lo) & (arr.x0 < p.hi) & (np.abs(r) < INLIER_THRESHOLD)
+    )
+    rows = []
+    for k in np.unique(arr.win[m]):
+        mk = m & (arr.win == k)
+        if mk.sum() >= 3:
+            rows.append((float(arr.x0[mk].min()), float(arr.x0[mk].max()), float(np.median(r[mk]))))
+    rows.sort()
+    if len(rows) < 4:
+        return None
+    d = np.array([t[2] for t in rows])
+    best = None
+    for i in range(2, len(rows) - 1):
+        a, b = d[:i], d[i:]
+        cost = float(np.abs(a - np.median(a)).sum() + np.abs(b - np.median(b)).sum())
+        if best is None or cost < best[0]:
+            best = (cost, i)
+    if best is None:
+        return None
+    i = best[1]
+    lo, hi = rows[i - 1][1], rows[i][0]
+    return (lo, hi) if hi > lo else None
+
+
+def _fold_votes(
+    own_v: dict[int, tuple[str, float]],
+    nb_v: dict[int, tuple[str, float]],
+    centres: dict[int, float],
+    tol: float,
+) -> tuple[int, int]:
+    """Votes (own, neighbour) of the windows inside a short segment. Each window
+    votes for the line its consensus is closer to, if that line is within 2x ``tol``
+    (a fold compares two lines; it is not a verification against one). Overlapping
+    windows (centres < 30 s apart) cover the same audio and share its timestamp bias,
+    so they cast one vote together (their majority)."""
+    prefs = []
+    for k in sorted(own_v, key=lambda k: centres[k]):
+        (vo, do), (vn, dn) = own_v[k], nb_v[k]
+        if vo == "unknown" or vn == "unknown":
+            continue
+        best = min(abs(do), abs(dn))
+        if best <= 2 * tol:
+            prefs.append((centres[k], 1 if abs(do) <= abs(dn) else -1))
+    own = nb = 0
+    i = 0
+    while i < len(prefs):
+        j = i
+        while j + 1 < len(prefs) and prefs[j + 1][0] - prefs[j][0] < 30.0:
+            j += 1
+        tally = sum(v for _c, v in prefs[i : j + 1])
+        own += tally > 0
+        nb += tally < 0
+        i = j + 1
+    return own, nb
+
+
+@dataclass
+class _Piece:
+    lo: float  # subtitle clock
+    hi: float
+    seg: Segment
+    depth: int = 0
+    split: bool = False  # created by a split (its start is ours to place)
+
+
+def subdivide(
+    fit: AlignResult,
+    anchors: Sequence[Anchor],
+    cues: Sequence[Cue],
+    probe=None,
+    speech: np.ndarray | None = None,
+    resolution: float = 0.01,
+    n_windows: int = 0,
+    tol: float = VERIFY_TOLERANCE,
+    min_len: float = MIN_SEGMENT,
+    max_depth: int = MAX_DEPTH,
+    seed: int = 0,
+) -> tuple[AlignResult, list[Anchor]]:
+    """Bisection verification of a fit.
+
+    Each segment's mapping is checked at its midpoint against a transcription window
+    there: ``probe(audio_time, near)`` returns ``(anchors, transcribed)``, transcribing
+    a window centred at ``audio_time`` if none lies within ``near`` s and the window
+    budget allows (``probe=None``: only existing windows are used). A probe window
+    without coherent evidence (music, silence) is not agreement: other positions are
+    tried while the budget lasts, and a segment with no evidence at all is left as it
+    is and counted in ``details["verify_unverified"]``. If the
+    window disagrees (see :func:`_window_verdict`), the segment is split at the best
+    cue gap near its midpoint and both halves are refitted on their own (known-ratio
+    snapping, scale prior, short halves share the dominant scale). A split is kept
+    only if the halves differ by more than ``tol`` plus twice the standard error
+    implied by the spread of per-window residuals (a single window's timestamp bias
+    is not a section of different timing). Recursion stops at ``min_len``,
+    ``max_depth`` or when the probe has nothing new; finally, adjacent segments that
+    agree within ``tol`` are merged.
+
+    Returns ``(fit, anchors)`` (anchors include probe windows).
+    """
+    if fit.method != "whisper" or not cues or fit.anchors < 6:
+        return fit, list(anchors)
+    rng = np.random.default_rng(seed)
+    cue_starts = [c.start for c in cues]
+    first, last = min(cue_starts), max(c.end for c in cues)
+    segs = fit.mapping.segments
+    dom_s = fit.mapping.dominant(cue_starts).scale
+    queue: list[_Piece] = []
+    for i, s in enumerate(segs):
+        lo = first if i == 0 else max(s.start, first)
+        hi = last if i + 1 == len(segs) else min(segs[i + 1].start, last)
+        if hi > lo:
+            queue.append(_Piece(lo, hi, s))
+    if not queue:
+        return fit, list(anchors)
+    cur = list(anchors)
+    arr = _AnchorArrays.build(cur)
+    done: list[_Piece] = []
+    checks = splits = unverified = empty_probes = 0
+    changed = False
+
+    def run_probe(centre: float, near: float) -> set[int] | None:
+        """Probe; None if nothing was transcribed, else the new windows' ids that
+        have coherent evidence (empty: the window gave nothing usable)."""
+        nonlocal cur, arr
+        if probe is None:
+            return None
+        before = set(np.unique(arr.win).tolist())
+        new, transcribed = probe(centre, near)
+        if not transcribed:
+            return None
+        cur = list(new)
+        arr = _AnchorArrays.build(cur)
+        ids = set(np.unique(arr.win).tolist()) - before
+        return ids
+
+    def probe_with_evidence(centres: list[float], near: float, seg: Segment) -> None:
+        """Probe the first position; if the window yields no coherent evidence (music,
+        silence), retry the next positions while the budget lasts."""
+        nonlocal empty_probes
+        for n, c in enumerate(centres):
+            ids = run_probe(c, near)
+            if ids is None:
+                if n == 0:
+                    return  # a window is already near the first position (or no budget)
+                continue
+            if any(_window_verdict(arr, k, seg, tol)[0] != "unknown" for k in ids):
+                return
+            empty_probes += 1
+
+    while queue:
+        p = queue.pop(0)
+        if p.hi - p.lo < 2 * min_len or p.depth >= max_depth:
+            done.append(p)
+            continue
+        mid = 0.5 * (p.lo + p.hi)
+        centre = p.seg.map(mid)
+        near = min(90.0, max(30.0, (p.hi - p.lo) * p.seg.scale / 8.0))
+        span = 0.25 * (p.hi - p.lo) * p.seg.scale
+        probe_with_evidence([centre, centre + span, centre - span], near, p.seg)
+        if not len(arr.anchors):
+            done.append(p)
+            unverified += 1
+            continue
+        # The midpoint window, plus every other window already inside the segment (a
+        # compromise line through two different sections is right at its middle).
+        centres = _window_centres(arr)
+        a_lo, a_hi = sorted((p.seg.map(p.lo), p.seg.map(p.hi)))
+        inside = [j for j, c in centres.items() if a_lo <= c <= a_hi]
+        k = min(centres, key=lambda j: abs(centres[j] - centre))
+        if abs(centres[k] - centre) <= near + 15.0 and k not in inside:
+            inside.append(k)
+        checks += 1
+        verdicts = [_window_verdict(arr, j, p.seg, tol)[0] for j in inside]
+        if "disagree" not in verdicts and "agree" not in verdicts:
+            unverified += 1  # no coherent evidence anywhere in the segment: leave it
+            done.append(p)
+            continue
+        if "disagree" not in verdicts:
+            # Verified; still prefer a known-ratio refit that halves the per-window
+            # error (an initial compromise line can stay within the tolerance).
+            whole = _refit_range(arr, p.lo, p.hi, p.seg, dom_s, rng)
+            if whole is not None:
+                e_old = _range_error(arr, p.lo, p.hi, [(p.lo, p.hi, p.seg)])
+                e_new = _range_error(arr, p.lo, p.hi, [(p.lo, p.hi, whole[0])])
+                if e_new <= 0.5 * e_old and e_old - e_new > 0.05:
+                    ws = whole[0]
+                    p = _Piece(p.lo, p.hi, Segment(p.seg.start, ws.scale, ws.offset,
+                                                   ws.anchors), p.depth, p.split)  # fmt: skip
+                    changed = True
+            done.append(p)
+            continue
+        # Candidate cuts: the best cue gap near the midpoint (bisection), and the cue
+        # gap at the change point of the per-window residuals (sections at 1/3 and
+        # 2/3 leave both midpoint halves mixed). The one explaining more wins.
+        cuts = {_split_point(cues, p.lo, p.hi)}
+        cp = _change_point(arr, p)
+        if cp is not None:
+            cuts.add(_split_point(cues, *cp))
+        significant = False
+        best = None
+        e_parent = _range_error(arr, p.lo, p.hi, [(p.lo, p.hi, p.seg)])
+        for cut in sorted(cuts):
+            if cut - p.lo < min_len or p.hi - cut < min_len:
+                continue
+            left = _refit_range(arr, p.lo, cut, p.seg, dom_s, rng)
+            right = _refit_range(arr, cut, p.hi, p.seg, dom_s, rng)
+            if left is None or right is None:
+                continue
+            (ls_, lm), (rs_, rm) = left, right
+            e_split = _range_error(arr, p.lo, p.hi, [(p.lo, cut, ls_), (cut, p.hi, rs_)])
+            if best is None or e_split < best[0]:
+                best = (e_split, cut, ls_, lm, rs_, rm)
+        if best is not None:
+            e_split, cut, ls, lm, rs, rm = best
+            sl, nl = _window_spread(arr, ls, lm)
+            sr, nr = _window_spread(arr, rs, rm)
+            diff = max(abs(ls.line(t) - rs.line(t)) for t in (p.lo, cut, p.hi))
+            se = max(sl, sr) * math.sqrt(1.0 / max(nl, 1) + 1.0 / max(nr, 1))
+            # Significant: the halves differ beyond the tolerance plus noise, and the
+            # split explains the disagreement: the error halves, or one half is
+            # consistent on its own and the other is left to the recursion (a step
+            # vanishes; a smooth wobble does not, that is refine_local's job).
+            explains = e_split <= 0.5 * e_parent or (
+                e_split <= 0.8 * e_parent
+                and (_verifies(arr, p.lo, cut, ls, tol) or _verifies(arr, cut, p.hi, rs, tol))
+            )
+            significant = nl > 0 and nr > 0 and diff > tol + 2.0 * se and explains
+        if not significant:
+            # Not two sections: maybe the segment's own line is off (e.g. a compromise
+            # scale); keep a refit of the whole range if it verifies where p did not.
+            whole = _refit_range(arr, p.lo, p.hi, p.seg, dom_s, rng)
+            if whole is not None and _verifies(arr, p.lo, p.hi, whole[0], tol):
+                ws = whole[0]
+                p = _Piece(p.lo, p.hi, Segment(p.seg.start, ws.scale, ws.offset, ws.anchors),
+                           p.depth, p.split)  # fmt: skip
+                changed = True
+            done.append(p)
+            continue
+        splits += 1
+        changed = True
+        queue[0:0] = [
+            _Piece(p.lo, cut, Segment(p.seg.start, ls.scale, ls.offset, ls.anchors),
+                   p.depth + 1, p.split),
+            _Piece(cut, p.hi, Segment(cut, rs.scale, rs.offset, rs.anchors), p.depth + 1, True),
+        ]  # fmt: skip
+
+    # Segments too short to split (typically one or two windows that fit_mapping set
+    # apart): probe once more inside, and fold one into a neighbour when at least as
+    # many of its windows agree with the neighbour as with the segment itself (ties
+    # favour fewer segments).
+    folded = 0
+    folded_windows: set[int] = set()  # windows outvoted by a fold (biased timestamps)
+    i = 0
+    while len(done) > 1 and i < len(done):
+        p = done[i]
+        if p.hi - p.lo >= 2 * min_len:
+            i += 1
+            continue
+        a_lo, a_hi = sorted((p.seg.map(p.lo), p.seg.map(p.hi)))
+        if probe is not None and a_hi - a_lo >= 60.0 and len(arr.anchors):
+            # independent evidence: the points of the segment farthest from any window
+            # (one window's timestamps can be off by more than a second on its own)
+            taken = np.array(list(_window_centres(arr).values()))
+            grid = np.linspace(a_lo + 15.0, a_hi - 15.0, 32)
+            dist = np.min(np.abs(grid[:, None] - taken[None, :]), axis=1)
+            order = [float(grid[g]) for g in np.argsort(-dist)[:8]]
+            # first the farthest point, then the farthest one away from it
+            far = [order[0]] + [c for c in order[1:] if abs(c - order[0]) >= 30.0][:1]
+            probe_with_evidence(far, 15.0, p.seg)
+        centres = _window_centres(arr)
+        inside = [k for k, c in centres.items() if a_lo <= c <= a_hi]
+        checks += 1
+        own_v = {k: _window_verdict(arr, k, p.seg, tol) for k in inside}
+        if all(v[0] == "unknown" for v in own_v.values()):
+            unverified += 1
+        target = None
+        for j in (i - 1, i + 1):
+            if 0 <= j < len(done):
+                nb_v = {k: _window_verdict(arr, k, done[j].seg, tol) for k in inside}
+                own, votes = _fold_votes(own_v, nb_v, centres, tol)
+                if votes >= max(own, 1) and (target is None or votes > target[1]):
+                    target = (j, votes)
+        if target is None:
+            i += 1
+            continue
+        j = target[0]
+        folded_windows |= {k for k, v in own_v.items() if v[0] == "agree"}
+        a, b = done[min(i, j)], done[max(i, j)]
+        nb = done[j].seg
+        done[min(i, j) : max(i, j) + 1] = [
+            _Piece(a.lo, b.hi, Segment(a.seg.start, nb.scale, nb.offset, nb.anchors),
+                   max(a.depth, b.depth), a.split)
+        ]  # fmt: skip
+        folded += 1
+        changed = True
+        i = min(i, j)
+
+    if not changed:
+        fit.details.update(
+            verify_checks=checks, verify_splits=0, verify_folded=0,
+            verify_unverified=unverified, verify_empty_probes=empty_probes,
+        )  # fmt: skip
+        if len(cur) != len(anchors):  # new windows: refresh statistics
+            conf, n_in, n_groups, med, stats = _fit_stats(fit.mapping, arr, n_windows)
+            fit = AlignResult(fit.mapping, fit.method, conf, n_in, n_groups, med,
+                              fit.ambiguous, fit.sparse, {**fit.details, **stats})  # fmt: skip
+        return fit, cur
+
+    # Merge adjacent pieces when one refit of both verifies against all their windows.
+    merged = True
+    while merged and len(done) > 1:
+        merged = False
+        for i in range(len(done) - 1):
+            a, b = done[i], done[i + 1]
+            ref = _refit_range(arr, a.lo, b.hi, a.seg, dom_s, rng)
+            if ref is None or not _verifies(arr, a.lo, b.hi, ref[0], tol):
+                continue
+            seg = ref[0]
+            done[i : i + 2] = [
+                _Piece(a.lo, b.hi, Segment(a.seg.start, seg.scale, seg.offset, seg.anchors),
+                       max(a.depth, b.depth), a.split)
+            ]  # fmt: skip
+            merged = True
+            break
+
+    # Boundaries of new splits: between the anchored regions of both sides, at a cue
+    # gap (or by speech overlap when the difference is audible).
+    x = arr.x_for(fit.mapping)
+    final: list[Segment] = []
+    for i, p in enumerate(done):
+        seg = Segment(p.seg.start, p.seg.scale, p.seg.offset, p.seg.anchors)
+        if i == 0:
+            seg.start = -math.inf
+        elif p.split:
+            prev = final[-1]
+            ra = np.abs(arr.y - prev.line(x)) < INLIER_THRESHOLD
+            rb = np.abs(arr.y - seg.line(x)) < INLIER_THRESHOLD
+            la = ra & (arr.x0 >= done[i - 1].lo) & (arr.x0 < p.lo)
+            lb = rb & (arr.x0 >= p.lo) & (arr.x0 < p.hi)
+            xa = float(arr.x0[la].max()) if la.any() else p.lo
+            xb = float(arr.x0[lb].min()) if lb.any() else p.lo
+            seg.start = (
+                _choose_boundary(xa, xb, prev, seg, cues, speech, resolution) if xb > xa else p.lo
+            )
+        else:
+            seg.start = p.lo if p.seg.start == -math.inf else p.seg.start
+        if final and final[-1].start > -math.inf:
+            seg.start = max(seg.start, final[-1].start + 1e-3)
+        final.append(seg)
+    mapping = Mapping(final)
+    conf, n_in, n_groups, med, stats = _fit_stats(mapping, arr, n_windows)
+    details = {**fit.details, **stats, "verify_checks": checks, "verify_splits": splits,
+               "verify_folded": folded, "verify_unverified": unverified,
+               "verify_empty_probes": empty_probes}  # fmt: skip
+    # Safety net against a bad refit: never trade a fit for one that explains clearly
+    # fewer anchors (folding a biased window legitimately drops a few) or explains them
+    # worse (the confidence itself also pays a small per-segment penalty).
+    # Windows outvoted by a fold are left out of the comparison: losing their
+    # (biased) inliers is the point of the fold.
+    kept = [a for a in cur if a.window not in folded_windows]
+    ref = _AnchorArrays.build(kept) if folded_windows and len(kept) >= 3 else arr
+    _c1, n_in1, _g1, med1, _s1 = _fit_stats(mapping, ref, n_windows)
+    _c0, n_in0, _g0, med0, _s0 = _fit_stats(fit.mapping, ref, n_windows)
+    if n_in1 < 0.9 * n_in0 or med1 > med0 + 0.05:
+        details.update(verify_splits=0, verify_rejected=True)
+        conf0, n_in0, n_groups0, med0, stats0 = _fit_stats(fit.mapping, arr, n_windows)
+        return AlignResult(fit.mapping, fit.method, conf0, n_in0, n_groups0, med0,
+                           fit.ambiguous, fit.sparse, {**details, **stats0}), cur  # fmt: skip
+    return AlignResult(mapping, "whisper", conf, n_in, n_groups, med, [], [], details), cur
 
 
 def refine_local(

@@ -116,6 +116,32 @@ def test_sync_cut_piecewise(tmp_path, synth, energy_vad):
     assert len(fake.calls) > Config().window_count(25 * 60)
 
 
+@pytest.mark.parametrize("verify_windows", ["auto", "0"])
+def test_sync_small_offset_steps_verified(tmp_path, synth, energy_vad, verify_windows):
+    """Sections 0.6-0.8 s apart (below the inlier threshold): the bisection
+    verification separates them, within its window budget."""
+
+    def f(t):
+        return t + 2.0 if t < 900 else (t + 2.6 if t < 1800 else t + 1.8)
+
+    duration = 45 * 60
+    script, wav, srt, fake = _case(tmp_path, synth, f, duration, seed=1, drop=0.1)
+    cfg = Config(verify_windows=verify_windows)
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(srt)), str(tmp_path / "o.srt"),
+        cfg, transcriber=fake,
+    )  # fmt: skip
+    assert r.applied
+    err = _errors(synth, r.output_path, script, f)
+    _check(err)
+    k = cfg.window_count(duration)
+    budget = cfg.verify_budget(duration)
+    adaptive = max(4, k // 2)
+    assert len(fake.calls) <= 1 + k + adaptive + budget  # +1: language detection window
+    if verify_windows == "auto":
+        assert r.segments == 3 and np.percentile(err, 95) < 0.2
+
+
 def test_language_mismatch_uses_vad(tmp_path, synth, energy_vad):
     def f(t):
         return t + 4.0

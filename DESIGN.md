@@ -201,7 +201,55 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    ≥2 clusters (cuts), fit piecewise-linear with DP over time-sorted anchors with a
    segment penalty (segments share `scale` unless evidence otherwise). If anchors are
    too sparse in a region, transcribe more windows there (adaptive, bounded).
-6. Local refinement (`align.refine_local`), three steps that each work on the
+6. Bisection verification (`align.subdivide`; differences below the 1 s inlier
+   threshold, e.g. 0.6 s steps that the fit absorbs into a tilted compromise line):
+   * Each segment is checked against the window nearest its midpoint (transcribed
+     there if none lies within `clamp(len/8, 30, 90)` s and the budget
+     `verify_windows` allows: auto = 2 + 1 per 30 min) and against every window
+     already inside it (free). A window's own consensus is the mode of the residuals
+     of *all* its candidate anchors (however far from the line), kept if ≥ 6
+     transcript tokens support it. The window *disagrees* if that consensus is
+     > 0.25 s off the line (10 s off is disagreement, not missing evidence), or the
+     line explains < 50% of what the consensus does; it is *unknown* only without
+     a coherent consensus (music, silence, garbled words). A segment verifies only on
+     positive evidence: at least one window agrees and none disagrees.
+   * A probe window without coherent evidence is not agreement: other positions
+     (±¼ of the segment) are tried while the budget lasts. A segment with no
+     evidence at all is left as it is and counted in `verify_unverified`; empty
+     probes in `verify_empty_probes`.
+   * On disagreement two cuts are tried: the best cue gap near the midpoint, and the
+     cue gap at the L1 change point of the per-window median residuals (sections at
+     1/3 and 2/3 leave both midpoint halves mixed). Each half is refitted with known
+     ratios only (dominant scale, parent scale, 1.0, or `_best_candidate_scale`; a free
+     scale over a few windows follows local wobble and extrapolates badly), judged by
+     the mean |window median| with 1.0, then the dominant scale, winning near-ties.
+   * A split is kept if the halves differ by > 0.25 s + 2·SE (SE from the spread of
+     per-window medians, so one window's timestamp bias is not a "section") and it
+     explains the disagreement: the per-window error halves, or one half verifies on
+     its own and drops it ≥ 20% (the other half is left to the recursion). Smooth
+     wobble fails this test and is left to step 7.
+   * A segment that is not split may still be replaced by a refit of its whole range
+     that verifies (or halves its error): the initial dominant line can be a
+     compromise. Recursion stops at 2×120 s, depth 5 or when the probe has nothing new.
+   * Segments too short to split get one probe at their point farthest from any
+     window (independent evidence) and are folded into a neighbour when at least as
+     many audio regions vote for the neighbour as for them (ties favour fewer
+     segments). A fold compares two lines, so each window votes for the line its
+     consensus is closer to (if within 0.5 s); overlapping windows (centres < 30 s
+     apart) share their audio and its timestamp bias and cast one vote. The safety
+     net below leaves the outvoted windows out of its comparison. Real cases: with
+     beam-1 CPU decoding the cold-open window(s) came back 1.6 s late and created a
+     false 90 s first segment; in thorough mode an adaptive window overlapped the
+     biased one and outvoted the probe 2:0 until overlapping windows voted once.
+   * Adjacent segments merge when one refit of both *positively* verifies against all
+     their windows (a genuine 10 s cut holding < 10% of the anchors stays: its windows
+     disagree with any merged line). Boundaries of new splits
+     use the usual cue-gap / speech-overlap placement. Safety net: the result is
+     dropped if it explains < 90% of the inliers or its median residual grows > 0.05 s.
+   * Known limit: a section needs two windows of evidence (one window's timestamps
+     can be off by more than a second), so sections shorter than the window spacing
+     (~4 min by default) can be missed.
+7. Local refinement (`align.refine_local`), three steps that each work on the
    residual of the previous one, so they cannot fight, assembled into **one
    continuous correction curve relative to the fitted lines, bounded by ±0.5 s in
    total** (`_assemble_correction`): each segment contributes its shift (steps 1–2)
@@ -225,20 +273,21 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
       precision, shrunk towards 0 with a 0.2 s prior, smoothed [¼ ½ ¼] and linearly
       interpolated (`Segment.knots`). Slow wobble is followed; single lines are not
       moved individually.
-7. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
+8. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
    with the subtitle-on mask at 10 ms resolution over the same candidate scales
    (FFT), pick best.
-8. Confidence: (1 − e^(−inliers/12)) · (0.35 + 0.65·inlier weight ratio) ·
+9. Confidence: (1 − e^(−inliers/12)) · (0.35 + 0.65·inlier weight ratio) ·
    (0.4 + 0.6·window coverage) · e^(−max(0, residual − 0.25)/0.4) · 0.95^(segments−1).
    The residual is the median |inlier residual| after removing up to 0.2 s of each
    window's median (its shared timestamp bias is not misfit; a line off by more still
-   shows the excess).
-9. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
+   shows the excess). Verification probe windows count in the coverage denominator
+   only if they contribute inliers.
+10. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)
 `model_en=base.en`, `model_multi=base`, `device=auto|cpu|cuda`, `compute_type=int8`,
-`windows=auto`, `min_confidence=0.5`, `threads=0`.
+`windows=auto`, `verify_windows=auto`, `min_confidence=0.5`, `threads=0`.
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 
 ## Installation UX

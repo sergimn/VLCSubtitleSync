@@ -22,6 +22,7 @@ from .align import (
     find_anchors,
     fit_mapping,
     refine_local,
+    subdivide,
     subtitle_tokens,
     vad_align,
 )
@@ -348,6 +349,43 @@ def sync_subtitles(
                 "refit (+%d windows): %d/%d anchors, conf %.2f, %d segments",
                 len(new), fit.anchors, fit.total_anchors, fit.confidence,
                 len(fit.mapping.segments),
+            )  # fmt: skip
+
+        # Bisection verification: check each segment at its midpoint (transcribing a
+        # window there if none is near, within a budget), split where it disagrees.
+        verify_left = config.verify_budget(duration)
+
+        def verify_probe(centre: float, near: float) -> tuple[list[Anchor], bool]:
+            """Transcribe a window near ``centre`` unless one is within ``near`` s or the
+            budget is spent; returns (anchors, whether a window was transcribed)."""
+            nonlocal anchors, verify_left, planned
+            if verify_left <= 0 or not 0.0 <= centre <= duration:
+                return anchors, False
+            if any(abs(st + 0.5 * WINDOW_SECONDS - centre) <= near for st, _w in transcribed):
+                return anchors, False
+            taken = [st for st, _w in transcribed]
+            lo = max(0.0, centre - near)
+            hi = min(duration, centre + near)
+            new = pick_windows(speech_sec, duration, 1, ranges=[(lo, hi)], taken=taken)
+            if not new:
+                return anchors, False
+            verify_left -= len(new)
+            planned += len(new)
+            run_windows(new)
+            anchors = find_anchors(sub_tok, transcribed)
+            return anchors, True
+
+        if fit.anchors >= MIN_WHISPER_ANCHORS:
+            n_before = len(transcribed)
+            fit, anchors = subdivide(
+                fit, anchors, cues, verify_probe, speech, vad.RESOLUTION, len(transcribed)
+            )
+            log.info(
+                "verification: %d checks, %d splits, %d folded, +%d windows: conf %.2f, "
+                "%d segments",
+                fit.details.get("verify_checks", 0), fit.details.get("verify_splits", 0),
+                fit.details.get("verify_folded", 0), len(transcribed) - n_before,
+                fit.confidence, len(fit.mapping.segments),
             )  # fmt: skip
         if fit.anchors < MIN_WHISPER_ANCHORS:
             reason = f"too few transcript matches ({fit.anchors})"

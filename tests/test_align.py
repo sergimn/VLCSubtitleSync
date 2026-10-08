@@ -17,6 +17,7 @@ from vlcsubsync.align import (
     refine_local,
     refine_with_speech,
     retime,
+    subdivide,
     subtitle_tokens,
     vad_align,
 )
@@ -471,8 +472,9 @@ def _speech_mask(spans, duration, res=0.01):
     return speech
 
 
-def _align_full(synth, transform, duration=45 * 60, seed=1, use_speech=True, **kw):
-    """fit_mapping → refine_local. Returns (initial fit errors, final fit, final errors)."""
+def _align_full(synth, transform, duration=45 * 60, seed=1, budget=4, use_speech=True, **kw):
+    """fit_mapping → subdivide (probing new windows within ``budget``) → refine_local.
+    Returns (initial fit errors, final fit, final errors, windows transcribed by probes)."""
     script = synth.script(duration - 30, seed=seed)
     cues = [Cue(c.start, c.end, c.text) for c in script]
     spans = synth.speech_spans(script, transform)
@@ -480,8 +482,20 @@ def _align_full(synth, transform, duration=45 * 60, seed=1, use_speech=True, **k
     fake = synth.FakeTranscriber(spans, **kw)
     starts = pick_windows(np.ones(int(duration)), duration, Config().window_count(duration))
     windows = [(s, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=s)) for s in starts]
-    anchors = find_anchors(subtitle_tokens(cues), windows)
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
     fit = fit_mapping(anchors, cues, speech, n_windows=len(windows))
+    probes = []
+
+    def probe(centre, near):
+        nonlocal anchors
+        if len(probes) >= budget or any(abs(s + 15 - centre) <= near for s, _w in windows):
+            return anchors, False
+        st = max(0.0, min(duration - 30.0, centre - 15.0))
+        probes.append(st)
+        windows.append((st, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)))
+        anchors = find_anchors(tok, windows)
+        return anchors, True
 
     truth = np.array([transform(c.start) for c in cues])
     keep = truth >= 0
@@ -491,8 +505,9 @@ def _align_full(synth, transform, duration=45 * 60, seed=1, use_speech=True, **k
         return np.abs(np.array([s for s, _e in retime(times, mapping)]) - truth)[keep]
 
     err0 = errors(fit.mapping)
+    fit, anchors = subdivide(fit, anchors, cues, probe, speech, 0.01, len(windows))
     fit.mapping, _info = refine_local(fit.mapping, anchors, cues, speech, 0.01)
-    return err0, fit, errors(fit.mapping)
+    return err0, fit, errors(fit.mapping), probes
 
 
 def test_piecewise_drift_scale_change_after_cut(synth):
@@ -502,7 +517,7 @@ def test_piecewise_drift_scale_change_after_cut(synth):
     def f(t):
         return t + 1.0 if t < 1500 else 1501.0 + (t - 1500) * r
 
-    _err0, fit, err = _align_full(synth, f)
+    _err0, fit, err, _probes = _align_full(synth, f)
     segs = fit.mapping.segments
     assert [s.scale for s in segs] == pytest.approx([1.0, r], abs=2e-4)
     assert 1400 < segs[1].start < 1600
@@ -517,7 +532,7 @@ def test_slow_wobble_is_followed_smoothly(synth, use_speech):
     def f(t):
         return t + 3.0 + 0.3 * math.sin(2 * math.pi * t / 1200)
 
-    err0, fit, err = _align_full(synth, f, use_speech=use_speech)
+    err0, fit, err, _probes = _align_full(synth, f, use_speech=use_speech)
     assert len(fit.mapping.segments) == 1
     seg = fit.mapping.segments[0]
     assert 2 <= len(seg.knots) <= 45 * 60 / 120
@@ -633,7 +648,227 @@ def test_wobble_periods_and_phases_not_chopped(synth, period, phase):
     def f(t):
         return t + 3.0 + 0.3 * math.sin(2 * math.pi * t / period + phase)
 
-    err0, fit, err = _align_full(synth, f)
+    err0, fit, err, _probes = _align_full(synth, f)
     assert len(fit.mapping.segments) == 1
     assert np.median(err) < 0.1
     assert np.percentile(err, 95) < np.percentile(err0, 95)
+
+
+# --- bisection verification ---------------------------------------------------------
+
+
+def test_three_sections_with_small_offset_steps(synth):
+    """Offsets 2.0 / 2.6 / 1.8 s: steps below the 1 s inlier threshold, which the
+    initial fit absorbs into a tilted compromise line; verification separates them."""
+
+    def f(t):
+        return t + 2.0 if t < 900 else (t + 2.6 if t < 1800 else t + 1.8)
+
+    err0, fit, err, probes = _align_full(synth, f)
+    segs = fit.mapping.segments
+    assert len(segs) == 3
+    assert [s.scale for s in segs] == pytest.approx([1.0, 1.0, 1.0])
+    # speech onsets lie 0-0.12 s after the cue starts (synthetic), hence the tolerance
+    assert [s.offset for s in segs] == pytest.approx([2.0, 2.6, 1.8], abs=0.12)
+    assert 800 < segs[1].start < 1000 and 1700 < segs[2].start < 1900
+    assert np.percentile(err, 95) < 0.15 < np.percentile(err0, 95)
+    assert len(probes) <= 4
+
+
+def test_subdivide_leaves_consistent_fit_alone(synth):
+    err0, fit, err, probes = _align_full(synth, lambda t: t * 25 / 23.976 - 4.0, drop=0.2)
+    assert len(fit.mapping.segments) == 1
+    assert fit.mapping.segments[0].scale == pytest.approx(25 / 23.976)
+    assert fit.details["verify_splits"] == 0
+    assert len(probes) <= 1
+    _assert_accurate(err)
+
+
+def test_subdivide_respects_budget_and_min_length(synth):
+    def f(t):
+        return t + 2.0 if t < 900 else (t + 2.6 if t < 1800 else t + 1.8)
+
+    _e0, fit0, _err, probes = _align_full(synth, f, budget=0)
+    assert probes == []
+    # segments never shorter than the minimum (except the open-ended first one)
+    starts = [s.start for s in fit0.mapping.segments[1:]]
+    assert all(b - a >= 120.0 for a, b in zip(starts, starts[1:], strict=False))
+
+
+def test_short_segment_from_one_biased_window_is_folded(synth):
+    """A window whose timestamps are all 1.6 s late (seen with beam-1 CPU decoding at
+    an episode's cold open) must not keep a section of its own: an independent probe
+    inside the short segment sides with the neighbour, and the tie folds it."""
+    from vlcsubsync.align import AlignResult
+    from vlcsubsync.transcribe import Word
+
+    duration = 30 * 60
+    script = synth.script(duration - 30, seed=1)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    fake = synth.FakeTranscriber(synth.speech_spans(script, lambda t: t + 2.0))
+
+    def transcribe(st):
+        words = fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)
+        bias = 1.6 if st == 60.0 else 0.0
+        return [Word(w.start + bias, w.end + bias, w.text) for w in words]
+
+    windows = [(st, transcribe(st)) for st in (60.0, 300.0, 600.0, 900.0, 1200.0, 1500.0)]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    mapping = Mapping([Segment(-math.inf, 1.0, 3.6, 20), Segment(150.0, 1.0, 2.0, 200)])
+    fit = AlignResult(mapping, "whisper", 0.9, 200, len(anchors))
+    probes = []
+
+    def probe(centre, near):
+        nonlocal anchors
+        st = max(0.0, centre - 15.0)
+        if len(probes) >= 2 or any(abs(s + 15 - centre) <= near for s, _w in windows):
+            return anchors, False
+        probes.append(st)
+        windows.append((st, transcribe(st)))
+        anchors = find_anchors(tok, windows)
+        return anchors, True
+
+    out, _anchors = subdivide(fit, anchors, cues, probe, None, 0.01, len(windows))
+    assert len(probes) == 1 and not 60.0 <= probes[0] <= 90.0  # away from the bad window
+    assert out.details["verify_folded"] == 1
+    assert [(s.scale, s.offset) for s in out.mapping.segments] == pytest.approx(
+        [(1.0, 2.0)], abs=0.05
+    )
+
+
+@pytest.mark.parametrize("length", [200.0, 330.0])  # fold path (< 2x120 s) / main loop
+@pytest.mark.parametrize("budget", [0, 3])
+def test_genuine_short_cut_section_survives_verification(synth, length, budget):
+    """An inserted scene: the subtitles are 12 s off for one short section that holds
+    under 10% of the anchors. Windows 12 s off the neighbours' line are disagreement,
+    not missing evidence, so neither the merge, the whole-range repair nor the fold
+    may swallow the section. A small 0.6 s step earlier in the file makes the
+    verification split there, so the merge loop runs (it used to merge the section
+    away: its windows had no candidates within 2 s and counted as "unknown")."""
+    from vlcsubsync.align import AlignResult
+
+    a, b = 1300.0, 1300.0 + length
+
+    def f(t):
+        return t + 14.6 if a <= t < b else (t + 2.0 if t < 500 else t + 2.6)
+
+    duration = 40 * 60
+    script = synth.script(duration - 30, seed=1)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    fake = synth.FakeTranscriber(synth.speech_spans(script, f))
+    # dense windows elsewhere, two inside the section (one alone is an outlier to
+    # fit_mapping, which is right: one window's timestamps can be off on their own)
+    starts = [st for st in (30.0 + 100.0 * i for i in range(24)) if not a - 40 < st < b + 20]
+    starts += [a + 14.0 + 10.0, b + 14.0 - 45.0]
+    windows = [(st, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)) for st in starts]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    fit = fit_mapping(anchors, cues, None, n_windows=len(windows))
+    assert [s.offset for s in fit.mapping.segments] == pytest.approx([2.6, 14.6, 2.6], abs=0.2)
+    tokens = {(x.window, x.token) for x in anchors}
+    inside = {(x.window, x.token) for x in anchors if a <= x.sub_time < b}
+    assert len(inside) < 0.1 * len(tokens)
+    probes = []
+
+    def probe(centre, near):
+        nonlocal anchors
+        if len(probes) >= budget or any(abs(s + 15 - centre) <= near for s, _w in windows):
+            return anchors, False
+        st = max(0.0, min(duration - 30.0, centre - 15.0))
+        probes.append(st)
+        windows.append((st, fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)))
+        anchors = find_anchors(tok, windows)
+        return anchors, True
+
+    out, _ = subdivide(fit, anchors, cues, probe, None, 0.01, len(windows))
+    assert isinstance(out, AlignResult)
+    segs = out.mapping.segments
+    assert [s.offset for s in segs] == pytest.approx([2.0, 2.6, 14.6, 2.6], abs=0.2)
+    assert a - 60 < segs[2].start < a + 60 and b - 60 < segs[3].start < b + 60
+    assert out.details["verify_splits"] >= 1  # the merge loop did run
+    assert out.details.get("verify_folded", 0) == 0
+
+
+def test_probe_without_evidence_is_not_verification(synth):
+    """Probe windows on music or silence add no anchors: the probe is retried at other
+    positions while the budget lasts, and a segment whose windows have no coherent
+    evidence is left unverified (and reported), not counted as verified."""
+    from vlcsubsync.align import AlignResult
+
+    duration = 30 * 60
+    script = synth.script(duration - 30, seed=1)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    fake = synth.FakeTranscriber(synth.speech_spans(script, lambda t: t + 2.0))
+    garbage = synth.FakeTranscriber(synth.speech_spans(script, lambda t: t + 2.0), garbage=True)
+
+    def transcribe(st):  # real speech before 900 s; music (garbage words) after
+        t = fake if st < 900 else garbage
+        return t.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)
+
+    windows = [(st, transcribe(st)) for st in (60.0, 300.0, 600.0, 1000.0, 1300.0, 1600.0)]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    mapping = Mapping([Segment(-math.inf, 1.0, 2.0, 100), Segment(950.0, 1.0, 2.0, 0)])
+    fit = AlignResult(mapping, "whisper", 0.9, 100, len(anchors))
+    probes = []
+
+    def probe(centre, near):  # every probe lands on silence
+        if len(probes) >= 3:
+            return anchors, False
+        probes.append(centre)
+        return anchors, True
+
+    out, _ = subdivide(fit, anchors, cues, probe, None, 0.01, len(windows))
+    assert len(probes) == 3  # retried at other positions until the budget ran out
+    assert out.details["verify_empty_probes"] == 3
+    assert out.details["verify_unverified"] >= 1  # the music-only segment
+    assert out.mapping == mapping  # left as it was
+
+
+@pytest.mark.parametrize("bias", [1.0, 1.6])
+@pytest.mark.parametrize("biased_starts", [(60.0,), (60.0, 72.0)])
+def test_biased_cold_open_windows_end_as_one_segment(synth, bias, biased_starts):
+    from vlcsubsync.align import AlignResult
+
+    """One exact line, but the window(s) over the cold open come back with timestamps
+    ``bias`` s late (seen with beam-1 CPU decoding; two overlapping windows when an
+    adaptive window lands on the same audio). Whether or not fit_mapping sets them
+    apart, verification must end with one segment: overlapping windows share their
+    bias and vote once, and an independent probe votes for the line it is closer to."""
+    from vlcsubsync.transcribe import Word
+
+    duration = 30 * 60
+    script = synth.script(duration - 30, seed=1)
+    cues = [Cue(c.start, c.end, c.text) for c in script]
+    fake = synth.FakeTranscriber(synth.speech_spans(script, lambda t: t + 2.0))
+
+    def transcribe(st):
+        words = fake.transcribe(np.zeros(30 * 16000), 16000, "en", start=st)
+        b = bias if st in biased_starts else 0.0
+        return [Word(w.start + b, w.end + b, w.text) for w in words]
+
+    starts = [*biased_starts, 300.0, 540.0, 780.0, 1020.0, 1260.0, 1500.0, 1700.0]
+    windows = [(st, transcribe(st)) for st in starts]
+    tok = subtitle_tokens(cues)
+    anchors = find_anchors(tok, windows)
+    fit = fit_mapping(anchors, cues, None, n_windows=len(windows))
+    if len(fit.mapping.segments) == 1:  # make sure the fold path is exercised
+        mapping = Mapping([Segment(-math.inf, 1.0, 2.0 + bias, 20), Segment(150.0, 1.0, 2.0, 200)])
+        fit = AlignResult(mapping, "whisper", 0.9, 200, len(anchors))
+    probes = []
+
+    def probe(centre, near):
+        nonlocal anchors
+        st = max(0.0, centre - 15.0)
+        if len(probes) >= 3 or any(abs(s + 15 - centre) <= near for s, _w in windows):
+            return anchors, False
+        probes.append(st)
+        windows.append((st, transcribe(st)))
+        anchors = find_anchors(tok, windows)
+        return anchors, True
+
+    out, _ = subdivide(fit, anchors, cues, probe, None, 0.01, len(starts))
+    segs = out.mapping.segments
+    assert len(segs) == 1, [(s.start, s.offset) for s in segs]
+    assert segs[0].scale == 1.0 and segs[0].offset == pytest.approx(2.0, abs=0.1)

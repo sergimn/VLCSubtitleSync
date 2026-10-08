@@ -21,6 +21,7 @@ import gc
 import logging
 import os
 import shutil
+import struct
 import sys
 import time
 from collections.abc import Callable, Iterable
@@ -241,6 +242,12 @@ def unload_models() -> int:
         lock = getattr(vad, "_lock", None)
         with lock if lock is not None else contextlib.nullcontext():
             vad._model = None
+    # faster-whisper caches the Silero session itself (functools.lru_cache), and its
+    # own vad_filter path uses the same cache: clear it, or nothing is freed.
+    fw_vad = sys.modules.get("faster_whisper.vad")
+    cached = getattr(fw_vad, "get_vad_model", None)
+    if cached is not None and hasattr(cached, "cache_clear"):
+        cached.cache_clear()
     gc.collect()
     _malloc_trim()
     return released
@@ -290,6 +297,10 @@ IOPRIO_SET_SYSCALL = {
     "ppc64le": 273,
     "s390x": 282,
 }
+
+# 32-bit userspace on a 64-bit kernel: platform.machine() names the kernel's arch,
+# but the syscall goes through the 32-bit ABI.
+IOPRIO_ARCH_32BIT = {"x86_64": "i386", "amd64": "i386", "aarch64": "armv7l", "arm64": "armv7l"}
 
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 
@@ -356,7 +367,9 @@ def _linux_idle_io(ctypes_mod: Any, machine: str | None) -> list[str]:
     if machine is None:
         import platform as _platform
 
-        machine = _platform.machine()
+        machine = (_platform.machine() or "").lower()
+        if struct.calcsize("P") == 4:
+            machine = IOPRIO_ARCH_32BIT.get(machine, machine)
     nr = IOPRIO_SET_SYSCALL.get((machine or "").lower())
     if nr is None:
         return []

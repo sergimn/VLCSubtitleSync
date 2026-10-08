@@ -624,3 +624,45 @@ def test_daemon_exit_moves_unreadable_request_aside(denv, queue, clock, monkeypa
     finally:
         d.request_stop()
         t.join(5)
+
+
+def test_unload_models_releases_the_cached_silero_model(monkeypatch):
+    """vad._model and faster-whisper's own lru_cache both hold the Silero session."""
+    import functools
+    import sys
+    import types
+    import weakref
+
+    from vlcsubsync import vad
+
+    class Session:
+        pass
+
+    @functools.lru_cache
+    def get_vad_model():
+        return Session()
+
+    fake = types.ModuleType("faster_whisper.vad")
+    fake.get_vad_model = get_vad_model
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", fake)
+    monkeypatch.setattr(vad, "_model", get_vad_model())
+    ref = weakref.ref(vad._model)
+    L.unload_models()
+    assert vad._model is None
+    assert get_vad_model.cache_info().currsize == 0
+    assert ref() is None
+
+
+@pytest.mark.parametrize(
+    "kernel,pointer,nr", [("x86_64", 8, 251), ("x86_64", 4, 289), ("aarch64", 4, 314)]
+)
+def test_priority_ioprio_uses_the_process_abi(allow_priority, monkeypatch, kernel, pointer, nr):
+    """32-bit Python on a 64-bit kernel must use the 32-bit syscall number."""
+    import platform
+    import struct
+
+    libc = FakeLibc()
+    monkeypatch.setattr(platform, "machine", lambda: kernel)
+    monkeypatch.setattr(struct, "calcsize", lambda fmt: pointer)
+    L._linux_idle_io(FakeCtypes(libc), None)
+    assert libc.calls and libc.calls[0][0] == nr

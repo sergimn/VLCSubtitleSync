@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="only watch --queue-dir dirs, not the VLC user-data dirs",
     )
     p.add_argument("--no-console", action="store_true", help="log to file only")
+    p.add_argument(
+        "--persistent",
+        action="store_true",
+        help="keep running while VLC is closed (default: exit ~15 s after VLC closes)",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
 
     def add_vlc_dir_opts(sp: argparse.ArgumentParser) -> None:
@@ -74,9 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--vlcrc", metavar="PATH", help="vlcrc file for --vlc-dir")
         sp.add_argument("--dry-run", action="store_true", help="show what would be done")
 
-    p = sub.add_parser("setup", help="install the VLC integration (scripts, settings, autostart)")
+    p = sub.add_parser(
+        "setup", help="install the VLC integration (scripts, settings, start-with-VLC)"
+    )
     add_vlc_dir_opts(p)
-    p.add_argument("--no-autostart", action="store_true", help="don't register/start the daemon")
+    p.add_argument(
+        "--no-autostart",
+        action="store_true",
+        help="don't register the start of the helper with VLC",
+    )
     p.add_argument("--no-model", action="store_true", help="don't pre-download the Whisper model")
 
     p = sub.add_parser("uninstall", help="remove the VLC integration")
@@ -206,6 +217,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         use_default_queues=not args.no_default_queues,
         log_to_stderr=not args.no_console,
         verbose=args.verbose,
+        persistent=args.persistent,
     )
 
 
@@ -258,6 +270,7 @@ def _vlcrc_value(text: str, key: str) -> str | None:
 
 def run_doctor(out=print, ctx=None) -> int:
     from . import daemon as D
+    from . import lifecycle as L
     from . import protocol as P
     from . import setup_vlc as S
 
@@ -307,21 +320,32 @@ def run_doctor(out=print, ctx=None) -> int:
             item(f"vlcrc {inst.vlcrc}", "missing", False)
         q = inst.queue_dir
         item("queue dir", q, q.is_dir())
+        launcher = P.read_kv(q / S.LAUNCHER_FILE) if q.is_dir() else None
+        if launcher:
+            item("launcher", f"mode={launcher.get('mode', '?')} exe={launcher.get('exe', '?')}")
+        vlc_open = L.read_intf_state(q, time.time()).alive if q.is_dir() else False
         hb = P.read_heartbeat(q) if q.is_dir() else None
         if hb is None:
-            item("daemon heartbeat", "none", False)
+            # the helper only runs while VLC does
+            item(
+                "daemon heartbeat",
+                "none" + ("" if vlc_open else " (VLC is closed)"),
+                False if vlc_open else None,
+            )
         else:
             age = hb.age()
             item(
                 "daemon heartbeat",
                 f"{age:.0f}s ago (pid {hb.pid}, v{hb.version})",
-                age <= 10,
+                age <= 10 or (None if not vlc_open else False),
             )
 
-    out("\nDaemon")
+    out("\nHelper lifecycle (starts with VLC, exits ~15 s after it)")
+    queue_dirs = [i.queue_dir for i in installs if i.usable]
+    for label, value, ok in S.lifecycle_status(ctx, queue_dirs):
+        item(label, value, ok)
     pid = D.daemon_running_pid()
-    item("process", f"running (pid {pid})" if pid else "not running", bool(pid))
-    item("autostart", S.autostart_status(ctx))
+    item("process", f"running (pid {pid})" if pid else "not running (normal while VLC is closed)")
     item("lock file", D.lock_file_path())
     item("log file", D.user_log_dir() / "daemon.log")
     item("result cache", D.results_cache_dir())
@@ -403,7 +427,12 @@ def daemon_main() -> int:
 
     argv = sys.argv[1:]
     queue_dirs = [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--queue-dir"]
-    return serve(queue_dirs, log_to_stderr=False, verbose="-v" in argv or "--verbose" in argv)
+    return serve(
+        queue_dirs,
+        log_to_stderr=False,
+        verbose="-v" in argv or "--verbose" in argv,
+        persistent="--persistent" in argv,
+    )
 
 
 if __name__ == "__main__":

@@ -450,7 +450,8 @@ def daemon(tmp_path: Path):
     env = isolated_env(tmp_path / "home")
     log = (tmp_path / "daemon.log").open("w", encoding="utf-8")
     proc = subprocess.Popen(
-        cli("serve", "--queue-dir", str(q), "--no-default-queues", "-v"),
+        # no VLC here: without --persistent it would exit after the startup grace
+        cli("serve", "--queue-dir", str(q), "--no-default-queues", "--persistent", "-v"),
         env=env,
         stdout=log,
         stderr=subprocess.STDOUT,

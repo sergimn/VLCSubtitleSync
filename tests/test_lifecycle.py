@@ -1,7 +1,8 @@
-"""Daemon process helpers: model unloading (fake clock), thread count, priority."""
+"""Helper lifecycle: idle exit, model unloading and process priority (fake clocks)."""
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -13,7 +14,6 @@ from vlcsubsync import daemon as D
 from vlcsubsync import lifecycle as L
 from vlcsubsync import protocol as P
 from vlcsubsync import transcribe as T
-
 
 # ------------------------------------------------------------------ model unloading
 
@@ -81,6 +81,7 @@ def make_daemon(denv, queue, clock, runner=None, **kw):
         cache_dir=denv.tmp / "cache",
         lock_path=denv.tmp / "state" / "daemon.lock",
         clock=clock.monotonic,
+        wall_clock=clock.time,
         **kw,
     )
 
@@ -344,8 +345,8 @@ def test_serve_lowers_priority_before_running(monkeypatch, tmp_path):
     monkeypatch.setattr(L, "lower_priority", lambda: order.append("priority") or ["nice 10"])
 
     class FakeDaemon:
-        def __init__(self, queue_dirs, use_default_queues):
-            order.append("daemon")
+        def __init__(self, queue_dirs, use_default_queues, idle_exit):
+            order.append(("daemon", idle_exit))
 
         def run(self):
             order.append("run")
@@ -357,4 +358,269 @@ def test_serve_lowers_priority_before_running(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "Daemon", FakeDaemon)
     monkeypatch.setattr(D, "setup_logging", lambda **kw: None)
     assert D.serve([str(tmp_path)], log_to_stderr=False) == 0
-    assert order == ["priority", "daemon", "run"]
+    assert order == ["priority", ("daemon", True), "run"]
+    order.clear()
+    D.serve([str(tmp_path)], log_to_stderr=False, persistent=True)
+    assert ("daemon", False) in order
+
+
+# ------------------------------------------------------------------ idle exit
+
+
+def intf(q: Path, clock: FakeClock, state: str = "idle", age: float = 0.0) -> None:
+    P.write_kv(q / P.INTF_STATE_FILE, {"time": int(clock.wall - age), "state": state})
+
+
+def test_read_intf_state_fresh_stale_stopped(queue, clock):
+    assert L.read_intf_state(queue, clock.wall) == L.IntfState(alive=False)
+    intf(queue, clock, age=5)
+    assert L.read_intf_state(queue, clock.wall).alive
+    intf(queue, clock, age=21)
+    s = L.read_intf_state(queue, clock.wall)
+    assert not s.alive and s.stopped_at is None and s.age == pytest.approx(21)
+    intf(queue, clock, state="stopped", age=1)
+    s = L.read_intf_state(queue, clock.wall)
+    assert not s.alive and s.stopped_at == int(clock.wall - 1)
+    # missing time: the file's mtime is used
+    P.write_kv(queue / P.INTF_STATE_FILE, {"state": "idle"})
+    assert L.read_intf_state(queue, time.time()).alive
+
+
+def test_vlc_activity_any_queue(tmp_path, clock):
+    q1, q2 = tmp_path / "a", tmp_path / "b"
+    for q in (q1, q2):
+        D.ensure_queue_layout(q)
+    intf(q1, clock, state="stopped")
+    intf(q2, clock, age=3)
+    a = L.vlc_activity([q1, q2], clock.wall)
+    assert a.alive and not a.just_stopped
+    intf(q2, clock, age=300)
+    a = L.vlc_activity([q1, q2], clock.wall)
+    assert not a.alive and a.just_stopped
+
+
+def test_policy_exits_after_grace_when_vlc_gone(clock):
+    pol = L.IdleExitPolicy(clock=clock.monotonic)
+    assert not pol.update(vlc_alive=True, busy=False)
+    clock.advance(100)
+    assert not pol.update(vlc_alive=False, busy=False)  # idle timer starts
+    clock.advance(14)
+    assert not pol.update(vlc_alive=False, busy=False)
+    clock.advance(1.5)
+    assert pol.update(vlc_alive=False, busy=False)
+
+
+def test_policy_busy_keeps_running_and_restarts_grace(clock):
+    pol = L.IdleExitPolicy(clock=clock.monotonic)
+    pol.update(vlc_alive=True, busy=False)
+    clock.advance(100)
+    pol.update(vlc_alive=False, busy=False)
+    clock.advance(10)
+    assert not pol.update(vlc_alive=False, busy=True)  # job in flight
+    clock.advance(600)
+    assert not pol.update(vlc_alive=False, busy=True)
+    assert not pol.update(vlc_alive=False, busy=False)  # finished: grace restarts
+    clock.advance(14)
+    assert not pol.update(vlc_alive=False, busy=False)
+    clock.advance(2)
+    assert pol.update(vlc_alive=False, busy=False)
+
+
+def test_policy_startup_grace(clock):
+    pol = L.IdleExitPolicy(clock=clock.monotonic)
+    for _ in range(59):
+        assert not pol.update(vlc_alive=False, busy=False)
+        clock.advance(1)
+    clock.advance(1.5)
+    assert pol.update(vlc_alive=False, busy=False)
+
+
+def test_policy_recent_stop_ends_startup_grace(clock):
+    pol = L.IdleExitPolicy(clock=clock.monotonic)
+    assert not pol.update(vlc_alive=False, busy=False, just_stopped=True)
+    clock.advance(15.5)
+    assert pol.update(vlc_alive=False, busy=False, just_stopped=True)
+
+
+def test_clean_request_junk(queue, clock):
+    req = queue / "requests"
+    (req / "a.req").write_text("x")
+    old_tmp = req / "b.req.tmp"
+    old_tmp.write_text("x")
+    os.utime(old_tmp, (clock.wall - 120, clock.wall - 120))
+    (req / "c.req.tmp").write_text("x")  # fresh: may be in the middle of a rename
+    os.utime(req / "c.req.tmp", (clock.wall, clock.wall))
+    assert L.clean_request_junk([queue], clock.wall) == 1
+    assert sorted(p.name for p in req.iterdir()) == ["a.req", "c.req.tmp"]
+
+
+def test_daemon_idle_exit_fresh_stale_stopped(denv, queue, clock):
+    d = make_daemon(denv, queue, clock, idle_exit=True)
+    d.scan_queue_dirs()
+    intf(queue, clock)
+    assert not d.check_idle_exit()
+    clock.advance(30)  # VLC wrote nothing for 30 s: crashed or killed
+    assert not d.check_idle_exit()  # grace starts
+    clock.advance(16)
+    assert d.check_idle_exit()
+
+    d = make_daemon(denv, queue, clock, idle_exit=True)
+    d.scan_queue_dirs()
+    intf(queue, clock)
+    assert not d.check_idle_exit()
+    clock.advance(5)
+    intf(queue, clock, state="stopped")  # VLC closed
+    assert not d.check_idle_exit()
+    clock.advance(15.5)
+    assert d.check_idle_exit()
+
+
+def test_daemon_startup_grace_then_exit(denv, queue, clock):
+    d = make_daemon(denv, queue, clock, idle_exit=True)
+    d.scan_queue_dirs()
+    for _ in range(12):
+        assert not d.check_idle_exit()
+        clock.advance(5)
+    clock.advance(1)
+    assert d.check_idle_exit()
+
+
+def test_daemon_job_in_flight_blocks_exit(denv, queue, clock):
+    runner = GatedRunner()
+    d = make_daemon(denv, queue, clock, runner=runner, idle_exit=True)
+    d.scan_queue_dirs()
+    d.start_worker()
+    try:
+        intf(queue, clock, state="stopped")
+        P.write_request(queue, P.Request(id="r1", media=denv.media))
+        assert d.poll_requests() == 1
+        assert runner.started.wait(5)
+        for _ in range(10):
+            clock.advance(30)
+            assert not d.check_idle_exit()
+        runner.release.set()
+        deadline = time.monotonic() + 5
+        while d.busy() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not d.busy()
+        assert not d.check_idle_exit()
+        clock.advance(16)
+        assert d.check_idle_exit()
+    finally:
+        runner.release.set()
+        d.request_stop()
+        d._worker.join(5)
+
+
+def test_daemon_run_exits_by_itself(denv, queue, clock):
+    d = make_daemon(denv, queue, clock, idle_exit=True, poll_interval=0.01, idle_check_interval=0.0)
+    intf(queue, clock, state="stopped")
+    t = threading.Thread(target=d.run)
+    t.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not (queue / P.HEARTBEAT_FILE).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        assert t.is_alive()
+        clock.advance(16)
+        t.join(5)
+        assert not t.is_alive()
+        assert "VLC is not running" in d.exit_reason
+        assert not (queue / P.HEARTBEAT_FILE).exists()
+    finally:
+        d.request_stop()
+        t.join(5)
+
+
+def test_persistent_daemon_never_idle_exits(denv, queue, clock):
+    d = make_daemon(denv, queue, clock, poll_interval=0.01)
+    assert d.idle_exit is False
+    t = threading.Thread(target=d.run)
+    t.start()
+    time.sleep(0.1)
+    clock.advance(3600)
+    time.sleep(0.1)
+    assert t.is_alive()
+    d.request_stop()
+    t.join(5)
+
+
+def _age(path, clock, seconds):
+    os.utime(path, (clock.wall - seconds, clock.wall - seconds))
+
+
+def test_clean_request_junk_removes_stale_directories(queue, clock):
+    sub = queue / "requests" / "junkdir"
+    (sub / "inner").mkdir(parents=True)
+    (sub / "inner" / "f").write_text("x")
+    _age(sub, clock, 120)
+    assert L.clean_request_junk([queue], clock.wall) == 1
+    assert list((queue / "requests").iterdir()) == []
+
+
+def test_undeletable_junk_is_moved_aside(queue, clock, monkeypatch, caplog):
+    junk = queue / "requests" / "x.req.tmp"
+    junk.write_text("x")
+    _age(junk, clock, 120)
+    real_unlink = os.unlink
+
+    def unlink(path, *a, **k):
+        if str(path).endswith("x.req.tmp"):
+            raise PermissionError("locked")
+        return real_unlink(path, *a, **k)
+
+    monkeypatch.setattr(L.os, "unlink", unlink)
+    assert L.clean_request_junk([queue], clock.wall) == 1
+    assert list((queue / "requests").iterdir()) == []
+    assert (queue / L.REJECTED_DIR / "x.req.tmp").read_text() == "x"
+
+
+def test_unmovable_junk_is_logged_once(queue, clock, monkeypatch, caplog):
+    junk = queue / "requests" / "y.tmp"
+    junk.write_text("x")
+    _age(junk, clock, 120)
+    monkeypatch.setattr(L.os, "unlink", lambda *a, **k: (_ for _ in ()).throw(OSError("no")))
+    monkeypatch.setattr(L.os, "replace", lambda *a, **k: (_ for _ in ()).throw(OSError("no")))
+    with caplog.at_level("WARNING", logger="vlcsubsync.lifecycle"):
+        assert L.clean_request_junk([queue], clock.wall) == 0
+        assert L.clean_request_junk([queue], clock.wall) == 0
+    assert sum("cannot remove or move" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_stuck_requests_only_moved_when_asked(queue, clock):
+    req = queue / "requests" / "r9.req"
+    req.write_text("x")
+    _age(req, clock, 30)
+    fresh = queue / "requests" / "r10.req"
+    fresh.write_text("x")
+    _age(fresh, clock, 1)
+    assert L.clean_request_junk([queue], clock.wall) == 0  # startup: never touch .req
+    assert L.clean_request_junk([queue], clock.wall, stuck_requests=True) == 1
+    assert (queue / L.REJECTED_DIR / "r9.req").exists()
+    assert sorted(p.name for p in (queue / "requests").iterdir()) == ["r10.req"]
+
+
+def test_daemon_exit_moves_unreadable_request_aside(denv, queue, clock, monkeypatch):
+    def unreadable(path):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(D.P, "read_request", unreadable)
+    req = queue / "requests" / "stuck.req"
+    req.write_text("version=1\n")
+    _age(req, clock, 30)
+    d = make_daemon(denv, queue, clock, idle_exit=True, poll_interval=0.01, idle_check_interval=0.0)
+    intf(queue, clock, state="stopped")
+    t = threading.Thread(target=d.run)
+    t.start()
+    try:
+        time.sleep(0.2)
+        assert req.exists()  # the daemon keeps retrying while it runs
+        clock.advance(16)
+        t.join(5)
+        assert not t.is_alive()
+        assert list((queue / "requests").iterdir()) == []
+        assert (queue / L.REJECTED_DIR / "stuck.req").exists()
+    finally:
+        d.request_stop()
+        t.join(5)

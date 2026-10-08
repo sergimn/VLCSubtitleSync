@@ -167,19 +167,23 @@ class CountingTranscriber:
 def run_sync(args, out: Path) -> dict:
     import vlcsubsync
     from vlcsubsync.config import Config
-    from vlcsubsync.sync import SubtitleSource, sync_subtitles
+    from vlcsubsync.sync import SubtitleSource, resolve_subtitle_source, sync_subtitles
     from vlcsubsync.transcribe import get_transcriber
 
     cfg = Config()
     for kv in args.set or []:
         k, _, v = kv.partition("=")
         cfg._set(k.strip().lower(), v.strip())
+    # English model only: non-English subtitles are measured through the .en model
+    # (or the VAD fallback), not the per-language model choice of a normal sync.
     tr = get_transcriber(cfg, "en")
     tr.load()  # the daemon keeps the model warm: don't time loading
     counter = CountingTranscriber(tr)
-    src = SubtitleSource("embedded", index=args.sub) if not args.sub_path else None
-    if src is None:
+    # --sub is a VLC ordinal (it may be a sidecar file): same source as the ground truth
+    if args.sub_path:
         src = SubtitleSource("external", path=args.sub_path)
+    else:
+        src = resolve_subtitle_source(args.media, args.sub)
     t0 = time.monotonic()
     r = sync_subtitles(
         args.media, args.audio, src, str(out / f"{args.label}.srt"), cfg, transcriber=counter

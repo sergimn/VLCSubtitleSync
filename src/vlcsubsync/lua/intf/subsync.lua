@@ -1287,7 +1287,7 @@ end
 
 -- Interface closing: give the input its user's delay back (VLC keeps the
 -- variable until the input ends), withdraw a request not picked up yet, and
--- tell the helper we are gone.
+-- record state=stopped in intf_state.
 function M.shutdown()
     pcall(function()
         if S.delay then

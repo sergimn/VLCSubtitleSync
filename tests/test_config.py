@@ -10,6 +10,7 @@ def test_defaults_match_design():
     assert c.windows == "auto"
     assert c.min_confidence == 0.5
     assert c.threads == 0
+    assert c.sync_mode == "track"  # delay mode is experimental and opt-in
 
 
 def test_missing_file_gives_defaults(tmp_path):
@@ -121,3 +122,16 @@ def test_verify_budget_per_mode():
     assert Config(mode="exhaustive").verify_budget(d) == 0  # every window is transcribed
     assert Config(mode="exhaustive", verify_windows="4").verify_budget(d) == 4
     assert Config(mode="thorough", verify_windows="1").verify_budget(d) == 1
+
+
+def test_sync_mode_parsing(tmp_path):
+    p = tmp_path / "config.ini"
+    p.write_text("sync_mode = Delay\n", encoding="utf-8")
+    c = Config.load(p)
+    assert c.sync_mode == "delay" and c.effective_sync_mode == "delay"
+    p.write_text("sync_mode=sideways\n", encoding="utf-8")
+    assert Config.load(p).sync_mode == "track"  # invalid: default kept
+    c.save(p)
+    assert "sync_mode=delay" in p.read_text(encoding="utf-8")
+    assert Config.load(p).sync_mode == "delay"
+    assert Config(sync_mode="bogus").effective_sync_mode == "track"

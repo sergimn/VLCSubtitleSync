@@ -92,6 +92,7 @@ class SyncResult:
     anchors: int
     applied: bool                 # False if confidence too low → output == original timing
     message: str                  # human summary, e.g. "offset +2.35s, drift +4.1%"
+    mapping_segments: list[MapSegment]  # full mapping (protocol.MapSegment), [] if not applied
 
 def sync_subtitles(media_path: str, audio_index: int, subtitle: SubtitleSource,
                    output_path: str, config: Config,
@@ -136,7 +137,27 @@ method=whisper
 offset=2.350
 scale=1.0417
 confidence=0.93
+segments=2                             # done + applied: the whole mapping, see below
+seg0=,1200.000,1.0000000,2.3500
+seg0_knots=120.000:0.0500;240.000:-0.0200
+seg1=1200.000,,1.0000000,32.3500
+sync_mode=track                        # the helper's configured sync_mode (track|delay)
 ```
+**Mapping segments.** In the subtitle clock (seconds), segment *i* maps
+`audio = scale*sub + offset + c(sub)` for `sub_start <= sub < sub_end`:
+`seg<i>=<sub_start>,<sub_end>,<scale>,<offset>`, time-ordered, an empty bound is open
+(the first segment starts at −∞, the last ends at +∞), `sub_end` of one segment is
+`sub_start` of the next. `c` is the local refinement (`align.Segment.knots`, at most
+±0.5 s): `seg<i>_knots=<sub_time>:<seconds>;…`, linearly interpolated and flat outside
+the knots; absent = 0. This is exactly the mapping `retime` applies to the output file
+(except its overlap/negative-time clean-up of individual cues). At most 256 segments
+and 4096 knots in total: the writer logs a warning and drops the extra segments, or the
+knots of the segments past the cap; readers apply the same knot cap.
+A reader drops the whole mapping if any line is malformed. Written only when
+`applied=1`; the result cache meta stores the same keys, so a cache hit returns them.
+An *applied* cache entry without `segments` (stored before mappings were sent) is
+treated as a miss and re-synced once; the new result replaces it. Track mode ignores
+the keys and still loads `output`.
 `<q>/heartbeat` (daemon): `time=<unix seconds>\npid=<pid>\nversion=<x.y.z>`; refreshed every ≤2 s.
 Lua considers the daemon alive if `os.time() - time <= 10`.
 
@@ -333,7 +354,9 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job w
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)
 `mode=fast|thorough|exhaustive`, `model_en=base.en`, `model_multi=base`,
 `device=auto|cpu|cuda`, `compute_type=int8`, `windows=auto`, `verify_windows=auto`,
-`min_confidence=0.5`, `threads=0`. Invalid values are ignored (default kept).
+`min_confidence=0.5`, `threads=0`, `sync_mode=track|delay` (how VLC applies a result;
+reported to the intf in each done status, default track). Invalid values are ignored
+(default kept).
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 
 ## Installation UX

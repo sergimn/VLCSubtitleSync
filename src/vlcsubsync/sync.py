@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -28,6 +28,7 @@ from .align import (
 )
 from .config import Config
 from .media import SAMPLE_RATE, probe, read_media
+from .protocol import MapSegment
 from .subtitles import (
     dialogue_events,
     find_sidecars,
@@ -70,6 +71,28 @@ class SyncResult:
     anchors: int
     applied: bool
     message: str
+    # The full piecewise mapping (audio = scale*sub + offset + knots), time-ordered;
+    # empty when not applied. Delay mode applies it live in VLC (protocol.MapSegment).
+    mapping_segments: list[MapSegment] = field(default_factory=list)
+
+
+def mapping_segments(mapping: Mapping) -> list[MapSegment]:
+    """``align.Mapping`` → protocol segments (sub-time bounds, open at both ends)."""
+    segs = mapping.segments
+    out = []
+    for i, s in enumerate(segs):
+        lo = s.start if i > 0 and math.isfinite(s.start) else None
+        hi = segs[i + 1].start if i + 1 < len(segs) else None
+        out.append(
+            MapSegment(
+                lo,
+                hi,
+                float(s.scale),
+                float(s.offset),
+                tuple((float(t), float(c)) for t, c in s.knots),
+            )
+        )
+    return out
 
 
 def resolve_subtitle_source(
@@ -470,6 +493,7 @@ def sync_subtitles(
             anchors=final.anchors,
             applied=True,
             message=message,
+            mapping_segments=mapping_segments(final.mapping),
         )
     else:
         conf = final.confidence if final is not None else 0.0
@@ -500,6 +524,7 @@ def sync_subtitles(
 __all__ = [
     "Mapping",
     "exhaustive_windows",
+    "mapping_segments",
     "plan_windows",
     "SubtitleSource",
     "SyncError",

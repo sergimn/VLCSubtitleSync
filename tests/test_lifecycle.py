@@ -357,3 +357,30 @@ def test_serve_lowers_priority_before_running(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "setup_logging", lambda **kw: None)
     assert D.serve([str(tmp_path)], log_to_stderr=False) == 0
     assert order == ["priority", "daemon", "run"]
+
+
+def test_unload_models_releases_the_cached_silero_model(monkeypatch):
+    """vad._model and faster-whisper's own lru_cache both hold the Silero session."""
+    import functools
+    import sys
+    import types
+    import weakref
+
+    from vlcsubsync import vad
+
+    class Session:
+        pass
+
+    @functools.lru_cache
+    def get_vad_model():
+        return Session()
+
+    fake = types.ModuleType("faster_whisper.vad")
+    fake.get_vad_model = get_vad_model
+    monkeypatch.setitem(sys.modules, "faster_whisper.vad", fake)
+    monkeypatch.setattr(vad, "_model", get_vad_model())
+    ref = weakref.ref(vad._model)
+    L.unload_models()
+    assert vad._model is None
+    assert get_vad_model.cache_info().currsize == 0
+    assert ref() is None

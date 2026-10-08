@@ -39,6 +39,12 @@ def unload_models() -> int:
         lock = getattr(vad, "_lock", None)
         with lock if lock is not None else contextlib.nullcontext():
             vad._model = None
+    # faster-whisper caches the Silero session itself (functools.lru_cache), and its
+    # own vad_filter path uses the same cache: clear it, or nothing is freed.
+    fw_vad = sys.modules.get("faster_whisper.vad")
+    cached = getattr(fw_vad, "get_vad_model", None)
+    if cached is not None and hasattr(cached, "cache_clear"):
+        cached.cache_clear()
     gc.collect()
     _malloc_trim()
     return released

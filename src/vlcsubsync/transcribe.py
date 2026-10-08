@@ -78,7 +78,12 @@ def _cuda_available() -> bool:
 
 
 def default_threads() -> int:
-    return max(1, min(8, os.cpu_count() or 4))
+    """CPU threads for Whisper when ``threads=0``: half the cores, 1..8.
+
+    Leaves the other half to VLC (video decoding, audio output) so playback stays
+    smooth while a sync runs in the background.
+    """
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
 
 
 class WhisperTranscriber:

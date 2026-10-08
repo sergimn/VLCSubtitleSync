@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from . import __version__
+from . import lifecycle as L
 from . import protocol as P
 
 log = logging.getLogger("vlcsubsync.daemon")
@@ -1016,6 +1017,9 @@ def serve(
 ) -> int:
     """Entry point for ``vlc-subsync serve``."""
     setup_logging(to_stderr=log_to_stderr, level=logging.DEBUG if verbose else logging.INFO)
+    applied = L.lower_priority()  # before any thread exists: threads inherit it
+    if applied:
+        log.info("process priority lowered: %s", ", ".join(applied))
     daemon = Daemon(queue_dirs, use_default_queues=use_default_queues)
     install_signal_handlers(daemon)
     try:

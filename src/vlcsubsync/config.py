@@ -39,7 +39,7 @@ class Config:
     compute_type: str = "int8"
     windows: str = "auto"  # "auto" or a positive integer (number of 30 s windows)
     min_confidence: float = 0.5
-    threads: int = 0  # 0 = let CTranslate2 decide
+    threads: int = 0  # 0 = auto: half the CPU cores, 1..8 (transcribe.default_threads)
     extra: dict[str, str] = field(default_factory=dict)  # unknown keys, preserved on save
 
     # -- derived helpers -------------------------------------------------------------

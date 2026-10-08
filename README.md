@@ -92,6 +92,10 @@ service or desktop autostart entry on Linux, a LaunchAgent on macOS, a Startup-f
 shortcut on Windows. The two sides talk through small files in VLC's own data folder,
 which also works for the sandboxed snap and flatpak builds of VLC.
 
+While it runs a sync, the helper uses low priority (nice 10 and idle disk priority on
+Linux, background priority on macOS, "below normal" on Windows) and at most half your
+CPU cores, so playback stays smooth.
+
 If the subtitle language and the spoken language differ (say English audio with
 Spanish subtitles), there is no text to compare. SubSync then lines up the subtitle
 timing with the moments where people are speaking. That method is less precise but
@@ -139,7 +143,7 @@ device=auto             # auto | cpu | cuda   (auto falls back to CPU if CUDA fa
 compute_type=int8       # CTranslate2 compute type (int8, int8_float16, float16, float32)
 windows=auto            # number of 30 s audio samples to transcribe, or auto
 min_confidence=0.5      # below this the original timing is kept (0..1)
-threads=0               # CPU threads, 0 = automatic
+threads=0               # CPU threads, 0 = automatic (half the cores, at most 8)
 ```
 
 `vlc-subsync doctor` prints the location it uses. The helper reads the file when it

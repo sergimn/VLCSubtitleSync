@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from .config import normalize_mode
+
 PROTOCOL_VERSION = 1
 
 REQUEST_SUFFIX = ".req"
@@ -201,10 +203,12 @@ class Request:
     audio_label: str = ""
     sub_label: str = ""
     force: bool = False
+    # Optional sync mode override ("fast" | "thorough" | "exhaustive"); "" = config's.
+    mode: str = ""
     version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        out: dict[str, object] = {
             "version": self.version,
             "id": self.id,
             "media": self.media,
@@ -215,6 +219,10 @@ class Request:
             "sub_path": self.sub_path,
             "force": self.force,
         }
+        mode = normalize_mode(self.mode)
+        if mode:
+            out["mode"] = mode
+        return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, str], fallback_id: str | None = None) -> Request:
@@ -247,6 +255,7 @@ class Request:
             audio_label=data.get("audio_label") or "",
             sub_label=data.get("sub_label") or "",
             force=_to_bool(data.get("force")),
+            mode=normalize_mode(data.get("mode")) or "",  # unknown modes are ignored
             version=_to_int(data.get("version"), PROTOCOL_VERSION) or PROTOCOL_VERSION,
         )
 

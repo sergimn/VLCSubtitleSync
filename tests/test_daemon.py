@@ -25,10 +25,11 @@ def wait_for(cond, timeout=10.0, interval=0.02):
 class FakeRunner:
     """Writes a fake SRT; optionally blocks until released."""
 
-    def __init__(self, fail_for=(), block=False):
+    def __init__(self, fail_for=(), block=False, applied=True):
         self.calls: list[D.JobSpec] = []
         self.fail_for = set(fail_for)
         self.block = block
+        self.applied = applied
         self.release = threading.Event()
         self.started = threading.Event()
 
@@ -51,7 +52,7 @@ class FakeRunner:
             segments=1,
             confidence=0.93,
             anchors=40,
-            applied=True,
+            applied=self.applied,
             message="offset +2.35s, drift +4.17%",
         )
 
@@ -281,6 +282,132 @@ def test_cache_hit_and_force(env):
         h.submit("c_5", media, sub_index=0)
         h.wait_state("c_5", "done")
         assert len(runner.calls) == 4
+
+
+def test_cache_key_includes_mode(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    d = D.Daemon(
+        [env.queue], use_default_queues=False, runner=FakeRunner(),
+        resolver=external_resolver, cache_dir=env.tmp / "c",
+        lock_path=env.tmp / "state" / "daemon.lock",
+    )  # fmt: skip
+    src = D.ResolvedSource("embedded", index=0)
+
+    def key(cfg_mode="fast", req_mode=""):
+        job = D._Job(P.Request(id="k", media=media, sub_index=0, mode=req_mode), env.queue)
+        return d.cache_key(job, src, Config(mode=cfg_mode))
+
+    keys = {m: key(m) for m in ("fast", "thorough", "exhaustive")}
+    assert len(set(keys.values())) == 3
+    # the request's mode wins over the config's; an unknown config mode means fast
+    assert key("fast", "exhaustive") == keys["exhaustive"]
+    assert key("bogus") == keys["fast"]
+    # lookup order: most thorough first, never a less thorough result
+    job = D._Job(P.Request(id="k", media=media, sub_index=0, mode="thorough"), env.queue)
+    assert d.cache_lookup_keys(job, src, Config()) == [
+        ("exhaustive", keys["exhaustive"]),
+        ("thorough", keys["thorough"]),
+    ]
+
+
+def test_request_mode_reaches_runner_and_cache(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    runner = FakeRunner()
+    with Harness(env, runner) as h:
+        h.daemon.config_loader = lambda: Config(mode="fast")
+        h.submit("m_1", media, sub_index=0)
+        h.wait_state("m_1", "done")
+        assert runner.calls[-1].config.mode == "fast"
+        # an exhaustive request does not reuse the fast result
+        h.submit("m_2", media, sub_index=0, mode="exhaustive")
+        h.wait_state("m_2", "done")
+        assert len(runner.calls) == 2
+        assert runner.calls[-1].config.mode == "exhaustive"
+        # ... but a later fast or thorough request reuses the exhaustive one
+        h.submit("m_3", media, sub_index=0, mode="thorough")
+        h.wait_state("m_3", "done")
+        h.submit("m_4", media, sub_index=0)
+        h.wait_state("m_4", "done")
+        assert len(runner.calls) == 2
+        # a thorough result does not satisfy an exhaustive request
+        h.submit("m_5", media, sub_index=1, mode="thorough")
+        h.wait_state("m_5", "done")
+        h.submit("m_6", media, sub_index=1, mode="exhaustive")
+        h.wait_state("m_6", "done")
+        assert [c.config.mode for c in runner.calls[2:]] == ["thorough", "exhaustive"]
+
+
+def test_unapplied_result_not_served_across_modes(env):
+    """An unapplied exhaustive result (e.g. Whisper windows lost to CUDA OOM, then the
+    VAD fallback) must not block a fast sync, but still answers exhaustive requests."""
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    runner = FakeRunner(applied=False)
+    with Harness(env, runner) as h:
+        h.daemon.config_loader = lambda: Config(mode="fast")
+        h.submit("u_1", media, sub_index=0, mode="exhaustive")
+        assert h.wait_state("u_1", "done").applied is False
+        # same mode: the cached unapplied result is reused (hopeless work not redone)
+        h.submit("u_2", media, sub_index=0, mode="exhaustive")
+        assert h.wait_state("u_2", "done").applied is False
+        assert len(runner.calls) == 1
+        # fast and thorough: not answered by the unapplied exhaustive result
+        runner.applied = True
+        h.submit("u_3", media, sub_index=0)
+        assert h.wait_state("u_3", "done").applied is True
+        assert [c.config.mode for c in runner.calls] == ["exhaustive", "fast"]
+        h.submit("u_4", media, sub_index=0, mode="thorough")
+        h.wait_state("u_4", "done")
+        assert [c.config.mode for c in runner.calls][-1] == "thorough"
+        assert len(runner.calls) == 3
+        # an applied exhaustive result does answer the cheaper modes
+        h.submit("u_5", media, sub_index=1, mode="exhaustive")
+        h.wait_state("u_5", "done")
+        h.submit("u_6", media, sub_index=1)
+        assert h.wait_state("u_6", "done").applied is True
+        assert len(runner.calls) == 4
+
+
+def test_forced_resync_wins_over_other_modes(env):
+    """A forced fast re-sync replaces an older exhaustive result for later opens."""
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    runner = FakeRunner()
+    cache = env.tmp / "cache" / "results"
+    with Harness(env, runner) as h:
+        h.daemon.config_loader = lambda: Config(mode="fast")
+        h.submit("f_1", media, sub_index=0, mode="exhaustive")
+        h.wait_state("f_1", "done")
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 1)  # stored after "done"
+        # user clicks "Sync now" (force=1) in fast mode with a different result
+        runner.applied = False
+        h.submit("f_2", media, sub_index=0, force=True)
+        assert h.wait_state("f_2", "done").applied is False
+        assert len(runner.calls) == 2
+
+        # only the forced fast result is left; the next (fast) open gets it
+        # (the cache is updated right after "done" is written)
+        def only_forced_entry_left():
+            metas = [P.read_kv(m) for m in cache.glob("*.meta")]
+            return len(metas) == 1 and metas[0].get("applied") == "0"
+
+        wait_for(only_forced_entry_left)
+        assert len(list(cache.glob("*.srt"))) == 1
+        h.submit("f_3", media, sub_index=0)
+        assert h.wait_state("f_3", "done").applied is False
+        assert len(runner.calls) == 2
+        # an exhaustive request now runs again (its old entry is gone)
+        h.submit("f_4", media, sub_index=0, mode="exhaustive")
+        h.wait_state("f_4", "done")
+        assert len(runner.calls) == 3
+        # a non-forced run does not drop other modes' entries
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 2)  # stored after "done"
 
 
 def test_stale_lock_is_taken_over(env):

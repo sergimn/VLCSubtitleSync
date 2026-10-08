@@ -61,6 +61,7 @@ From the menu **View → SubSync** you can:
 | Menu item | What it does |
 |---|---|
 | Sync subtitles now | force a re-sync of the current tracks (ignores the cache) |
+| Sync now (exhaustive) | re-sync by transcribing the whole file, 30 s at a time: for files the normal sync gets wrong. Much slower, especially on a CPU (see [Sync modes](#sync-modes)) |
 | Auto-sync: ON/OFF | turn automatic syncing on or off (remembered) |
 | Status… | show what SubSync is doing and the last result |
 
@@ -172,8 +173,16 @@ starts, so restart it (or log out and in) after a change. <!-- TODO(lead): confi
 | `thorough` | about 2.5× more samples (one per ~96 s, at least 20) and a 3× larger budget for the section check |
 | `exhaustive` | the whole file in consecutive 30 s pieces, skipping the ones with no speech. All matches feed the fit and the fine-tuning. The section check uses those pieces and transcribes nothing extra |
 
-Set the default with `mode=` in `config.ini`. You can also choose a mode for one run
-with `vlc-subsync sync --mode …` on the command line.
+Set the default with `mode=` in `config.ini`. You can also choose a mode for one run:
+**View → SubSync → Sync now (exhaustive)** in VLC, or `vlc-subsync sync --mode …` on
+the command line. A cached exhaustive result is reused when the file is opened again,
+including by later fast syncs, but only if it was applied. A forced re-sync ("Sync
+subtitles now" on an already synced track) replaces the cached results of the other
+modes, so the newest result is what you get next time.
+
+After upgrading SubSync, **restart VLC** before using "Sync now (exhaustive)". Until
+then the old interface script keeps running and can't do it. The menu says so instead
+of running a normal sync.
 
 Measured on a real 28.7 min TV episode (`--audio 0 --sub 0`). Its subtitles were timed
 for 29.97 fps, so they drift +25% and start almost 3 minutes off. Hardware: RTX 3050 Ti

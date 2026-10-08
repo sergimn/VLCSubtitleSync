@@ -12,6 +12,7 @@ import contextlib
 import gc
 import logging
 import os
+import struct
 import sys
 from typing import Any
 
@@ -95,6 +96,10 @@ IOPRIO_SET_SYSCALL = {
     "s390x": 282,
 }
 
+# 32-bit userspace on a 64-bit kernel: platform.machine() names the kernel's arch,
+# but the syscall goes through the 32-bit ABI.
+IOPRIO_ARCH_32BIT = {"x86_64": "i386", "amd64": "i386", "aarch64": "armv7l", "arm64": "armv7l"}
+
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
 
 
@@ -109,7 +114,7 @@ def lower_priority(
 
     * POSIX: nice 10 (never lowers a higher nice value, e.g. the systemd unit's).
     * Linux: also the idle I/O class (``ioprio_set``) and ``SCHED_BATCH``. The systemd
-      unit sets the same; this covers the daemon spawned by VLC itself.
+      unit only sets ``Nice=10``; this also covers the daemon spawned by VLC itself.
     * Windows: ``BELOW_NORMAL_PRIORITY_CLASS``.
 
     Call it before starting threads: on Linux nice and I/O priority are per thread
@@ -160,7 +165,9 @@ def _linux_idle_io(ctypes_mod: Any, machine: str | None) -> list[str]:
     if machine is None:
         import platform as _platform
 
-        machine = _platform.machine()
+        machine = (_platform.machine() or "").lower()
+        if struct.calcsize("P") == 4:
+            machine = IOPRIO_ARCH_32BIT.get(machine, machine)
     nr = IOPRIO_SET_SYSCALL.get((machine or "").lower())
     if nr is None:
         return []

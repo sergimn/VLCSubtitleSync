@@ -64,9 +64,9 @@ def test_pure_offset(synth, offset):
 )
 def test_framerate_drift(synth, scale):
     fit, err = _align(synth, lambda t: t * scale)
-    # Known limit: compressing by 0.8x leaves ~0.15 s median error (in-cue word timing
-    # is estimated); tightened later by per-segment refinement.
-    _assert_accurate(err, median_max=0.2 if scale < 0.9 else None)
+    # In-cue word times follow the fitted scale (speech rate is nominal in the audio
+    # clock), so even 0.8x compression meets the normal tolerance.
+    _assert_accurate(err)
     assert fit.mapping.segments[0].scale == pytest.approx(scale, abs=2e-4)
 
 
@@ -410,3 +410,50 @@ def test_mapping_dominant():
     assert m.dominant().offset == 9.0
     assert m(50) == 51 and m(150) == 159
     assert list(m.map_array(np.array([50.0, 150.0]))) == [51.0, 159.0]
+
+
+# --- in-cue timing and scale snapping -----------------------------------------------
+
+
+def test_in_cue_token_times_follow_scale():
+    from vlcsubsync.align import _AnchorArrays
+
+    tok = subtitle_tokens([Cue(100.0, 110.0, "one two three four five six seven eight")])
+    rows = zip(tok.times, tok.lead, tok.cap, strict=True)
+    a = [
+        Anchor(float(t), 0.0, 1.0, 0, 0, i, float(ld), float(cp))
+        for i, (t, ld, cp) in enumerate(rows)
+    ]
+    arr = _AnchorArrays.build(a)
+    assert list(arr.x(1.0)) == pytest.approx(list(tok.times))
+    # under 1.25x drift the same speech takes 1/1.25 of the subtitle-clock time
+    assert list(arr.x(1.25) - 100.0) == pytest.approx(list((tok.times - 100.0) / 1.25))
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_snap_tolerates_per_window_timestamp_bias(seed):
+    """Real Whisper windows each carry a shared timestamp bias (~0.2-0.4 s): the free
+    slope through 12 such windows is off the exact NTSC ratio by a few 1e-4, which is
+    within its standard error, so the exact ratio is kept."""
+    from vlcsubsync.align import _snap_scale
+
+    rng = np.random.default_rng(seed)
+    xs, ys, wins = [], [], []
+    for k in range(12):
+        x = 60.0 + 130.0 * k + np.sort(rng.uniform(0, 24, 40))
+        bias = rng.normal(0, 0.3)
+        xs.append(x)
+        ys.append(1.25 * x + 0.3 + bias + rng.normal(0, 0.25, x.size))
+        wins.append(np.full(x.size, k))
+    x, y, win = np.concatenate(xs), np.concatenate(ys), np.concatenate(wins)
+    w = np.ones_like(x)
+    s_free = float(np.polyfit(x, y, 1)[0])
+    s, _o = _snap_scale(x, y, w, s_free, float(np.median(y - s_free * x)), win)
+    assert s == 1.25
+
+
+def test_24_vs_23976_is_not_snapped_away(synth):
+    """24/23.976 (+0.1%) stays distinguishable from 1.0 on clean data."""
+    fit, err = _align(synth, lambda t: t * 24 / 23.976 + 1.0)
+    assert fit.mapping.segments[0].scale == pytest.approx(24 / 23.976, abs=1e-5)
+    _assert_accurate(err)

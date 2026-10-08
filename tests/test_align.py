@@ -243,6 +243,17 @@ def test_vad_align(synth, transform, scale):
     # The mask correlation is weaker under NTSC-sized stretching: the right mapping is
     # found but stays below the apply gate, so the fallback errs on the safe side.
     assert r.confidence > (0.3 if abs(scale - 1.0) > 0.1 else 0.6)
+    # the cross-scale term must not cut genuine matches
+    assert r.details["cross_scale"] > 0.15
+
+
+def test_vad_align_long_file_keeps_cross_scale(synth):
+    """On a long file 1.0 and 24/23.976 map > 3 s apart and count as rivals; the
+    right scale must still stand out."""
+    cues, speech = _masks(synth, lambda t: t + 2.5, 52 * 60)
+    r = vad_align(speech, cues)
+    assert r.mapping.segments[0].scale == pytest.approx(1.0)
+    assert r.confidence > 0.6 and r.details["cross_scale"] > 0.15
 
 
 def test_vad_align_unrelated_is_low_confidence(synth):

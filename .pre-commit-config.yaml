@@ -14,6 +14,8 @@ repos:
         args: [--maxkb=1024]
       - id: mixed-line-ending
         args: [--fix=no]
+  # Renovate updates this rev; the lint job in .github/workflows/ci.yml pins the same
+  # ruff version (RUFF_VERSION) and is bumped together with it. Keep both in sync.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.16.10
     hooks:

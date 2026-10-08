@@ -627,8 +627,8 @@ def test_genuine_backward_cut_still_jumps():
 
 @pytest.mark.parametrize("period,phase", [(1200, 1.3), (1800, 0.0), (1800, 2.2), (900, 4.0)])
 def test_wobble_periods_and_phases_not_chopped(synth, period, phase):
-    """Verification must leave smooth wobble to local refinement, whatever its period
-    and phase (no extra segments), and refinement must improve it."""
+    """Smooth wobble, whatever its period and phase, stays one segment and local
+    refinement improves it."""
 
     def f(t):
         return t + 3.0 + 0.3 * math.sin(2 * math.pi * t / period + phase)

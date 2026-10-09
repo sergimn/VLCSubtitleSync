@@ -1148,7 +1148,14 @@ function M.switch_sync_mode(input, snap, sel)
         if not D then return end
         M.delay_stop(input, "sync mode track")
         local e = D.entry
-        if e.output and file_exists(e.output) then
+        if e.es and snap.spu_set[e.es] and S.ours[e.es] then
+            -- the synced track is still loaded: go back to it, do not add it again
+            if snap.spu ~= e.es then
+                select_spu(input, e.es)
+                snap.spu = e.es
+            end
+            S.last_spu = e.es
+        elseif e.output and file_exists(e.output) then
             M.load_output(input, snap, e, true)
         end
         return

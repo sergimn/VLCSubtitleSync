@@ -998,6 +998,32 @@ def test_delay_toggle_while_playing_moves_result(h):
     assert len(h.added()) == 1
 
 
+def test_delay_toggle_off_reselects_loaded_synced_track(h):
+    """Track-mode sync, then live delay on/off twice: turning delay off goes back
+    to the synced track already loaded instead of adding the same file again."""
+    h.control(auto=1, sync_now=0, sync_mode="track")
+    h.set_input()
+    h.mock.set_time(10)
+    h.settle()
+    req = h.requests()[0]
+    out = h.finish(req["id"], **seg_status((None, None, 1.0, 2.0)))
+    h.tick(2)
+    assert h.added() == [(out, True)]
+    ours = h.spu_ids()[-1]
+    assert h.selected("spu-es") == ours
+    for _ in range(2):
+        h.control(auto=1, sync_now=0, sync_mode="delay")
+        h.tick(2)
+        assert h.selected("spu-es") == 20
+        assert spu_delay(h) == 2_000_000
+        h.control(auto=1, sync_now=0, sync_mode="track")
+        h.tick(2)
+        assert spu_delay(h) == 0
+        assert h.selected("spu-es") == ours
+    assert h.added() == [(out, True)]
+    assert h.spu_ids().count(ours) == 1
+
+
 def test_delay_sync_now_forces_resync(h):
     start_delay(h, (None, None, 1.0, 2.0), t0=10)
     h.control(auto=1, sync_now=1, sync_mode="delay")

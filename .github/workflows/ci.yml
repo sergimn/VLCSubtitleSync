@@ -264,3 +264,25 @@ jobs:
         with:
           name: dist
           path: dist/
+
+  all-green:
+    # The one check to mark as required in branch protection. It needs every other
+    # job and runs even when one of them fails, is cancelled or is skipped, so it
+    # can only pass when all of them passed (a skipped required check counts as
+    # passing on GitHub, which is why it must not be skipped itself).
+    # tests/test_ci_workflow.py checks that `needs` lists every job in this file.
+    name: All green
+    if: always()
+    needs: [lint, unit, integration, e2e-vlc, installer, installer-clean-windows, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check that every job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.value.result)\t\(.key)"'
+          bad="$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result != "success") | .key')"
+          if [ -n "$bad" ]; then
+            echo "::error::These jobs did not pass: $(echo $bad)"
+            exit 1
+          fi

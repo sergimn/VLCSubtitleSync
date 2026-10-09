@@ -345,6 +345,57 @@ def test_cache_off_neither_reuses_nor_stores(env):
         assert {f: f.stat().st_mtime_ns for f in cache.iterdir()} == stored  # untouched
 
 
+def test_control_cache_toggle_overrides_config(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    cfg = {"c": Config()}
+    runner = FakeRunner()
+    cache = env.tmp / "cache" / "results"
+    with Harness(env, runner, config_loader=lambda: cfg["c"]) as h:
+        P.write_kv(env.queue / P.CONTROL_FILE, {"auto": 1, "sync_now": 0, "cache": "off"})
+        h.submit("t_1", media, sub_index=0)
+        h.wait_state("t_1", "done")
+        h.submit("t_2", media, sub_index=0)
+        h.wait_state("t_2", "done")
+        assert len(runner.calls) == 2 and not list(cache.glob("*.meta"))
+        # the VLC toggle turned back on wins over cache=off in config.ini
+        cfg["c"] = Config(cache=False)
+        P.write_kv(env.queue / P.CONTROL_FILE, {"auto": 1, "sync_now": 0, "cache": "on"})
+        h.submit("t_3", media, sub_index=0)
+        h.wait_state("t_3", "done")
+        h.submit("t_4", media, sub_index=0)
+        h.wait_state("t_4", "done")
+        assert len(runner.calls) == 3  # t_4 came from the cache
+
+
+def test_heartbeat_reports_config_cache(env):
+    from vlcsubsync.config import Config
+
+    cfg = {"c": Config()}
+    with Harness(env, FakeRunner(), config_loader=lambda: cfg["c"]):
+        wait_for(lambda: (hb := P.read_heartbeat(env.queue)) and hb.cache is True)
+        cfg["c"] = Config(cache=False)
+        wait_for(lambda: (hb := P.read_heartbeat(env.queue)) and hb.cache is False)
+    assert P.Heartbeat.from_dict({"time": "1", "pid": "2", "version": "x"}).cache is None
+
+
+def test_clear_cache_command_from_vlc(env):
+    media = make_media(env)
+    runner = FakeRunner()
+    cache = env.tmp / "cache" / "results"
+    with Harness(env, runner) as h:
+        h.submit("x_1", media, sub_index=0)
+        h.wait_state("x_1", "done")
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 1)
+        P.write_kv(env.queue / P.CLEAR_CACHE_FILE, {"time": 1})
+        wait_for(lambda: not (env.queue / P.CLEAR_CACHE_FILE).exists())
+        wait_for(lambda: not cache.exists())
+        h.submit("x_2", media, sub_index=0)
+        h.wait_state("x_2", "done")
+        assert len(runner.calls) == 2  # synced again
+
+
 def test_cache_entry_deleted_before_copy_resyncs(env, monkeypatch):
     """`clear-cache` between the lookup and the copy: the job syncs again."""
     media = make_media(env)

@@ -160,10 +160,11 @@ A reader drops the whole mapping if any line is malformed. Written only when
 An *applied* cache entry without `segments` (stored before mappings were sent) is
 treated as a miss and re-synced once; the new result replaces it. Track mode ignores
 the keys and still loads `output`.
-`<q>/heartbeat` (daemon): `time=<unix seconds>\npid=<pid>\nversion=<x.y.z>`; refreshed every ≤2 s.
+`<q>/heartbeat` (daemon): `time=<unix seconds>\npid=<pid>\nversion=<x.y.z>\ncache=on|off`
+(`cache` = `config.ini`'s setting; absent in helpers from before it); refreshed every ≤2 s.
 Lua considers the daemon alive if `os.time() - time <= 10`.
 
-`<q>/control` (extension → intf): `sync_now=<counter>`, `auto=1|0`, optionally
+`<q>/control` (extension → intf; `cache=on|off` → daemon, see the result cache below): `sync_now=<counter>`, `auto=1|0`, optionally
 `sync_now_mode=exhaustive`, and `sync_mode=delay|track` once the "Experimental: no extra
 track (live delay)" toggle was used (every control write keeps it; absent = the helper's
 config decides, from the `sync_mode=` of the last done status). intf reacts when `sync_now` increases; the
@@ -189,7 +190,11 @@ Result cache key = sha1(media path, size, mtime, audio_index, sub source identit
 model, version, effective mode) → reuse previous output instantly unless `force=1`.
 `cache=off` in `config.ini` skips both the lookup and the store (debugging), and
 leaves stored results untouched (a forced sync drops no other mode's entry);
-`vlc-subsync clear-cache` deletes the results dir (`D.clear_results_cache`).
+`cache=on|off` in `<q>/control` (the extension's "Use cached results" toggle, kept by
+every control write) wins over it for jobs from that queue dir.
+`vlc-subsync clear-cache` deletes the results dir (`D.clear_results_cache`); so does
+the daemon when it finds `<q>/clear_cache` (the extension's "Delete cached results"),
+which it removes first. A cache hit whose file vanished meanwhile re-syncs.
 Effective mode = the request's `mode=`, else the config's. A lookup tries the
 exhaustive key, then thorough, down to the job's own mode: a result of a *more*
 thorough mode also answers a later cheaper request for the same file and tracks

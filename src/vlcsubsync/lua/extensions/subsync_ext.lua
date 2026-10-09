@@ -5,7 +5,11 @@
  (toggle), "Status…", "Load synced result" (only while a fallback job exists),
  "Experimental: no extra track (live delay): ON/OFF" (toggle, writes
  sync_mode=delay|track; the intf then corrects the original track through
- spu-delay instead of adding a synced track, see DESIGN.md "Delay mode").
+ spu-delay instead of adding a synced track, see DESIGN.md "Delay mode"),
+ "Use cached results: ON/OFF" (toggle, writes cache=on|off, read by the
+ helper; absent = its config.ini, reported in <q>/heartbeat) and "Delete
+ cached results" (writes <q>/clear_cache; the helper deletes its result
+ cache and that file). Both are for debugging.
 
  It talks to the interface script (lua/intf/subsync.lua) only through
  <q>/control (written here: auto=1|0, sync_now=<counter>, plus
@@ -45,6 +49,7 @@ E.HEARTBEAT_MAX_AGE = 10
 -- VLC lists menu entries in id order.
 local MENU_SYNC, MENU_SYNC_EXH, MENU_AUTO, MENU_STATUS, MENU_LOAD = 1, 2, 3, 4, 5
 local MENU_DELAY = 6
+local MENU_CACHE, MENU_CLEAR = 7, 8
 E.DELAY_LABEL = "Experimental: no extra track (live delay)"
 E.EXHAUSTIVE = "exhaustive"
 
@@ -195,9 +200,26 @@ function E.delay_enabled()
     return st ~= nil and st.sync_mode == "delay"
 end
 
+-- "on" / "off" if the cache toggle was used, else nil (the helper's config decides)
+function E.control_cache(c)
+    local v = ((c or E.read_control()).cache or ""):lower()
+    if v == "on" or v == "off" then return v end
+    return nil
+end
+
+-- Result cache in effect: the toggle's choice, else the helper's config.ini (its
+-- heartbeat reports it), else on.
+function E.cache_enabled()
+    local v = E.control_cache()
+    if v then return v == "on" end
+    local hb = E.read_kv(join(E.queue_dir(), "heartbeat"))
+    return not (hb and hb.cache == "off")
+end
+
 -- `mode` (optional) applies to this sync_now increment ("" / nil = default mode).
--- `sync_mode` "delay"/"track" sets the toggle; nil keeps the current value.
-function E.write_control(auto, sync_now, mode, sync_mode)
+-- `sync_mode` "delay"/"track" and `cache` "on"/"off" set their toggles; nil keeps
+-- the current value.
+function E.write_control(auto, sync_now, mode, sync_mode, cache)
     E.ensure_dirs()
     local kv = {
         { "auto", auto and 1 or 0 },
@@ -206,6 +228,8 @@ function E.write_control(auto, sync_now, mode, sync_mode)
     if mode and mode ~= "" then kv[#kv + 1] = { "sync_now_mode", mode } end
     sync_mode = sync_mode or E.control_sync_mode()
     if sync_mode then kv[#kv + 1] = { "sync_mode", sync_mode } end
+    cache = cache or E.control_cache()
+    if cache then kv[#kv + 1] = { "cache", cache } end
     return E.write_kv(join(E.queue_dir(), "control"), kv)
 end
 
@@ -396,6 +420,9 @@ function E.status_html()
     if E.delay_enabled() then
         parts[#parts + 1] = "<b>Mode:</b> live delay (experimental, no extra track)"
     end
+    if not E.cache_enabled() then
+        parts[#parts + 1] = "<b>Cached results:</b> not used (every sync runs again)"
+    end
     if ST.job then
         parts[#parts + 1] = "<b>Manual job:</b> " .. html_escape(E.check_job(false))
     end
@@ -517,6 +544,59 @@ function E.toggle_delay()
     end
 end
 
+-- The running helper (alive, heartbeat `hb`) knows the cache toggle and the
+-- delete command: helpers from before them write no `cache` key.
+local function helper_too_old(hb, d_alive)
+    return d_alive and (hb.cache == nil or hb.cache == "")
+end
+
+local OLD_HELPER = "The running SubSync helper is from an older version and cannot do"
+    .. " this. Restart VLC (the helper restarts with it), then try again."
+
+-- Debugging: stop (or resume) reusing and storing results (cache=on|off in <q>/control).
+function E.toggle_cache()
+    local hb, d_alive = E.daemon_status()
+    if helper_too_old(hb, d_alive) then
+        E.show_status(OLD_HELPER)
+        return
+    end
+    local c = E.read_control()
+    local on = not E.cache_enabled()
+    local ok, err = E.write_control(c.auto ~= "0", tonumber(c.sync_now) or 0, nil, nil,
+        on and "on" or "off")
+    if not ok then
+        E.show_status("Cannot write control file: " .. tostring(err))
+        return
+    end
+    if d_alive then
+        osd("SubSync cached results " .. (on and "ON" or "OFF"))
+    else
+        E.show_status("Cached results are now " .. (on and "ON" or "OFF")
+            .. ". The helper is not running; it uses this setting once it starts.")
+    end
+end
+
+-- Debugging: ask the helper to delete every stored result (<q>/clear_cache).
+function E.clear_cache()
+    local hb, d_alive = E.daemon_status()
+    if helper_too_old(hb, d_alive) then
+        E.show_status(OLD_HELPER)
+        return
+    end
+    E.ensure_dirs()
+    local ok, err = E.write_kv(join(E.queue_dir(), "clear_cache"), { { "time", os.time() } })
+    if not ok then
+        E.show_status("Cannot ask the helper to delete cached results: " .. tostring(err))
+        return
+    end
+    if d_alive then
+        osd("SubSync: deleting cached results")
+    else
+        E.show_status("The helper is not running. It deletes the cached results when"
+            .. " it starts, or run vlc-subsync clear-cache.")
+    end
+end
+
 ---------------------------------------------------------------- VLC hooks
 
 function descriptor()
@@ -554,6 +634,9 @@ function menu()
     m[MENU_STATUS] = "Status…"
     local okd, delay = pcall(E.delay_enabled)
     m[MENU_DELAY] = E.DELAY_LABEL .. ": " .. ((okd and delay) and "ON" or "OFF")
+    local okc, cache = pcall(E.cache_enabled)
+    m[MENU_CACHE] = "Use cached results: " .. ((not okc or cache) and "ON" or "OFF")
+    m[MENU_CLEAR] = "Delete cached results"
     return m
 end
 
@@ -569,6 +652,10 @@ function trigger_menu(id)
             E.show_status(E.check_job(true))
         elseif id == MENU_DELAY then
             E.toggle_delay()
+        elseif id == MENU_CACHE then
+            E.toggle_cache()
+        elseif id == MENU_CLEAR then
+            E.clear_cache()
         elseif id == MENU_STATUS then
             E.collect_ours()
             E.show_status()

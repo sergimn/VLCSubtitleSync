@@ -35,6 +35,7 @@ from .config import (
     mode_rank,
     normalize_mode,
     normalize_sync_mode,
+    parse_bool,
 )
 
 log = logging.getLogger("vlcsubsync.daemon")
@@ -666,7 +667,11 @@ class Daemon:
 
     # ---------------------------------------------------------------- heartbeat
     def write_heartbeats(self) -> None:
-        hb = P.Heartbeat(time=time.time(), pid=os.getpid(), version=self.version)
+        try:
+            cache = parse_bool(getattr(self.config_loader(), "cache", True))
+        except Exception:  # noqa: BLE001
+            cache = None
+        hb = P.Heartbeat(time=time.time(), pid=os.getpid(), version=self.version, cache=cache)
         for q in self.queue_dirs:
             try:
                 P.write_heartbeat(q, hb)
@@ -679,6 +684,40 @@ class Daemon:
             if hb is not None and hb.pid == os.getpid():
                 with contextlib.suppress(OSError):
                     (q / P.HEARTBEAT_FILE).unlink()
+
+    # ---------------------------------------------------------------- commands
+    def poll_commands(self) -> int:
+        """Handle ``<q>/clear_cache`` (the extension's "Delete cached results").
+
+        Returns the number of results deleted (0 if nothing was asked)."""
+        asked = False
+        for q in self.queue_dirs:
+            try:
+                (q / P.CLEAR_CACHE_FILE).unlink()
+                asked = True
+            except FileNotFoundError:
+                pass
+            except OSError as exc:  # e.g. still open on Windows: next poll
+                log.debug("cannot take %s yet: %s", q / P.CLEAR_CACHE_FILE, exc)
+        if not asked:
+            return 0
+        removed, left = clear_results_cache(self.cache_dir)
+        log.info(
+            "deleted %d cached result(s) as asked from VLC%s",
+            removed,
+            f"; {left} file(s) could not be deleted" if left else "",
+        )
+        return removed
+
+    @staticmethod
+    def cache_enabled(queue_dir: Path, config: Any) -> bool:
+        """Whether a job from ``queue_dir`` may use the result cache: the extension's
+        toggle (``cache=on|off`` in ``<q>/control``) wins over ``config.cache``."""
+        control = P.read_kv(queue_dir / P.CONTROL_FILE) or {}
+        toggle = parse_bool(control.get("cache"))
+        if toggle is not None:
+            return toggle
+        return parse_bool(getattr(config, "cache", True)) is not False
 
     # ---------------------------------------------------------------- requests
     def poll_requests(self) -> int:
@@ -1007,7 +1046,7 @@ class Daemon:
             out_dir = job.queue_dir / P.OUT_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            use_cache = bool(getattr(config, "cache", True))
+            use_cache = self.cache_enabled(job.queue_dir, config)
             cached = self._cached_result(job, source, config) if use_cache and not r.force else None
             if cached is not None:
                 cached_file, meta = cached
@@ -1077,7 +1116,7 @@ class Daemon:
             )
             writer.write(done, force=True)
             if not use_cache:
-                log.debug("job %s: result cache disabled (cache=off), not stored", r.id)
+                log.debug("job %s: result cache off, not stored", r.id)
             else:
                 self._cache_store(key, output, done)
                 if r.force:
@@ -1214,6 +1253,7 @@ class Daemon:
                     self.write_heartbeats()
                     last_hb = now
                 try:
+                    self.poll_commands()
                     self.poll_requests()
                 except Exception:  # noqa: BLE001
                     log.exception("error while polling requests")

@@ -155,9 +155,10 @@ class Harness:
             return []
         return [parse_kv(p) for p in sorted(d.glob("*.req"))]
 
-    def heartbeat(self, age: int = 0):
+    def heartbeat(self, age: int = 0, **kv):
         write_kv(
-            self.q / "heartbeat", {"time": int(time.time()) - age, "pid": 1234, "version": "0.1.0"}
+            self.q / "heartbeat",
+            {"time": int(time.time()) - age, "pid": 1234, "version": "0.1.0", **kv},
         )
 
     def status(self, req_id: str, **kv):
@@ -1182,6 +1183,8 @@ def test_ext_descriptor_and_menu(ext):
         3: "Auto-sync: ON",
         4: "Status…",
         6: "Experimental: no extra track (live delay): OFF",
+        7: "Use cached results: ON",
+        8: "Delete cached results",
     }
 
 
@@ -1345,6 +1348,66 @@ def test_ext_delay_toggle_with_old_intf_asks_for_restart(ext):
     ext.control(auto=1, sync_now=2)
     ext.lua.eval("trigger_menu(6)")
     assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "2"}
+    assert "Restart VLC" in ext.mock.last_dialog.widgets[1].text
+
+
+def test_ext_cache_toggle_writes_control(ext):
+    write_intf_state(ext)
+    ext.heartbeat(cache="on")
+    ext.control(auto=0, sync_now=5, sync_mode="delay")
+    ext.lua.eval("trigger_menu(7)")
+    assert parse_kv(ext.q / "control") == {
+        "auto": "0",
+        "sync_now": "5",
+        "sync_mode": "delay",
+        "cache": "off",
+    }
+    assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: OFF"
+    assert "SubSync cached results OFF" in ext.osd()
+    ext.lua.eval("trigger_menu(4)")
+    assert "Cached results:</b> not used" in ext.mock.last_dialog.widgets[1].text
+    # other control writes keep the choice
+    ext.lua.eval("trigger_menu(1)")
+    ext.lua.eval("trigger_menu(3)")
+    ext.lua.eval("trigger_menu(6)")
+    assert parse_kv(ext.q / "control")["cache"] == "off"
+    ext.lua.eval("trigger_menu(7)")
+    assert parse_kv(ext.q / "control")["cache"] == "on"
+    assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: ON"
+
+
+def test_ext_cache_menu_reflects_helper_config(ext):
+    ext.heartbeat(cache="off")  # cache=off in config.ini
+    assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: OFF"
+    ext.lua.eval("trigger_menu(7)")  # toggling turns it on explicitly
+    assert parse_kv(ext.q / "control")["cache"] == "on"
+
+
+def test_ext_cache_toggle_without_helper_explains(ext):
+    ext.lua.eval("trigger_menu(7)")
+    assert parse_kv(ext.q / "control")["cache"] == "off"
+    assert "helper is not running" in ext.mock.last_dialog.widgets[1].text
+
+
+def test_ext_delete_cached_results(ext):
+    ext.heartbeat(cache="on")
+    ext.lua.eval("trigger_menu(8)")
+    assert "time" in parse_kv(ext.q / "clear_cache")
+    assert "SubSync: deleting cached results" in ext.osd()
+    (ext.q / "clear_cache").unlink()
+    ext.heartbeat(age=600)  # helper gone: it deletes them once it starts
+    ext.lua.eval("trigger_menu(8)")
+    assert (ext.q / "clear_cache").exists()
+    assert "vlc-subsync clear-cache" in ext.mock.last_dialog.widgets[1].text
+
+
+def test_ext_cache_items_with_old_helper_ask_for_restart(ext):
+    ext.heartbeat()  # no cache key: a helper from before these items
+    ext.control(auto=1, sync_now=2)
+    ext.lua.eval("trigger_menu(7)")
+    ext.lua.eval("trigger_menu(8)")
+    assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "2"}
+    assert not (ext.q / "clear_cache").exists()
     assert "Restart VLC" in ext.mock.last_dialog.widgets[1].text
 
 

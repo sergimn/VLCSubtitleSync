@@ -202,7 +202,7 @@ class Config:
                 if 0.0 <= v <= 1.0:
                     self.min_confidence = v
             elif key == "cache":
-                b = _parse_bool(value)
+                b = parse_bool(value)
                 if b is not None:
                     self.cache = b
             elif key == "threads":
@@ -232,8 +232,11 @@ class Config:
             pass
 
 
-def _parse_bool(value: str) -> bool | None:
-    v = value.strip().lower()
+def parse_bool(value: object) -> bool | None:
+    """on/1/true/yes → True, off/0/false/no → False (case-insensitive), else None."""
+    if isinstance(value, bool):
+        return value
+    v = str(value or "").strip().lower()
     if v in ("1", "on", "true", "yes"):
         return True
     if v in ("0", "off", "false", "no"):

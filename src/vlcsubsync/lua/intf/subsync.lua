@@ -52,7 +52,7 @@
 
 local M = {}
 
-M.VERSION = "1.0.2"
+M.VERSION = "1.1.0"
 M.TICK_US = 500000            -- main loop period
 M.DEBOUNCE_US = 1500000       -- wait this long after a track change
 -- After a file opens, VLC (and the user) may still be picking tracks: automatic

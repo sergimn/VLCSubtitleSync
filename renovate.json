@@ -22,6 +22,14 @@
       "depNameTemplate": "astral-sh/ruff-pre-commit",
       "datasourceTemplate": "github-tags",
       "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "description": "Runner versions in workflow matrices (os: [ubuntu-24.04, ...]); the github-actions manager only reads plain runs-on values",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": ["\\b(?<depName>ubuntu|macos|windows)-(?<currentValue>\\d[\\w.-]*?)(?=\\s*[,\\]])"],
+      "datasourceTemplate": "github-runners",
+      "versioningTemplate": "docker"
     }
   ],
   "packageRules": [
@@ -30,6 +38,20 @@
       "matchManagers": ["github-actions", "pre-commit", "custom.regex"],
       "groupName": "CI tooling",
       "automerge": true
+    },
+    {
+      "description": "Runner OS versions (runs-on and matrix os) get their own PR, so a new OS that breaks a job doesn't hold back action updates. The datasource has no release dates, so the minimum release age can't apply.",
+      "matchDatasources": ["github-runners"],
+      "groupName": "CI runners",
+      "minimumReleaseAge": "0 days",
+      "automerge": true
+    },
+    {
+      "description": "installer-clean-windows runs a servercore:ltsc2022 container, which needs a Windows Server 2022 host",
+      "matchDatasources": ["github-runners"],
+      "matchDepNames": ["windows"],
+      "matchCurrentValue": "2022",
+      "enabled": false
     },
     {
       "description": "Dev extras (pytest, ruff, lupa, piper-tts) are low risk",

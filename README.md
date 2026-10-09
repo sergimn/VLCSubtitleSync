@@ -113,11 +113,6 @@ background priority on macOS, "below normal" on Windows) and at most half your C
 cores, so playback stays smooth. It frees the speech model from memory a minute after
 the last sync.
 
-While it runs a sync, the helper uses low priority (nice 10 and idle disk priority on
-Linux, background priority on macOS, "below normal" on Windows) and at most half your
-CPU cores, so playback stays smooth. It frees the speech model from memory a minute
-after the last sync.
-
 Step 5 in more detail: SubSync first fits one timing line (offset and, if the
 subtitles were made for another frame rate, a drift factor) per section of the video.
 It then checks each section in the middle, transcribing one more sample there if

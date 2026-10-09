@@ -244,3 +244,14 @@ class _SynthKit:
 @pytest.fixture
 def synth() -> type[_SynthKit]:
     return _SynthKit
+
+
+# --------------------------------------------------------------------------------------
+# daemon lifecycle: never renice / re-schedule the test process itself
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _keep_test_process_priority(monkeypatch):
+    """``serve()`` lowers its own priority; in tests it would hit pytest's process."""
+    monkeypatch.setenv("VLC_SUBSYNC_PRIORITY", "normal")

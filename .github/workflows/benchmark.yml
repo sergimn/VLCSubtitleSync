@@ -53,10 +53,14 @@ jobs:
         run: python -m vlcsubsync.cli download-models tiny.en base.en base
 
       - name: Run benchmark
+        # on main a broken run must show (it is the baseline); on PRs it is informational
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: python scripts/bench_fixtures.py run --out bench
       - name: Publish summary
+        if: hashFiles('bench/results.json') != ''
         run: cat bench/summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload results
+        if: hashFiles('bench/results.json') != ''
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results
@@ -67,8 +71,9 @@ jobs:
           retention-days: 90
 
       - name: Fetch main baseline
+        continue-on-error: true
         id: baseline
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && hashFiles('bench/results.json') != ''
         run: |
           run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow benchmark.yml \
             --branch main --event push --status success --limit 1 \
@@ -84,7 +89,8 @@ jobs:
             echo "::warning::could not download the baseline artifact of run $id"
           fi
       - name: Compare with main
-        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        if: github.event_name == 'pull_request' && hashFiles('bench/results.json') != ''
         env:
           BASE_URL: ${{ steps.baseline.outputs.url }}
         run: |
@@ -93,8 +99,9 @@ jobs:
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Comment on PR
         # fork PRs get a read-only token; their comparison is in the step summary
+        continue-on-error: true
         if: >-
-          github.event_name == 'pull_request' &&
+          github.event_name == 'pull_request' && hashFiles('comment.md') != '' &&
           github.event.pull_request.head.repo.full_name == github.repository
         env:
           PR: ${{ github.event.pull_request.number }}

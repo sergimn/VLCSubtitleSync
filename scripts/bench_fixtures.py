@@ -159,8 +159,10 @@ def git_sha() -> str:
         return "unknown"
 
 
-def overall(cases: list[dict]) -> dict:
-    errs = np.array([e for c in cases for e in c.get("errors", ())])
+def overall(cases: list[dict], ids: set[str] | None = None) -> dict:
+    errs = np.array(
+        [e for c in cases if ids is None or c["id"] in ids for e in c.get("errors", ())]
+    )
     if not errs.size:
         return {}
     return {
@@ -169,6 +171,10 @@ def overall(cases: list[dict]) -> dict:
         "p95": float(np.percentile(errs, 95)),
         "within_0.5": float(np.mean(errs <= 0.5)),
     }
+
+
+def cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")[:120]
 
 
 def ms(x: float) -> str:
@@ -182,7 +188,7 @@ def results_table(res: dict) -> list[str]:
     ]
     for c in res["cases"]:
         if "error" in c:
-            lines.append(f"| `{c['id']}` | ❌ {c['error'][:80]} | | | | | |")
+            lines.append(f"| `{c['id']}` | ❌ {cell(c['error'])} | | | | | |")
             continue
         lines.append(
             f"| `{c['id']}` | {ms(c['median'])} | {ms(c['p95'])} | {c['within_0.5']:.0%} "
@@ -265,14 +271,13 @@ def cmd_compare(args: argparse.Namespace) -> int:
         return 0
 
     by_id = {c["id"]: c for c in base["cases"]}
-    rows, counts = [], {"✅": 0, "⚠️": 0}
+    rows, counts = [], {"✅": 0, "⚠️": 0, "≈": 0, "🆕": 0, "❌": 0}
     for h in head["cases"]:
         b = by_id.get(h["id"])
         status, note = classify(h, b)
-        if status in counts:
-            counts[status] += 1
+        counts[status] += 1
         if "error" in h:
-            rows.append(f"| {status} | `{h['id']}` | {h['error'][:80]} | | | | | {note} |")
+            rows.append(f"| {status} | `{h['id']}` | {cell(h['error'])} | | | | | {note} |")
             continue
         if b is None or "error" in b:
             rows.append(
@@ -288,24 +293,34 @@ def cmd_compare(args: argparse.Namespace) -> int:
             f"| {h['method']} | {h['windows']} ({h['windows'] - b['windows']:+d}) "
             f"| {h['runtime_s']:.1f} s ({h['runtime_s'] - b['runtime_s']:+.1f}) {note} |"
         )
-    same = len(head["cases"]) - counts["✅"] - counts["⚠️"]
+    removed = sorted(set(by_id) - {c["id"] for c in head["cases"]})
     base_ref = f"`{base['sha'][:7]}`"
     if args.base_url:
         base_ref = f"[{base_ref}]({args.base_url})"
-    head_line = f"**{counts['✅']} better · {counts['⚠️']} worse · {same} unchanged**"
+    parts = [f"{counts['✅']} better", f"{counts['⚠️']} worse", f"{counts['≈']} unchanged"]
+    parts += [f"{counts[k]} {w}" for k, w in (("🆕", "new"), ("❌", "failing")) if counts[k]]
+    parts += [f"{len(removed)} removed"] if removed else []
     lines += [
-        f"{'⚠️ ' if counts['⚠️'] else ''}{head_line}: `{head['sha'][:7]}` vs `main` at {base_ref}",
+        f"{'⚠️ ' if counts['⚠️'] else ''}**{' · '.join(parts)}**: PR head "
+        f"`{head['sha'][:7]}` (merged with its base) vs `main` at {base_ref}",
         "",
         "|   | case | median Δ | p95 Δ | ≤0.5 s | method | windows | runtime |",
         "|---|---|---|---|---|---|---|---|",
         *rows,
     ]
-    ho, bo = head.get("overall"), base.get("overall")
+    ok = {c["id"] for c in head["cases"] if "error" not in c} & {
+        c["id"] for c in base["cases"] if "error" not in c
+    }
+    ho, bo = overall(head["cases"], ok), overall(base["cases"], ok)
     if ho and bo:
         lines.append(
-            f"| | **all cues** | **{delta(ho['median'], bo['median'])}** "
+            f"| | **{ho['cues']} cues of cases scored in both** "
+            f"| **{delta(ho['median'], bo['median'])}** "
             f"| **{delta(ho['p95'], bo['p95'])}** | **{ho['within_0.5']:.0%}** | | | |"
         )
+    lines += []
+    if removed:
+        lines += ["", "Cases on `main` missing here: " + ", ".join(f"`{r}`" for r in removed)]
     lines += [
         "",
         f"Errors are per-cue start errors against the exact TTS ground truth. "

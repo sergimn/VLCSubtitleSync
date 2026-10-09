@@ -594,6 +594,7 @@ end
 function meta_changed()
 end
 
-if rawget(_G, "SUBSYNC_TEST") then
-    _G.subsync_ext = E
+-- plain globals only: VLC runs extensions without rawget (and _G may be absent)
+if SUBSYNC_TEST then
+    subsync_ext = E
 end

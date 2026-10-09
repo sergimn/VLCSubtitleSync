@@ -19,8 +19,8 @@ input.
 * Fully automatic mode needs a **Lua interface script** (`lua/intf/subsync.lua`,
   enabled via `vlcrc`: `extraintf=luaintf`, `lua-intf=subsync`), because VLC
   extensions must be activated manually each session. A companion **extension**
-  (`lua/extensions/subsync_ext.lua`, View menu) provides "Sync now", auto on/off and
-  status.
+  (`lua/extensions/subsync_ext.lua`, View menu) provides "Sync now", "Sync now
+  (exhaustive)", auto on/off and status.
 
 ```
 VLC ── intf/subsync.lua ──writes──► <q>/requests/<id>.req
@@ -121,7 +121,9 @@ sub_index=0                            # ordinal among subtitle tracks VLC lists
 sub_label=Track 1 - [English]
 sub_path=                              # optional explicit external subtitle path
 force=0                                # 1 = ignore result cache
+mode=exhaustive                        # optional: fast|thorough|exhaustive, overrides config
 ```
+`mode` is omitted for the default; unknown values are ignored (config mode used).
 `<q>/jobs/<id>.status` (daemon → Lua), rewritten on each update:
 ```
 id=...
@@ -138,14 +140,36 @@ confidence=0.93
 `<q>/heartbeat` (daemon): `time=<unix seconds>\npid=<pid>\nversion=<x.y.z>`; refreshed every ≤2 s.
 Lua considers the daemon alive if `os.time() - time <= 10`.
 
-`<q>/control` (extension → intf): `sync_now=<counter>`, `auto=1|0`. intf reacts when
-`sync_now` increases. `<q>/intf_state` (intf → extension, display only): `state`,
-`message`, `last_result`.
+`<q>/control` (extension → intf): `sync_now=<counter>`, `auto=1|0`, and optionally
+`sync_now_mode=exhaustive`. intf reacts when `sync_now` increases; the
+`sync_now_mode` present in that same write becomes the request's `mode=` (absent =
+no `mode` key, i.e. the configured mode). "Sync now (exhaustive)" in the extension
+writes it; "Sync subtitles now" does not. `<q>/intf_state` (intf → extension,
+display only, except `modes`): `state`, `message`, `last_result`, `modes` (the
+`sync_now_mode` values it understands; an intf from before sync modes lacks it, and
+the extension then asks for a VLC restart instead of claiming an exhaustive sync).
 
 Daemon housekeeping: delete `.req` once picked up; delete jobs/out older than 7 days.
 Result cache key = sha1(media path, size, mtime, audio_index, sub source identity,
-model, version, configured sync mode) → reuse previous output instantly unless
-`force=1`.
+model, version, effective mode) → reuse previous output instantly unless `force=1`.
+Effective mode = the request's `mode=`, else the config's. A lookup tries the
+exhaustive key, then thorough, down to the job's own mode: a result of a *more*
+thorough mode also answers a later cheaper request for the same file and tracks
+(it used at least the same evidence), never the other way round. So after
+"Sync now (exhaustive)", reopening the file reuses the exhaustive result.
+* Another mode's entry is only used if it was applied (`applied=1`). Example: an
+  exhaustive run that lost its windows to CUDA OOM and fell back to VAD with
+  `applied=0` must not block a fast sync that might succeed. The job's own mode
+  reuses unapplied results as before, so hopeless work is not redone.
+* A request for the running job's media and tracks cancels it when the user asked
+  for another mode: an explicit different `mode=` ("Sync now (exhaustive)" during a
+  fast run), or `force=1` in another mode ("Sync subtitles now" during an exhaustive
+  run). Automatic requests (no `mode`, no `force`) wait for it.
+* A forced run (`force=1`) stores its result and deletes the other modes' entries
+  for the same file and tracks, so the newest forced result wins on the next open.
+* The order assumes the mode defaults. Explicit `windows=N` / `verify_windows=N` are
+  not part of the key and can make "thorough" sample less than "fast". This is
+  accepted: such settings are rare and were never in the key.
 
 ### Lua behaviour (intf)
 Loop every ~500 ms (`vlc.misc.mwait`); VLC 3 has no `should_die()` — `mwait` raises "Interrupted." when the interface is closing, which ends the loop.
@@ -158,7 +182,9 @@ added). On `done` + `applied=1`: `vlc.input.add_subtitle(output, true)` (try pat
 `vlc.strings.make_uri(output)`), remember the new ES id(s) as "ours → source", OSD
 `"Subtitles synced: <message>"`. On error / not applied: short OSD message, keep
 original. Remember the result per (input, audio, source) so re-selecting doesn't resync.
-OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
+OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job with
+`mode=exhaustive` (or thorough) says so in its OSD/progress text: "Syncing subtitles
+(exhaustive, may take a while)… 42% – Transcribing 20/58 (exhaustive)".
 
 ## Alignment algorithm (align.py)
 1. Decode selected audio stream → 16 kHz mono float32.
@@ -288,7 +314,7 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
 10. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 
-## Sync modes (`mode=` in config, `vlc-subsync sync --mode`)
+## Sync modes (`mode=` in config, per-request `mode=`, `vlc-subsync sync --mode`)
 
 | mode | windows (step 3) | adaptive (step 5) | verification budget (step 6) |
 |---|---|---|---|

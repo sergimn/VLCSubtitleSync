@@ -25,6 +25,7 @@ from typing import Any, Literal, Protocol
 
 from . import __version__
 from . import protocol as P
+from .config import DEFAULT_MODE, MODES, mode_rank, normalize_mode
 
 log = logging.getLogger("vlcsubsync.daemon")
 
@@ -426,6 +427,15 @@ def resolve_source(
     )
 
 
+def effective_mode(request: P.Request, config: Any) -> str:
+    """Sync mode of a job: the request's ``mode=`` if valid, else the config's."""
+    return (
+        normalize_mode(request.mode)
+        or normalize_mode(getattr(config, "mode", None))
+        or DEFAULT_MODE
+    )
+
+
 def load_config() -> Any:
     """Load the user's Config (lazy import of the engine's config module)."""
     try:
@@ -482,6 +492,16 @@ class _Job:
     def params(self) -> tuple[Any, ...]:
         r = self.request
         return (r.audio_index, r.sub_index, r.sub_path)
+
+
+def _mode_switch(running: _Job, new: _Job) -> bool:
+    """The user asked for another sync mode for the running job's tracks: an explicit
+    ``mode=`` that differs ("Sync now (exhaustive)" during a fast run), or a forced
+    request in another mode ("Sync subtitles now" during an exhaustive run). Automatic
+    requests (no mode, no force) never cancel a running job."""
+    a = normalize_mode(running.request.mode)
+    b = normalize_mode(new.request.mode)
+    return a != b and (b is not None or new.request.force)
 
 
 class _StatusWriter:
@@ -689,7 +709,7 @@ class Daemon:
             if (
                 running is not None
                 and running.media_key == job.media_key
-                and running.params != job.params
+                and (running.params != job.params or _mode_switch(running, job))
             ):
                 running.cancel_reason = "Superseded by a newer request"
                 running.cancel.set()
@@ -735,7 +755,10 @@ class Daemon:
                     self._running = None
                 self.jobs_completed += 1
 
-    def cache_key(self, job: _Job, source: ResolvedSource, config: Any) -> str:
+    def cache_key(
+        self, job: _Job, source: ResolvedSource, config: Any, mode: str | None = None
+    ) -> str:
+        """Result-cache key; ``mode`` defaults to the job's effective sync mode."""
         r = job.request
         media = os.path.abspath(r.media)
         st = os.stat(media)
@@ -748,10 +771,69 @@ class Daemon:
             str(getattr(config, "model_en", "")),
             str(getattr(config, "model_multi", "")),
             self.version,
-            # the configured sync mode: changing it must not reuse another mode's result
-            str(getattr(config, "effective_mode", "fast")),
+            mode or effective_mode(r, config),
         ]
         return hashlib.sha1("\0".join(parts).encode("utf-8")).hexdigest()
+
+    def cache_lookup_keys(
+        self, job: _Job, source: ResolvedSource, config: Any
+    ) -> list[tuple[str, str]]:
+        """``(mode, key)`` pairs whose results may satisfy this job: the most thorough
+        mode first, down to the job's own mode. A result of a more thorough mode is at
+        least as good, so an exhaustive result also answers a later fast/thorough
+        request (never the other way round), but only if it was applied (see
+        :meth:`_cached_result`)."""
+        want = mode_rank(effective_mode(job.request, config))
+        return [
+            (m, self.cache_key(job, source, config, m))
+            for m in reversed(MODES)
+            if mode_rank(m) >= want
+        ]
+
+    def _cached_result(
+        self, job: _Job, source: ResolvedSource, config: Any
+    ) -> tuple[Path, dict[str, str]] | None:
+        """Cached result for ``job``, or None.
+
+        The job's own mode may answer with any cached result, including an unapplied
+        one (no point redoing hopeless work in the same mode). Another, more thorough
+        mode only answers with an *applied* result: an unapplied exhaustive run (e.g.
+        windows lost to CUDA OOM, then the VAD fallback) must not block a fast sync
+        that might succeed.
+        """
+        own = effective_mode(job.request, config)
+        for m, key in self.cache_lookup_keys(job, source, config):
+            hit = self._cache_lookup(key)
+            if hit is None:
+                continue
+            if m != own and not P._to_bool(hit[1].get("applied")):
+                log.debug("ignoring unapplied cached %s result for a %s job", m, own)
+                continue
+            return hit
+        return None
+
+    def _cache_drop_other_modes(
+        self, job: _Job, source: ResolvedSource, config: Any, keep: str
+    ) -> None:
+        """Remove the cached results of every mode but ``keep`` for this file and
+        tracks, so the newest (forced) result is what later lookups find."""
+        for m in MODES:
+            if m == keep:
+                continue
+            key = self.cache_key(job, source, config, m)
+            meta_path = self.cache_dir / f"{key}.meta"
+            meta = P.read_kv(meta_path)
+            paths = [meta_path]
+            if meta and meta.get("file"):
+                paths.append(self.cache_dir / meta["file"])
+            for p in paths:
+                try:
+                    p.unlink()
+                    log.debug("dropped cached %s result %s", m, p.name)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    log.warning("cannot drop cached result %s: %s", p, exc)
 
     def _cache_lookup(self, key: str) -> tuple[Path, dict[str, str]] | None:
         meta = P.read_kv(self.cache_dir / f"{key}.meta")
@@ -800,11 +882,14 @@ class Daemon:
                 raise JobError(f"Media file not found: {r.media}")
             source = self.resolver(r)
             config = self.config_loader()
-            key = self.cache_key(job, source, config)
+            mode = effective_mode(r, config)
+            if r.mode and hasattr(config, "with_mode"):
+                config = config.with_mode(r.mode)
+            key = self.cache_key(job, source, config, mode)
             out_dir = job.queue_dir / P.OUT_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            cached = None if r.force else self._cache_lookup(key)
+            cached = None if r.force else self._cached_result(job, source, config)
             if cached is not None:
                 cached_file, meta = cached
                 dest = out_dir / f"{r.id}{cached_file.suffix}"
@@ -815,7 +900,7 @@ class Daemon:
                 done.progress = 1.0
                 done.output = str(dest)
                 done.time = None
-                log.info("job %s: cache hit (%s)", r.id, key[:12])
+                log.info("job %s: cache hit (mode %s)", r.id, mode)
                 writer.write(done, force=True)
                 return done
 
@@ -864,10 +949,15 @@ class Daemon:
             )
             writer.write(done, force=True)
             self._cache_store(key, output, done)
+            if r.force:
+                # the user asked for a fresh result: it must not be shadowed by an
+                # older result of another (more thorough) mode on the next open
+                self._cache_drop_other_modes(job, source, config, mode)
             log.info(
-                "job %s done in %.1fs: %s (applied=%s)",
+                "job %s done in %.1fs (mode %s): %s (applied=%s)",
                 r.id,
                 time.monotonic() - started,
+                mode,
                 done.message,
                 done.applied,
             )

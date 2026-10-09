@@ -1,12 +1,16 @@
 --[==========================================================================[
  subsync_ext.lua -- VLC SubSync companion extension (View > SubSync)
 
- Menu: "Sync subtitles now", "Auto-sync: ON/OFF" (toggle), "Load synced
- result" (only while a fallback job exists), "Status…".
+ Menu: "Sync subtitles now", "Sync now (exhaustive)", "Auto-sync: ON/OFF"
+ (toggle), "Status…", "Load synced result" (only while a fallback job exists).
 
  It talks to the interface script (lua/intf/subsync.lua) only through
- <q>/control (written here: auto=1|0, sync_now=<counter>) and <q>/intf_state
+ <q>/control (written here: auto=1|0, sync_now=<counter>, plus
+ sync_now_mode=exhaustive for the exhaustive item) and <q>/intf_state
  (read here), where <q> = vlc.config.userdatadir().."/subsync".
+ "Sync now (exhaustive)" asks the helper to transcribe the whole file in
+ consecutive 30 s windows (request key mode=exhaustive): more accurate on
+ hard files, but it can take minutes (much longer on CPU).
  If the interface script is not running (intf_state missing/stale), "Sync
  subtitles now" falls back to writing the request itself; because extensions
  cannot run a loop, the result is loaded when the user clicks "Load synced
@@ -35,7 +39,9 @@ E.VERSION = "0.1.0"
 E.INTF_MAX_AGE = 15      -- intf_state older than this => intf not running
 E.HEARTBEAT_MAX_AGE = 10
 
-local MENU_SYNC, MENU_AUTO, MENU_STATUS, MENU_LOAD = 1, 2, 3, 4
+-- VLC lists menu entries in id order.
+local MENU_SYNC, MENU_SYNC_EXH, MENU_AUTO, MENU_STATUS, MENU_LOAD = 1, 2, 3, 4, 5
+E.EXHAUSTIVE = "exhaustive"
 
 local ST = {
     dialog = nil,
@@ -168,12 +174,15 @@ function E.auto_enabled()
     return not (a == "0" or a == "off" or a == "false")
 end
 
-function E.write_control(auto, sync_now)
+-- `mode` (optional) applies to this sync_now increment ("" / nil = default mode).
+function E.write_control(auto, sync_now, mode)
     E.ensure_dirs()
-    return E.write_kv(join(E.queue_dir(), "control"), {
+    local kv = {
         { "auto", auto and 1 or 0 },
         { "sync_now", sync_now },
-    })
+    }
+    if mode and mode ~= "" then kv[#kv + 1] = { "sync_now_mode", mode } end
+    return E.write_kv(join(E.queue_dir(), "control"), kv)
 end
 
 -- Returns intf_state table (or nil) and whether the intf looks alive.
@@ -237,13 +246,13 @@ function E.current_selection()
              sub = s, sub_label = slabel, spu_ids = sids }
 end
 
-function E.fallback_sync()
+function E.fallback_sync(mode)
     local sel, why = E.current_selection()
     if not sel then return false, why end
     local q = E.ensure_dirs()
     ST.counter = ST.counter + 1
     local id = tostring(os.time()) .. "_e" .. ST.counter
-    local ok, err = E.write_kv(join(join(q, "requests"), id .. ".req"), {
+    local kv = {
         { "version", 1 },
         { "id", id },
         { "media", sel.media },
@@ -253,9 +262,11 @@ function E.fallback_sync()
         { "sub_label", sel.sub_label },
         { "sub_path", "" },
         { "force", 0 },
-    })
+    }
+    if mode and mode ~= "" then kv[#kv + 1] = { "mode", mode } end
+    local ok, err = E.write_kv(join(join(q, "requests"), id .. ".req"), kv)
     if not ok then return false, "Cannot write request: " .. err end
-    ST.job = { id = id, media = sel.media, uri = sel.uri,
+    ST.job = { id = id, media = sel.media, uri = sel.uri, mode = mode,
                status_path = join(join(q, "jobs"), id .. ".status") }
     log_dbg("fallback request " .. id)
     return true
@@ -275,7 +286,8 @@ function E.check_job(load)
     local state = st.state or "queued"
     if state == "queued" or state == "running" then
         local p = math.floor((tonumber(st.progress) or 0) * 100 + 0.5)
-        return string.format("Syncing… %d%% %s", p, st.message or "")
+        local slow = (job.mode == E.EXHAUSTIVE) and " (exhaustive, may take a while)" or ""
+        return string.format("Syncing%s… %d%% %s", slow, p, st.message or "")
     elseif state == "error" then
         ST.job = nil
         return "Error: " .. (st.message or "unknown")
@@ -389,23 +401,46 @@ end
 
 ---------------------------------------------------------------- actions
 
-function E.sync_now()
-    local _, i_alive = E.intf_status()
+-- True if the running intf (its intf_state `st`) understands sync_now_mode=`mode`.
+-- Interface scripts from before sync modes do not write the `modes` key.
+function E.intf_supports(st, mode)
+    local modes = st and st.modes
+    if not modes then return false end
+    for m in modes:gmatch("[^,%s]+") do
+        if m == mode then return true end
+    end
+    return false
+end
+
+-- `mode`: nil/"" = the helper's configured mode, or "exhaustive".
+function E.sync_now(mode)
+    local exhaustive = mode == E.EXHAUSTIVE
+    local st, i_alive = E.intf_status()
+    if i_alive and mode and mode ~= "" and not E.intf_supports(st, mode) then
+        -- An interface script from before sync modes (still running after an
+        -- upgrade, until VLC restarts) would ignore sync_now_mode and run a normal
+        -- sync; a request of our own would race with it over the loaded track.
+        E.show_status("The running SubSync interface script is from an older version"
+            .. " and cannot run a " .. mode .. " sync. Restart VLC, then try again.")
+        return
+    end
     if i_alive then
         local c = E.read_control()
         local n = (tonumber(c.sync_now) or 0) + 1
         local auto = c.auto ~= "0"
-        local ok, err = E.write_control(auto, n)
+        local ok, err = E.write_control(auto, n, mode)
         if not ok then
             E.show_status("Cannot write control file: " .. tostring(err))
             return
         end
-        osd("SubSync: sync requested")
+        osd(exhaustive and "SubSync: exhaustive sync requested (may take a while)"
+            or "SubSync: sync requested")
         return
     end
-    local ok, why = E.fallback_sync()
+    local ok, why = E.fallback_sync(mode)
     if ok then
-        osd("Syncing subtitles…")
+        osd(exhaustive and "Syncing subtitles (exhaustive, may take a while)…"
+            or "Syncing subtitles…")
         E.show_status("Sync requested. The SubSync interface script is not running, so"
             .. " click “Load synced result” when the job is done (or reopen this dialog"
             .. " from the menu).")
@@ -461,6 +496,7 @@ end
 function menu()
     local m = {}
     m[MENU_SYNC] = "Sync subtitles now"
+    m[MENU_SYNC_EXH] = "Sync now (exhaustive)"
     local ok, auto = pcall(E.auto_enabled)
     m[MENU_AUTO] = "Auto-sync: " .. ((not ok or auto) and "ON" or "OFF")
     if ST.job and not ST.job.loaded then m[MENU_LOAD] = "Load synced result" end
@@ -472,6 +508,8 @@ function trigger_menu(id)
     local ok, err = pcall(function()
         if id == MENU_SYNC then
             E.sync_now()
+        elseif id == MENU_SYNC_EXH then
+            E.sync_now(E.EXHAUSTIVE)
         elseif id == MENU_AUTO then
             E.toggle_auto()
         elseif id == MENU_LOAD then

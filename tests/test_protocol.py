@@ -36,6 +36,25 @@ def test_request_file_format_matches_design(tmp_path):
     assert "force=0" in lines
 
 
+@pytest.mark.parametrize("mode", ["fast", "thorough", "exhaustive"])
+def test_request_roundtrip_with_mode(tmp_path, mode):
+    req = P.Request(id="m1", media="/m.mkv", sub_index=0, mode=mode)
+    path = P.write_request(tmp_path, req)
+    assert f"mode={mode}" in path.read_text(encoding="utf-8").splitlines()
+    assert P.read_request(path) == req
+
+
+def test_request_mode_optional_and_validated(tmp_path):
+    # no mode -> no key written (old daemons/readers are unaffected)
+    path = P.write_request(tmp_path, P.Request(id="m2", media="/m.mkv", sub_index=0))
+    assert "mode" not in P.read_kv(path)
+    assert P.read_request(path).mode == ""
+    base = {"id": "m3", "media": "/m.mkv"}
+    assert P.Request.from_dict({**base, "mode": " Exhaustive "}).mode == "exhaustive"
+    assert P.Request.from_dict({**base, "mode": "turbo"}).mode == ""  # unknown: ignored
+    assert P.Request.from_dict({**base, "mode": ""}).mode == ""
+
+
 def test_status_roundtrip(tmp_path):
     st = P.Status(
         id="x_1",

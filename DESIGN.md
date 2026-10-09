@@ -59,6 +59,7 @@ src/vlcsubsync/
   sync.py                      # orchestration: sync_subtitles(...) -> SyncResult
   protocol.py                  # key=value file format, request/status dataclasses, atomic writes
   daemon.py                    # queue watcher, heartbeat, job runner, result cache
+  lifecycle.py                 # model unloading, process priority of the daemon
   setup_vlc.py                 # install/uninstall Lua scripts, vlcrc edits, autostart, dirs
   lua/intf/subsync.lua         # shipped as package data, copied into VLC by `setup`
   lua/extensions/subsync_ext.lua
@@ -455,10 +456,25 @@ queue name.
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)
 `mode=fast|thorough|exhaustive`, `model_en=base.en`, `model_multi=base`,
 `device=auto|cpu|cuda`, `compute_type=int8`, `windows=auto`, `verify_windows=auto`,
-`min_confidence=0.5`, `threads=0`, `sync_mode=track|delay` (experimental delay mode,
-default track; reported to the intf in each done status). Invalid values are ignored
-(default kept).
+`min_confidence=0.5`, `threads=0` (= `max(1, min(8, cpu_count // 2))`, leaving half
+the cores to VLC), `sync_mode=track|delay` (how VLC applies a result: experimental delay
+mode, default track; reported to the intf in each done status). Invalid values are
+ignored (default kept).
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
+
+## Daemon resources
+
+**Models**: 60 s after the last job that ran the engine, the *worker thread* calls
+`transcribe.clear_cache()` (drops each model under its transcriber lock), drops the
+Silero VAD, runs `gc.collect()` and `malloc_trim(0)`, and logs the RSS before/after.
+Running on the worker means it can never overlap a job. The 7-day result cache is
+unchanged.
+
+**Priority** (`lifecycle.lower_priority`, at `serve` start before any thread, since
+Linux nice/ioprio are per thread and inherited): nice ≥ 10 (never lowered), Linux
+`SCHED_BATCH` + idle I/O class via `ioprio_set` (raw syscall through ctypes, known
+arches only), Windows `BELOW_NORMAL_PRIORITY_CLASS`. Every step is best effort and
+never raises. `VLC_SUBSYNC_PRIORITY=normal` skips it (tests).
 
 ## Installation UX
 * Linux/macOS: `curl -LsSf https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.sh | sh`

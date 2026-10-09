@@ -100,6 +100,11 @@ service or desktop autostart entry on Linux, a LaunchAgent on macOS, a Startup-f
 shortcut on Windows. The two sides talk through small files in VLC's own data folder,
 which also works for the sandboxed snap and flatpak builds of VLC.
 
+While it runs a sync, the helper uses low priority (nice 10 and idle disk priority on
+Linux, background priority on macOS, "below normal" on Windows) and at most half your
+CPU cores, so playback stays smooth. It frees the speech model from memory a minute
+after the last sync.
+
 Step 5 in more detail: SubSync first fits one timing line (offset and, if the
 subtitles were made for another frame rate, a drift factor) per section of the video.
 It then checks each section in the middle, transcribing one more sample there if
@@ -160,7 +165,7 @@ windows=auto            # number of 30 s audio samples to transcribe, or auto (p
                         # a number is ignored in exhaustive mode, which covers everything
 verify_windows=auto     # extra samples the section check may transcribe (0 = none)
 min_confidence=0.5      # below this the original timing is kept (0..1)
-threads=0               # CPU threads, 0 = automatic
+threads=0               # CPU threads, 0 = automatic (half the cores, at most 8)
 sync_mode=track         # track | delay (EXPERIMENTAL, see below)
 ```
 

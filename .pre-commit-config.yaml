@@ -2,7 +2,7 @@
 exclude: ^tests/fixtures/
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
@@ -17,13 +17,13 @@ repos:
   # Renovate updates this rev; the lint job in .github/workflows/ci.yml pins the same
   # ruff version (RUFF_VERSION) and is bumped together with it. Keep both in sync.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.10
+    rev: f12be1ebaa5351c1fc76472de98db2c3446c8253  # frozen: v0.16.10
     hooks:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
   - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: v0.11.0.1-1
+    rev: a6564f5d57444e123433a5c9af733e3975c77229  # frozen: v0.11.0.1-1
     hooks:
       - id: shellcheck
   # luacheck via luarocks is not available everywhere; run it when installed
@@ -36,6 +36,6 @@ repos:
         types: [lua]
         entry: sh -c 'if command -v luacheck >/dev/null; then luacheck "$@"; else echo "luacheck not installed, skipping"; fi' --
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.12
+    rev: 914e7df21a07ef503a81201c76d2b11c789d3fca  # frozen: v1.7.12
     hooks:
       - id: actionlint

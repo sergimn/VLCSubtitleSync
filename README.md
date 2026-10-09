@@ -40,7 +40,10 @@ powershell -c "irm https://github.com/sergimn/VLCSubtitleSync/releases/latest/do
 ```
 
 Then **restart VLC**. The first install downloads about 200 MB (Python runtime,
-speech-recognition libraries and the English model).
+speech-recognition libraries and the English model). On Windows, if the Microsoft
+Visual C++ runtime is missing (most PCs already have it), the installer adds it and
+Windows asks once for permission. Windows on ARM PCs are supported (the helper runs
+as an x64 program under emulation).
 
 SubSync is also listed on [VLC's add-ons site](https://www.opendesktop.org/p/2377843/),
 where the download is the same installers in a zip.

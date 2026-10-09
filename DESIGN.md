@@ -496,6 +496,12 @@ The daemon loads the config for every job.
 * Linux/macOS: `curl -LsSf https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.sh | sh`
 * Windows: double-click `install.cmd` (or `irm …/install.ps1 | iex`).
 Steps: install `uv` if missing → `uv tool install --python 3.12 vlc-subsync@<archive url>`
+(Windows on ARM: `cpython-3.12-windows-x86_64-none`, since ctranslate2 has no win_arm64
+wheels; the helper runs under x64 emulation) → on Windows, import the speech engine
+(`av, ctranslate2, onnxruntime, faster_whisper`) and, if that fails, install the
+Visual C++ 2015-2022 x64 runtime (`aka.ms/vs/17/release/vc_redist.x64.exe`, one UAC
+prompt) and check again; a fresh Windows may lack it and the wheels need it
+(ctranslate2.dll, onnxruntime) → fail rather than report success if it still fails
 → `vlc-subsync setup` which: copies Lua scripts into every detected VLC (native,
 snap, flatpak), lists them as one "SubSync" add-on (icon, summary, description) in
 that VLC's `<userdatadir>/catalog.xml` (without an entry there, VLC's Addons Manager

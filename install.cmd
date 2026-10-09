@@ -2,6 +2,9 @@
 rem SubSync (vlc-subsync) installer for Windows: double-click to install.
 rem Pass --uninstall (or -Uninstall) to remove. Other arguments go to "vlc-subsync setup".
 setlocal
+rem From a PowerShell 7 prompt, its PSModulePath makes Windows PowerShell load PowerShell 7's
+rem modules, which fail ("module could not be loaded"). Let powershell.exe use its defaults.
+set "PSModulePath="
 set "PS1=%~dp0install.ps1"
 if exist "%PS1%" goto run
 set "PS1=%TEMP%\vlc-subsync-install.ps1"

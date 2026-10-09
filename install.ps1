@@ -6,7 +6,8 @@
 # Environment:
 #   VLC_SUBSYNC_SOURCE     package source (default: GitHub main branch archive);
 #                          may be a local checkout directory for testing
-#   VLC_SUBSYNC_PYTHON     Python version (default 3.12)
+#   VLC_SUBSYNC_PYTHON     Python version or uv Python request (default 3.12; x64 Python
+#                          on Windows on ARM, where the speech engine has no ARM64 build)
 #   VLC_SUBSYNC_UNINSTALL  set to 1 to uninstall (for `irm | iex`, which takes no args)
 
 param(
@@ -20,6 +21,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 $DefaultSource = 'https://github.com/sergimn/VLCSubtitleSync/archive/refs/heads/main.zip'
 $Source = if ($env:VLC_SUBSYNC_SOURCE) { $env:VLC_SUBSYNC_SOURCE } else { $DefaultSource }
 $PyVer = if ($env:VLC_SUBSYNC_PYTHON) { $env:VLC_SUBSYNC_PYTHON } else { '3.12' }
+$VcRedistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
 if ($env:VLC_SUBSYNC_UNINSTALL -eq '1') { $Uninstall = $true }
 if (-not $SetupArgs) { $SetupArgs = @() }
 
@@ -43,6 +45,36 @@ function Get-ToolBinDir($uv) {
     $dir = (& $uv tool dir --bin --color never) | Select-Object -Last 1
     if ($LASTEXITCODE -ne 0 -or -not $dir) { return $null }
     return $dir.Trim()
+}
+
+function Test-Arm64 {
+    if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { return $true }
+    try {
+        return [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() -eq 'Arm64'
+    } catch { return $false }
+}
+
+# The speech engine (ctranslate2, onnxruntime) needs the Microsoft Visual C++ runtime, which
+# a fresh Windows does not always have. Returns $null when everything imports, else the error.
+function Test-Engine($py) {
+    $ErrorActionPreference = 'Continue'  # stderr of a native command must not throw here
+    $out = & $py -c 'import av, ctranslate2, onnxruntime, faster_whisper' 2>&1
+    if ($LASTEXITCODE -eq 0) { return $null }
+    $last = $out | Select-Object -Last 1
+    if ($null -eq $last) { return "python exited with code $LASTEXITCODE" }
+    return $last.ToString().Trim()
+}
+
+function Install-VcRuntime {
+    $file = Join-Path $env:TEMP 'vc_redist.x64.exe'
+    Invoke-WebRequest -UseBasicParsing -Uri $VcRedistUrl -OutFile $file
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $admin = ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $sp = @{ FilePath = $file; ArgumentList = '/install /quiet /norestart'; Wait = $true; PassThru = $true }
+    if (-not $admin) { $sp.Verb = 'RunAs' }  # UAC prompt; throws if the user declines
+    $p = Start-Process @sp
+    Remove-Item $file -ErrorAction SilentlyContinue
+    return $p.ExitCode
 }
 
 function Invoke-Main {
@@ -79,6 +111,12 @@ function Invoke-Main {
     }
     Say "Using uv: $uv"
 
+    if (-not $env:VLC_SUBSYNC_PYTHON -and (Test-Arm64)) {
+        # ctranslate2 publishes no Windows ARM64 wheels; x64 Python runs under emulation.
+        $PyVer = "cpython-$PyVer-windows-x86_64-none"
+        Say 'Windows on ARM: using x64 Python (the speech engine has no ARM64 build)'
+    }
+
     $spec = "vlc-subsync @ $Source"
     if (Test-Path -LiteralPath $Source) {
         $abs = (Resolve-Path -LiteralPath $Source).Path
@@ -93,6 +131,24 @@ function Invoke-Main {
     if (-not $bin) { Fail 'cannot determine the uv tool bin directory' }
     $exe = Join-Path $bin 'vlc-subsync.exe'
     if (-not (Test-Path $exe)) { Fail "vlc-subsync.exe not found in $bin" }
+
+    $toolDir = (& $uv tool dir --color never) | Select-Object -Last 1
+    $py = if ($toolDir) { Join-Path $toolDir.Trim() 'vlc-subsync\Scripts\python.exe' } else { $null }
+    if ($py -and (Test-Path $py)) {
+        $err = Test-Engine $py
+        if ($err) {
+            Say "The speech engine cannot load yet ($err)"
+            Say 'Installing the Microsoft Visual C++ runtime it needs (Windows may ask for permission)'
+            try { $code = Install-VcRuntime } catch {
+                Fail "could not install the Microsoft Visual C++ runtime ($_). Install it from $VcRedistUrl, then run this installer again"
+            }
+            if ($code -notin 0, 1638, 3010) { Warn "the Visual C++ runtime installer exited with code $code" }
+            $err = Test-Engine $py
+            if ($err) { Fail "the speech engine still cannot load: $err" }
+        }
+    } else {
+        Warn 'cannot find the SubSync Python; skipping the speech engine check'
+    }
 
     Say 'Configuring VLC'
     & $exe setup @SetupArgs

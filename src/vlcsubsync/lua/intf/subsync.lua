@@ -1391,8 +1391,9 @@ function M.shutdown()
     log_dbg("stopped")
 end
 
-if rawget(_G, "SUBSYNC_TEST") then
-    _G.subsync = M
+-- plain globals only, as in the extension (VLC runs extensions without rawget)
+if SUBSYNC_TEST then
+    subsync = M
 else
     M.run()
 end

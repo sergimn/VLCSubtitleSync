@@ -1180,6 +1180,21 @@ def ext(runtime, tmp_path):
     return Harness(runtime, tmp_path, EXT)
 
 
+@pytest.mark.parametrize("script", [INTF, EXT], ids=["intf", "ext"])
+def test_loads_without_rawget(runtime, script):
+    # VLC's extension loader has no rawget; the script used to die on its last line
+    # (the test hook), so VLC listed it in the Addons Manager but never loaded it.
+    lua = importlib.import_module(f"lupa.{runtime}").LuaRuntime()
+    lua.execute("rawget = nil; vlc = setmetatable({}, {__index = function() return {} end})")
+    if script == EXT:
+        lua.execute(f"dofile({str(script)!r})")
+        assert lua.eval("descriptor().shortdesc") == "SubSync"
+    else:
+        lua.execute("SUBSYNC_TEST = true")
+        lua.execute(f"dofile({str(script)!r})")
+        assert lua.eval("type(subsync)") == "table"
+
+
 def write_intf_state(
     hh: Harness, age=0, state="idle", last_result="", modes="fast,thorough,exhaustive"
 ):

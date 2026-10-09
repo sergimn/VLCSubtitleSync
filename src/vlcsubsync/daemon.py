@@ -494,6 +494,7 @@ class _Job:
     received: float = field(default_factory=time.time)
     cancel: threading.Event = field(default_factory=threading.Event)
     cancel_reason: str = ""
+    mode: str | None = None  # effective sync mode, set when the job starts running
 
     @property
     def media_key(self) -> tuple[str, str]:
@@ -505,14 +506,17 @@ class _Job:
         return (r.audio_index, r.sub_index, r.sub_path)
 
 
-def _mode_switch(running: _Job, new: _Job) -> bool:
+def _mode_switch(running: _Job, new: _Job, config: Any) -> bool:
     """The user asked for another sync mode for the running job's tracks: an explicit
-    ``mode=`` that differs ("Sync now (exhaustive)" during a fast run), or a forced
-    request in another mode ("Sync subtitles now" during an exhaustive run). Automatic
-    requests (no mode, no force) never cancel a running job."""
-    a = normalize_mode(running.request.mode)
-    b = normalize_mode(new.request.mode)
-    return a != b and (b is not None or new.request.force)
+    ``mode=`` whose effective mode differs ("Sync now (exhaustive)" during a fast run),
+    or a forced request in another mode ("Sync subtitles now" during an exhaustive
+    run). Automatic requests (no mode, no force) never cancel a running job. Modes are
+    compared after falling back to the config's, so with ``mode=exhaustive`` configured
+    "Sync now (exhaustive)" does not restart the exhaustive run it would repeat."""
+    if normalize_mode(new.request.mode) is None and not new.request.force:
+        return False
+    a = running.mode or effective_mode(running.request, config)
+    return a != effective_mode(new.request, config)
 
 
 class _StatusWriter:
@@ -734,6 +738,13 @@ class Daemon:
         self.enqueue(_Job(request=request, queue_dir=queue_dir))
         return True
 
+    def _config_for_enqueue(self) -> Any:
+        try:
+            return self.config_loader()
+        except Exception:  # noqa: BLE001
+            log.exception("cannot load the config to compare sync modes")
+            return None
+
     def enqueue(self, job: _Job) -> None:
         superseded: list[_Job] = []
         with self._cond:
@@ -748,7 +759,10 @@ class Daemon:
             if (
                 running is not None
                 and running.media_key == job.media_key
-                and (running.params != job.params or _mode_switch(running, job))
+                and (
+                    running.params != job.params
+                    or _mode_switch(running, job, self._config_for_enqueue())
+                )
             ):
                 running.cancel_reason = "Superseded by a newer request"
                 running.cancel.set()
@@ -985,6 +999,7 @@ class Daemon:
             source = self.resolver(r)
             config = self.config_loader()
             mode = effective_mode(r, config)
+            job.mode = mode
             if r.mode and hasattr(config, "with_mode"):
                 config = config.with_mode(r.mode)
             key = self.cache_key(job, source, config, mode)

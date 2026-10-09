@@ -292,6 +292,33 @@ def test_mode_switch_cancels_running(env, first, second, cancels):
         h.wait_state("m_2", "done")
 
 
+@pytest.mark.parametrize(
+    "first,second,cancels",
+    [
+        ({}, {"mode": "exhaustive"}, False),  # already exhaustive via the config
+        ({"mode": "exhaustive"}, {"force": True}, False),  # forced, same effective mode
+        ({}, {"mode": "fast"}, True),
+        ({"mode": "fast"}, {"force": True}, True),
+    ],
+)
+def test_mode_switch_compares_effective_modes(env, first, second, cancels):
+    m1 = make_media(env)
+    runner = FakeRunner(block=True)
+    config = SimpleNamespace(model_en="base.en", model_multi="base", mode="exhaustive")
+    with Harness(env, runner, config_loader=lambda: config) as h:
+        h.submit("e_1", m1, sub_index=0, **first)
+        h.wait_state("e_1", "running")
+        h.submit("e_2", m1, sub_index=0, **second)
+        h.wait_state("e_2", "queued", "running", "done")
+        if cancels:
+            assert "Superseded" in h.wait_state("e_1", "error").message
+        else:
+            time.sleep(0.2)
+            assert h.status("e_1").state == "running"
+        runner.release.set()
+        h.wait_state("e_2", "done")
+
+
 def test_cache_hit_and_force(env):
     media = make_media(env)
     runner = FakeRunner()

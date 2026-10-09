@@ -685,3 +685,20 @@ def test_cache_key_includes_configured_mode(env):
     keys = {m: d.cache_key(job, src, Config(mode=m)) for m in ("fast", "thorough", "exhaustive")}
     assert len(set(keys.values())) == 3
     assert d.cache_key(job, src, Config(mode="bogus")) == keys["fast"]
+
+
+def test_unlink_retry_survives_a_transient_sharing_violation(tmp_path, monkeypatch):
+    target = tmp_path / "x.meta"
+    target.write_text("applied=1\n")
+    real_unlink = Path.unlink
+    calls = []
+
+    def flaky_unlink(self, *a, **kw):
+        calls.append(self)
+        if len(calls) < 3:
+            raise PermissionError(32, "being used by another process")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    D._unlink_retry(target, delay=0)
+    assert not target.exists() and len(calls) == 3

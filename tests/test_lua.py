@@ -1367,10 +1367,9 @@ def test_ext_cache_toggle_writes_control(ext):
     ext.lua.eval("trigger_menu(4)")
     assert "Cached results:</b> not used" in ext.mock.last_dialog.widgets[1].text
     # other control writes keep the choice
-    ext.lua.eval("trigger_menu(1)")
-    ext.lua.eval("trigger_menu(3)")
-    ext.lua.eval("trigger_menu(6)")
-    assert parse_kv(ext.q / "control")["cache"] == "off"
+    for item in (1, 2, 3, 6):
+        ext.lua.eval(f"trigger_menu({item})")
+        assert parse_kv(ext.q / "control")["cache"] == "off"
     ext.lua.eval("trigger_menu(7)")
     assert parse_kv(ext.q / "control")["cache"] == "on"
     assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: ON"
@@ -1381,6 +1380,12 @@ def test_ext_cache_menu_reflects_helper_config(ext):
     assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: OFF"
     ext.lua.eval("trigger_menu(7)")  # toggling turns it on explicitly
     assert parse_kv(ext.q / "control")["cache"] == "on"
+
+
+def test_ext_cache_toggle_accepts_helper_spellings(ext):
+    ext.heartbeat(cache="on")
+    ext.control(auto=1, sync_now=0, cache=" 0 ")  # hand-written; the helper reads it as off
+    assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: OFF"
 
 
 def test_ext_cache_toggle_without_helper_explains(ext):

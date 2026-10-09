@@ -194,7 +194,9 @@ leaves stored results untouched (a forced sync drops no other mode's entry);
 every control write) wins over it for jobs from that queue dir.
 `vlc-subsync clear-cache` deletes the results dir (`D.clear_results_cache`); so does
 the daemon when it finds `<q>/clear_cache` (the extension's "Delete cached results"),
-which it removes first. A cache hit whose file vanished meanwhile re-syncs.
+which it removes first (a job running then still stores its result afterwards). A
+cache hit whose file vanished meanwhile re-syncs. Housekeeping removes a
+`clear_cache.tmp` older than an hour (VLC died mid-write).
 Effective mode = the request's `mode=`, else the config's. A lookup tries the
 exhaustive key, then thorough, down to the job's own mode: a result of a *more*
 thorough mode also answers a later cheaper request for the same file and tracks

@@ -396,6 +396,66 @@ def test_clear_cache_command_from_vlc(env):
         assert len(runner.calls) == 2  # synced again
 
 
+def test_control_cache_invalid_value_falls_back_to_config(env, tmp_path):
+    from vlcsubsync.config import Config
+
+    q = tmp_path / "q"
+    q.mkdir()
+    P.write_kv(q / P.CONTROL_FILE, {"cache": "maybe"})
+    assert D.Daemon.cache_enabled(q, Config(cache=False)) is False
+    assert D.Daemon.cache_enabled(q, Config()) is True
+    P.write_kv(q / P.CONTROL_FILE, {"cache": "0"})
+    assert D.Daemon.cache_enabled(q, Config()) is False
+    assert D.Daemon.cache_enabled(tmp_path / "none", SimpleNamespace()) is True
+
+
+def test_heartbeat_cache_when_config_fails(env):
+    def broken():
+        raise RuntimeError("bad config")
+
+    with Harness(env, FakeRunner(), config_loader=broken):
+        wait_for(lambda: (hb := P.read_heartbeat(env.queue)) and hb.cache is True)
+    assert "cache" not in P.Heartbeat(time=1, pid=2, version="x").to_dict()
+
+
+def test_poll_commands_clears_once_and_retries_locked_file(env, monkeypatch):
+    q1, q2 = env.tmp / "q1", env.tmp / "q2"
+    d = D.Daemon(
+        [q1, q2],
+        use_default_queues=False,
+        runner=FakeRunner(),
+        cache_dir=env.tmp / "c",
+        lock_path=env.tmp / "l",
+    )
+    d.scan_queue_dirs()
+    (env.tmp / "c").mkdir()
+    (env.tmp / "c" / "k.meta").write_text("file=k.srt\n")
+    calls = []
+    monkeypatch.setattr(D, "clear_results_cache", lambda c: calls.append(c) or (1, 0))
+    for q in (q1, q2):
+        P.write_kv(q / P.CLEAR_CACHE_FILE, {"time": 1})
+    assert d.poll_commands() == 1 and len(calls) == 1  # both asked: one clear
+    assert d.poll_commands() == 0 and len(calls) == 1
+    # a locked file (Windows) is taken on a later poll
+    P.write_kv(q1 / P.CLEAR_CACHE_FILE, {"time": 1})
+    real_unlink = Path.unlink
+    monkeypatch.setattr(Path, "unlink", lambda self, *a: (_ for _ in ()).throw(PermissionError()))
+    assert d.poll_commands() == 0 and (q1 / P.CLEAR_CACHE_FILE).exists()
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    assert d.poll_commands() == 1 and len(calls) == 2
+
+
+def test_clear_cache_file_present_at_start_is_handled(env):
+    cache = env.tmp / "cache" / "results"
+    cache.mkdir(parents=True)
+    (cache / "k.meta").write_text("file=k.srt\n")
+    (env.queue).mkdir(parents=True)
+    P.write_kv(env.queue / P.CLEAR_CACHE_FILE, {"time": 1})
+    with Harness(env, FakeRunner()):
+        wait_for(lambda: not cache.exists())
+    assert not (env.queue / P.CLEAR_CACHE_FILE).exists()
+
+
 def test_cache_entry_deleted_before_copy_resyncs(env, monkeypatch):
     """`clear-cache` between the lookup and the copy: the job syncs again."""
     media = make_media(env)

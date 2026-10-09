@@ -67,7 +67,7 @@ From the menu **View → SubSync** you can:
 | Status… | show what SubSync is doing and the last result |
 | Experimental: no extra track (live delay): ON/OFF | correct the subtitle track you picked instead of adding a synced copy (remembered; see [below](#experimental-no-extra-subtitle-track-live-delay)) |
 | Use cached results: ON/OFF | for debugging: OFF syncs every time and stores nothing (remembered; overrides `cache=` in `config.ini`) |
-| Delete cached results | for debugging: delete every stored result, like `vlc-subsync clear-cache` |
+| Delete cached results | for debugging: delete every stored result, like `vlc-subsync clear-cache` (a sync running at that moment still stores its own) |
 
 > The extension has to be enabled once per VLC session from the View menu. Automatic
 > syncing does not need it.
@@ -189,7 +189,9 @@ every sync, so a change applies to the next one.
 Results are kept for 7 days after their last use. To debug, set `cache=off` (or turn
 off **View → SubSync → Use cached results**) so every sync runs again and nothing is
 stored, or run `vlc-subsync clear-cache` (**Delete cached results** in the menu) to
-delete what is stored. The menu toggle wins over `config.ini` once you have used it.
+delete what is stored. The menu toggle wins over `config.ini` once you have used it,
+until you delete the `subsync/control` file in VLC's data folder. Each VLC install
+(for example snap and non-snap) has its own toggle; they share one cache.
 
 ### Sync modes
 

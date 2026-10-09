@@ -667,10 +667,11 @@ class Daemon:
 
     # ---------------------------------------------------------------- heartbeat
     def write_heartbeats(self) -> None:
+        # always report a value: the extension takes a missing key for an old helper
         try:
-            cache = parse_bool(getattr(self.config_loader(), "cache", True))
+            cache = parse_bool(getattr(self.config_loader(), "cache", True)) is not False
         except Exception:  # noqa: BLE001
-            cache = None
+            cache = True
         hb = P.Heartbeat(time=time.time(), pid=os.getpid(), version=self.version, cache=cache)
         for q in self.queue_dirs:
             try:
@@ -701,7 +702,11 @@ class Daemon:
                 log.debug("cannot take %s yet: %s", q / P.CLEAR_CACHE_FILE, exc)
         if not asked:
             return 0
-        removed, left = clear_results_cache(self.cache_dir)
+        try:
+            removed, left = clear_results_cache(self.cache_dir)
+        except OSError as exc:
+            log.warning("cannot delete the result cache: %s", exc)
+            return 0
         log.info(
             "deleted %d cached result(s) as asked from VLC%s",
             removed,
@@ -1154,6 +1159,12 @@ class Daemon:
         for q in self.queue_dirs:
             dirs += [(q / P.JOBS_DIR, self.max_age), (q / P.OUT_DIR, self.max_age)]
             dirs += [(q / P.REQUESTS_DIR, 3600.0), (q / L.REJECTED_DIR, self.max_age)]
+            # left behind if VLC died while the extension wrote it
+            stale = q / f"{P.CLEAR_CACHE_FILE}{P.TMP_SUFFIX}"
+            with contextlib.suppress(OSError):
+                if now - stale.stat().st_mtime > 3600.0:
+                    stale.unlink()
+                    removed += 1
         dirs.append((self.cache_dir, self.max_age))
         active_ids = set()
         with self._cond:
@@ -1254,6 +1265,9 @@ class Daemon:
                     last_hb = now
                 try:
                     self.poll_commands()
+                except Exception:  # noqa: BLE001
+                    log.exception("error while handling commands")
+                try:
                     self.poll_requests()
                 except Exception:  # noqa: BLE001
                     log.exception("error while polling requests")

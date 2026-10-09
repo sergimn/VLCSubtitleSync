@@ -200,11 +200,12 @@ function E.delay_enabled()
     return st ~= nil and st.sync_mode == "delay"
 end
 
--- "on" / "off" if the cache toggle was used, else nil (the helper's config decides)
+-- "on" / "off" if the cache toggle was used, else nil (the helper's config decides).
+-- Accepts what the helper accepts (config.parse_bool).
+local CACHE_VALUES = { on = "on", ["1"] = "on", ["true"] = "on", yes = "on",
+    off = "off", ["0"] = "off", ["false"] = "off", no = "off" }
 function E.control_cache(c)
-    local v = ((c or E.read_control()).cache or ""):lower()
-    if v == "on" or v == "off" then return v end
-    return nil
+    return CACHE_VALUES[trim((c or E.read_control()).cache or ""):lower()]
 end
 
 -- Result cache in effect: the toggle's choice, else the helper's config.ini (its

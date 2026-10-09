@@ -1197,8 +1197,7 @@ class Daemon:
                 segments=_segments_or_none(result),
                 sync_mode=_sync_mode(config),
             )
-            # Cached before "done" is written: a cache-only probe, which skips the
-            # queue, may arrive as soon as the intf sees "done".
+            writer.write(done, force=True)
             if not use_cache:
                 log.debug("job %s: result cache off, not stored", r.id)
             else:
@@ -1207,7 +1206,6 @@ class Daemon:
                     # the user asked for a fresh result: it must not be shadowed by an
                     # older result of another (more thorough) mode on the next open
                     self._cache_drop_other_modes(job, source, config, mode)
-            writer.write(done, force=True)
             log.info(
                 "job %s done in %.1fs (mode %s): %s (applied=%s)",
                 r.id,

@@ -42,7 +42,7 @@
 
 local E = {}
 
-E.VERSION = "0.1.0"
+E.VERSION = "1.0.0"
 E.INTF_MAX_AGE = 15      -- intf_state older than this => intf not running
 E.HEARTBEAT_MAX_AGE = 10
 

@@ -47,6 +47,18 @@ function Get-ToolBinDir($uv) {
     return $dir.Trim()
 }
 
+# The Python of the SubSync tool environment. SubSync's own commands run through it, not
+# through vlc-subsync.exe: uv makes that launcher on install, so Smart App Control and
+# App Control policies know nothing about it and block it, while python.exe is the same
+# file on every PC.
+function Get-ToolPython($uv) {
+    $dir = (& $uv tool dir --color never) | Select-Object -Last 1
+    if ($LASTEXITCODE -ne 0 -or -not $dir) { return $null }
+    $py = Join-Path $dir.Trim() 'vlc-subsync\Scripts\python.exe'
+    if (Test-Path $py) { return $py }
+    return $null
+}
+
 function Test-Arm64 {
     if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { return $true }
     try {
@@ -105,10 +117,9 @@ function Invoke-Main {
     if ($Uninstall) {
         Say 'Uninstalling SubSync'
         if (-not $uv) { Fail 'uv not found; nothing to uninstall?' }
-        $bin = Get-ToolBinDir $uv
-        $exe = if ($bin) { Join-Path $bin 'vlc-subsync.exe' } else { $null }
-        if ($exe -and (Test-Path $exe)) {
-            & $exe uninstall @SetupArgs
+        $py = Get-ToolPython $uv
+        if ($py) {
+            & $py -m vlcsubsync.cli uninstall @SetupArgs
             if ($LASTEXITCODE -ne 0) { Warn 'vlc-subsync uninstall reported problems' }
         } else {
             Warn 'vlc-subsync not found; skipping VLC cleanup'
@@ -154,28 +165,31 @@ function Invoke-Main {
     $exe = Join-Path $bin 'vlc-subsync.exe'
     if (-not (Test-Path $exe)) { Fail "vlc-subsync.exe not found in $bin" }
 
-    $toolDir = (& $uv tool dir --color never) | Select-Object -Last 1
-    $py = if ($toolDir) { Join-Path $toolDir.Trim() 'vlc-subsync\Scripts\python.exe' } else { $null }
-    if ($py -and (Test-Path $py)) {
-        Say 'Checking that the speech engine loads'
-        $err = Test-Engine $py
-        if ($err) {
-            Say "The speech engine cannot load yet ($err)"
-            Say 'Installing the Microsoft Visual C++ runtime it needs (Windows may ask for permission)'
-            try { $code = Install-VcRuntime } catch {
-                Fail "could not install the Microsoft Visual C++ runtime ($_). Install it from $VcRedistUrl, then run this installer again"
-            }
-            if ($code -notin 0, 1638, 3010) { Warn "the Visual C++ runtime installer exited with code $code" }
-            $err = Test-Engine $py
-            if ($err) { Fail "the speech engine still cannot load: $err" }
+    $py = Get-ToolPython $uv
+    if (-not $py) { Fail 'cannot find the Python that SubSync was installed with' }
+    Say 'Checking that the speech engine loads'
+    $err = Test-Engine $py
+    if ($err) {
+        Say "The speech engine cannot load yet ($err)"
+        Say 'Installing the Microsoft Visual C++ runtime it needs (Windows may ask for permission)'
+        try { $code = Install-VcRuntime } catch {
+            Fail "could not install the Microsoft Visual C++ runtime ($_). Install it from $VcRedistUrl, then run this installer again"
         }
-    } else {
-        Warn 'cannot find the SubSync Python; skipping the speech engine check'
+        if ($code -notin 0, 1638, 3010) { Warn "the Visual C++ runtime installer exited with code $code" }
+        $err = Test-Engine $py
+        if ($err) { Fail "the speech engine still cannot load: $err" }
     }
 
     Say 'Configuring VLC'
-    & $exe setup @SetupArgs
-    if ($LASTEXITCODE -ne 0) { Fail "vlc-subsync setup failed (run `"$exe doctor`" for details)" }
+    & $py -m vlcsubsync.cli setup @SetupArgs
+    if ($LASTEXITCODE -ne 0) { Fail "vlc-subsync setup failed (run `"$py`" -m vlcsubsync.cli doctor for details)" }
+
+    $blocked = $false
+    try { & $exe --version | Out-Null } catch { $blocked = $true }
+    if ($blocked) {
+        Warn ('Windows (Smart App Control or an App Control policy) blocks the vlc-subsync command. ' +
+            'SubSync still works in VLC. To run its commands, use: & "' + $py + '" -m vlcsubsync.cli doctor')
+    }
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not ($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $bin.TrimEnd('\') })) {

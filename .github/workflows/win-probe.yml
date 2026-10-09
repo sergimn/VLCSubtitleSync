@@ -1,0 +1,15 @@
+name: win-probe
+on:
+  push:
+    branches: [claude/project-thread-6leh4b]
+permissions:
+  contents: read
+jobs:
+  vlc-spawn:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: probe
+        shell: pwsh
+        run: .\.github\win-probe\vlc-spawn.ps1

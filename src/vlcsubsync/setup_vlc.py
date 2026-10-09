@@ -813,6 +813,12 @@ def _daemon_base_command(ctx: Context, *, gui: bool = False) -> list[str]:
     bindir = _bin_dir()
     if ctx.platform == "windows":
         if gui:
+            # pythonw.exe, not the vlc-subsync-daemon.exe launcher: the launcher is made
+            # on install, so Smart App Control / App Control knows no reputation for it
+            # and blocks it, while the Python executables are the same everywhere.
+            pythonw = bindir / "pythonw.exe"
+            if pythonw.exists():
+                return [str(pythonw), "-m", "vlcsubsync.cli", "serve", "--no-console"]
             for cand in (
                 bindir / "vlc-subsync-daemon.exe",
                 bindir / "Scripts" / "vlc-subsync-daemon.exe",
@@ -822,9 +828,7 @@ def _daemon_base_command(ctx: Context, *, gui: bool = False) -> list[str]:
             found = ctx.which("vlc-subsync-daemon")
             if found:
                 return [found]
-            pythonw = bindir / "pythonw.exe"
-            exe = str(pythonw) if pythonw.exists() else sys.executable
-            return [exe, "-m", "vlcsubsync.cli", "serve", "--no-console"]
+            return [sys.executable, "-m", "vlcsubsync.cli", "serve", "--no-console"]
         cand = bindir / "vlc-subsync.exe"
         if cand.exists():
             return [str(cand), "serve"]

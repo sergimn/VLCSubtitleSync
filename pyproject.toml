@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vlc-subsync"
-version = "1.0.2"
+version = "1.1.0"
 description = "Automatically sync VLC subtitles to the selected audio track using Whisper"
 readme = "README.md"
 requires-python = ">=3.10"

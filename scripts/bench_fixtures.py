@@ -181,13 +181,17 @@ def ms(x: float) -> str:
     return f"{x * 1000:.0f} ms"
 
 
+def plural(n: int) -> str:
+    return f"{n} case{'s' * (n != 1)}"
+
+
 def details(summary: str, body: list[str]) -> list[str]:
     return ["<details>", f"<summary>{summary}</summary>", "", *body, "", "</details>"]
 
 
 def results_summary(res: dict) -> list[str]:
     """Overall line + per-case table collapsed behind a dropdown."""
-    o, n = res.get("overall"), len(res["cases"])
+    o, n = res.get("overall") or overall(res["cases"]), len(res["cases"])
     failed = sum("error" in c for c in res["cases"])
     head = (
         f"**All {o['cues']} cues: median {ms(o['median'])} · p95 {ms(o['p95'])} · "
@@ -197,7 +201,7 @@ def results_summary(res: dict) -> list[str]:
     )
     if failed:
         head += f" ❌ {failed} of {n} cases failed."
-    return [head, "", *details(f"Per-case results ({n} cases)", results_table(res))]
+    return [head, "", *details(f"Per-case results ({plural(n)})", results_table(res))]
 
 
 def results_table(res: dict) -> list[str]:
@@ -345,7 +349,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         f"than {P95_DELTA * 1000:.0f} ms. Runtimes come from different runners and are "
         "only indicative. This comment is informational and never fails the check.",
     ]
-    lines += details(f"Per-case results ({len(head['cases'])} cases)", table)
+    lines += details(f"Per-case results ({plural(len(head['cases']))})", table)
     print("\n".join(lines))
     return 0
 

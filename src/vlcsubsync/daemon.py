@@ -35,6 +35,7 @@ from .config import (
     mode_rank,
     normalize_mode,
     normalize_sync_mode,
+    parse_bool,
 )
 
 log = logging.getLogger("vlcsubsync.daemon")
@@ -89,6 +90,22 @@ def lock_file_path() -> Path:
 
 def results_cache_dir() -> Path:
     return user_cache_dir() / "results"
+
+
+def clear_results_cache(cache_dir: Path | None = None) -> tuple[int, int]:
+    """Delete every stored result (``cache_dir`` defaults to :func:`results_cache_dir`).
+
+    Returns ``(removed, left)``: the number of results deleted and of those that could
+    not be (e.g. a file locked on Windows). Safe while the helper runs: a job that
+    misses the cache simply syncs again, and a result stored meanwhile is not counted.
+    """
+    d = Path(cache_dir) if cache_dir else results_cache_dir()
+    before = list(d.iterdir()) if d.is_dir() else []
+    shutil.rmtree(d, ignore_errors=True)
+    left = sum(1 for f in before if f.exists())
+    n = sum(1 for f in before if f.suffix == ".meta")
+    left_meta = sum(1 for f in before if f.suffix == ".meta" and f.exists())
+    return n - left_meta, left
 
 
 def platform_key(platform: str | None = None) -> str:
@@ -667,7 +684,12 @@ class Daemon:
 
     # ---------------------------------------------------------------- heartbeat
     def write_heartbeats(self) -> None:
-        hb = P.Heartbeat(time=time.time(), pid=os.getpid(), version=self.version)
+        # always report a value: the extension takes a missing key for an old helper
+        try:
+            cache = parse_bool(getattr(self.config_loader(), "cache", True)) is not False
+        except Exception:  # noqa: BLE001
+            cache = True
+        hb = P.Heartbeat(time=time.time(), pid=os.getpid(), version=self.version, cache=cache)
         for q in self.queue_dirs:
             try:
                 P.write_heartbeat(q, hb)
@@ -680,6 +702,44 @@ class Daemon:
             if hb is not None and hb.pid == os.getpid():
                 with contextlib.suppress(OSError):
                     (q / P.HEARTBEAT_FILE).unlink()
+
+    # ---------------------------------------------------------------- commands
+    def poll_commands(self) -> int:
+        """Handle ``<q>/clear_cache`` (the extension's "Delete cached results").
+
+        Returns the number of results deleted (0 if nothing was asked)."""
+        asked = False
+        for q in self.queue_dirs:
+            try:
+                (q / P.CLEAR_CACHE_FILE).unlink()
+                asked = True
+            except FileNotFoundError:
+                pass
+            except OSError as exc:  # e.g. still open on Windows: next poll
+                log.debug("cannot take %s yet: %s", q / P.CLEAR_CACHE_FILE, exc)
+        if not asked:
+            return 0
+        try:
+            removed, left = clear_results_cache(self.cache_dir)
+        except OSError as exc:
+            log.warning("cannot delete the result cache: %s", exc)
+            return 0
+        log.info(
+            "deleted %d cached result(s) as asked from VLC%s",
+            removed,
+            f"; {left} file(s) could not be deleted" if left else "",
+        )
+        return removed
+
+    @staticmethod
+    def cache_enabled(queue_dir: Path, config: Any) -> bool:
+        """Whether a job from ``queue_dir`` may use the result cache: the extension's
+        toggle (``cache=on|off`` in ``<q>/control``) wins over ``config.cache``."""
+        control = P.read_kv(queue_dir / P.CONTROL_FILE) or {}
+        toggle = parse_bool(control.get("cache"))
+        if toggle is not None:
+            return toggle
+        return parse_bool(getattr(config, "cache", True)) is not False
 
     # ---------------------------------------------------------------- requests
     def poll_requests(self) -> int:
@@ -1019,11 +1079,17 @@ class Daemon:
             out_dir = job.queue_dir / P.OUT_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            cached = None if r.force else self._cached_result(job, source, config)
+            use_cache = self.cache_enabled(job.queue_dir, config)
+            cached = self._cached_result(job, source, config) if use_cache and not r.force else None
             if cached is not None:
                 cached_file, meta = cached
                 dest = out_dir / f"{r.id}{cached_file.suffix}"
-                shutil.copyfile(cached_file, dest)
+                try:
+                    shutil.copyfile(cached_file, dest)
+                except OSError as exc:  # e.g. `clear-cache` ran meanwhile: sync again
+                    log.info("job %s: cached result unreadable (%s); re-syncing", r.id, exc)
+                    cached = None
+            if cached is not None:
                 done = P.Status.from_dict(meta)
                 done.id = r.id
                 done.state = "done"
@@ -1082,11 +1148,14 @@ class Daemon:
                 sync_mode=_sync_mode(config),
             )
             writer.write(done, force=True)
-            self._cache_store(key, output, done)
-            if r.force:
-                # the user asked for a fresh result: it must not be shadowed by an
-                # older result of another (more thorough) mode on the next open
-                self._cache_drop_other_modes(job, source, config, mode)
+            if not use_cache:
+                log.debug("job %s: result cache off, not stored", r.id)
+            else:
+                self._cache_store(key, output, done)
+                if r.force:
+                    # the user asked for a fresh result: it must not be shadowed by an
+                    # older result of another (more thorough) mode on the next open
+                    self._cache_drop_other_modes(job, source, config, mode)
             log.info(
                 "job %s done in %.1fs (mode %s): %s (applied=%s)",
                 r.id,
@@ -1118,6 +1187,12 @@ class Daemon:
         for q in self.queue_dirs:
             dirs += [(q / P.JOBS_DIR, self.max_age), (q / P.OUT_DIR, self.max_age)]
             dirs += [(q / P.REQUESTS_DIR, 3600.0), (q / L.REJECTED_DIR, self.max_age)]
+            # left behind if VLC died while the extension wrote it
+            stale = q / f"{P.CLEAR_CACHE_FILE}{P.TMP_SUFFIX}"
+            with contextlib.suppress(OSError):
+                if now - stale.stat().st_mtime > 3600.0:
+                    stale.unlink()
+                    removed += 1
         dirs.append((self.cache_dir, self.max_age))
         active_ids = set()
         with self._cond:
@@ -1216,6 +1291,10 @@ class Daemon:
                 if now - last_hb >= self.heartbeat_interval:
                     self.write_heartbeats()
                     last_hb = now
+                try:
+                    self.poll_commands()
+                except Exception:  # noqa: BLE001
+                    log.exception("error while handling commands")
                 try:
                     self.poll_requests()
                 except Exception:  # noqa: BLE001

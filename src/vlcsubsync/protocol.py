@@ -33,6 +33,7 @@ JOBS_DIR = "jobs"
 OUT_DIR = "out"
 HEARTBEAT_FILE = "heartbeat"
 CONTROL_FILE = "control"
+CLEAR_CACHE_FILE = "clear_cache"  # extension → daemon: delete the stored results
 INTF_STATE_FILE = "intf_state"
 
 STATES = ("queued", "running", "done", "error")
@@ -458,16 +459,24 @@ class Heartbeat:
     time: float
     pid: int
     version: str
+    # the result cache setting of config.ini (None: unknown); the extension's toggle,
+    # stored in <q>/control, overrides it
+    cache: bool | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {"time": int(self.time), "pid": self.pid, "version": self.version}
+        d: dict[str, object] = {"time": int(self.time), "pid": self.pid, "version": self.version}
+        if self.cache is not None:
+            d["cache"] = "on" if self.cache else "off"
+        return d
 
     @classmethod
     def from_dict(cls, data: Mapping[str, str]) -> Heartbeat:
+        cache = (data.get("cache") or "").strip().lower()
         return cls(
             time=_to_float(data.get("time"), 0.0) or 0.0,
             pid=_to_int(data.get("pid"), 0) or 0,
             version=data.get("version", ""),
+            cache={"on": True, "off": False}.get(cache),
         )
 
     def age(self, now: float | None = None) -> float:

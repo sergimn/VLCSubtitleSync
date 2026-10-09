@@ -1,4 +1,5 @@
-"""Command line interface: ``vlc-subsync sync|serve|setup|uninstall|doctor|download-models``."""
+"""Command line interface: ``vlc-subsync sync|serve|setup|uninstall|doctor|download-models|
+clear-cache``."""
 
 from __future__ import annotations
 
@@ -102,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--purge", action="store_true", help="also delete cache, logs, config and state")
 
     sub.add_parser("doctor", help="diagnose the installation")
+
+    sub.add_parser(
+        "clear-cache",
+        help="delete the stored sync results (to disable the cache, set cache=off in config.ini)",
+    )
 
     p = sub.add_parser("download-models", help="download Whisper models")
     p.add_argument("models", nargs="*", help="model names (default: configured English model)")
@@ -266,6 +272,18 @@ def cmd_download_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_clear_cache(args: argparse.Namespace) -> int:
+    from . import daemon as D
+
+    d = D.results_cache_dir()
+    removed, left = D.clear_results_cache(d)
+    print(f"Deleted {removed} cached result(s) from {d}")
+    if left:
+        print(f"error: could not delete {left} file(s) in {d}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _vlcrc_value(text: str, key: str) -> str | None:
     import re
 
@@ -368,7 +386,7 @@ def run_doctor(out=print, ctx=None) -> int:
         item(
             "settings",
             f"model_en={cfg.model_en} model_multi={cfg.model_multi} device={cfg.device} "
-            f"compute_type={cfg.compute_type}",
+            f"compute_type={cfg.compute_type} cache={'on' if cfg.cache else 'off'}",
         )
         try:
             from faster_whisper import download_model
@@ -415,6 +433,7 @@ COMMANDS = {
     "uninstall": cmd_uninstall,
     "doctor": cmd_doctor,
     "download-models": cmd_download_models,
+    "clear-cache": cmd_clear_cache,
 }
 
 

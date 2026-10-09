@@ -66,6 +66,8 @@ From the menu **View → SubSync** you can:
 | Auto-sync: ON/OFF | turn automatic syncing on or off (remembered) |
 | Status… | show what SubSync is doing and the last result |
 | Experimental: no extra track (live delay): ON/OFF | correct the subtitle track you picked instead of adding a synced copy (remembered; see [below](#experimental-no-extra-subtitle-track-live-delay)) |
+| Use cached results: ON/OFF | for debugging: OFF syncs every time and stores nothing (remembered; overrides `cache=` in `config.ini`) |
+| Delete cached results | for debugging: delete every stored result, like `vlc-subsync clear-cache` (a sync running at that moment still stores its own) |
 
 > The extension has to be enabled once per VLC session from the View menu. Automatic
 > syncing does not need it.
@@ -145,6 +147,7 @@ vlc-subsync setup             # (re)install the VLC integration
 vlc-subsync download-models --all
 vlc-subsync serve             # run the helper in the foreground (for debugging);
                               # it exits ~15 s after VLC closes, add --persistent to keep it
+vlc-subsync clear-cache       # delete the stored sync results
 vlc-subsync uninstall [--purge]
 ```
 
@@ -177,10 +180,18 @@ verify_windows=auto     # extra samples the section check may transcribe (0 = no
 min_confidence=0.5      # below this the original timing is kept (0..1)
 threads=0               # CPU threads, 0 = automatic (half the cores, at most 8)
 sync_mode=track         # track | delay (EXPERIMENTAL, see below)
+cache=on                # off = always sync again, never reuse or store results
 ```
 
 `vlc-subsync doctor` prints the location it uses. The helper reads the file again for
 every sync, so a change applies to the next one.
+
+Results are kept for 7 days after their last use. To debug, set `cache=off` (or turn
+off **View → SubSync → Use cached results**) so every sync runs again and nothing is
+stored, or run `vlc-subsync clear-cache` (**Delete cached results** in the menu) to
+delete what is stored. The menu toggle wins over `config.ini` once you have used it,
+until you delete the `subsync/control` file in VLC's data folder. Each VLC install
+(for example snap and non-snap) has its own toggle; they share one cache.
 
 ### Sync modes
 
@@ -195,7 +206,8 @@ Set the default with `mode=` in `config.ini`. You can also choose a mode for one
 the command line. A cached exhaustive result is reused when the file is opened again,
 including by later fast syncs, but only if it was applied. A forced re-sync ("Sync
 subtitles now" on an already synced track) replaces the cached results of the other
-modes, so the newest result is what you get next time.
+modes, so the newest result is what you get next time (with `cache=off` it leaves the
+cache alone).
 
 After upgrading SubSync, **restart VLC** before using "Sync now (exhaustive)". Until
 then the old interface script keeps running and can't do it. The menu says so instead

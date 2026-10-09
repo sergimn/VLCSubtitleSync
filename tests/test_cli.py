@@ -269,3 +269,14 @@ def test_doctor_runs(tmp_path, capsys):
     assert "lua-intf: subsync" in text
     assert "CUDA" in text
     assert rc == 1  # scripts missing, daemon not running
+
+
+def test_clear_cache(capsys):
+    d = D.results_cache_dir()
+    d.mkdir(parents=True)
+    (d / "k.meta").write_text("file=k.srt\n")
+    (d / "k.srt").write_text("1\n")
+    assert cli.main(["clear-cache"]) == 0
+    assert not d.exists()
+    assert "Deleted 1 cached result(s)" in capsys.readouterr().out
+    assert cli.main(["clear-cache"]) == 0  # nothing left: still fine

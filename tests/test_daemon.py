@@ -346,6 +346,168 @@ def test_cache_hit_and_force(env):
         assert len(runner.calls) == 4
 
 
+def test_cache_off_neither_reuses_nor_stores(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    cfg = {"c": Config()}
+    runner = FakeRunner()
+    cache = env.tmp / "cache" / "results"
+    with Harness(env, runner, config_loader=lambda: cfg["c"]) as h:
+        h.submit("n_1", media, sub_index=0)
+        h.wait_state("n_1", "done")
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 1)
+        stored = {f: f.stat().st_mtime_ns for f in cache.iterdir()}
+        cfg["c"] = Config(cache=False)  # the user edited config.ini
+        h.submit("n_2", media, sub_index=0)
+        h.wait_state("n_2", "done")
+        assert len(runner.calls) == 2  # the stored result was not reused...
+        h.submit("n_3", media, sub_index=0, mode="exhaustive")
+        h.wait_state("n_3", "done")
+        assert len(runner.calls) == 3
+        assert len(list(cache.glob("*.meta"))) == 1  # ...and nothing new was stored
+        # a forced sync with the cache off leaves the stored results alone too
+        h.submit("n_4", media, sub_index=0, mode="thorough", force=True)
+        h.wait_state("n_4", "done")
+        assert {f: f.stat().st_mtime_ns for f in cache.iterdir()} == stored  # untouched
+
+
+def test_control_cache_toggle_overrides_config(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    cfg = {"c": Config()}
+    runner = FakeRunner()
+    cache = env.tmp / "cache" / "results"
+    with Harness(env, runner, config_loader=lambda: cfg["c"]) as h:
+        P.write_kv(env.queue / P.CONTROL_FILE, {"auto": 1, "sync_now": 0, "cache": "off"})
+        h.submit("t_1", media, sub_index=0)
+        h.wait_state("t_1", "done")
+        h.submit("t_2", media, sub_index=0)
+        h.wait_state("t_2", "done")
+        assert len(runner.calls) == 2 and not list(cache.glob("*.meta"))
+        # the VLC toggle turned back on wins over cache=off in config.ini
+        cfg["c"] = Config(cache=False)
+        P.write_kv(env.queue / P.CONTROL_FILE, {"auto": 1, "sync_now": 0, "cache": "on"})
+        h.submit("t_3", media, sub_index=0)
+        h.wait_state("t_3", "done")
+        h.submit("t_4", media, sub_index=0)
+        h.wait_state("t_4", "done")
+        assert len(runner.calls) == 3  # t_4 came from the cache
+
+
+def test_heartbeat_reports_config_cache(env):
+    from vlcsubsync.config import Config
+
+    cfg = {"c": Config()}
+    with Harness(env, FakeRunner(), config_loader=lambda: cfg["c"]):
+        wait_for(lambda: (hb := P.read_heartbeat(env.queue)) and hb.cache is True)
+        cfg["c"] = Config(cache=False)
+        wait_for(lambda: (hb := P.read_heartbeat(env.queue)) and hb.cache is False)
+    assert P.Heartbeat.from_dict({"time": "1", "pid": "2", "version": "x"}).cache is None
+
+
+def test_clear_cache_command_from_vlc(env):
+    media = make_media(env)
+    runner = FakeRunner()
+    cache = env.tmp / "cache" / "results"
+    with Harness(env, runner) as h:
+        h.submit("x_1", media, sub_index=0)
+        h.wait_state("x_1", "done")
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 1)
+        P.write_kv(env.queue / P.CLEAR_CACHE_FILE, {"time": 1})
+        wait_for(lambda: not (env.queue / P.CLEAR_CACHE_FILE).exists())
+        wait_for(lambda: not cache.exists())
+        h.submit("x_2", media, sub_index=0)
+        h.wait_state("x_2", "done")
+        assert len(runner.calls) == 2  # synced again
+
+
+def test_control_cache_invalid_value_falls_back_to_config(env, tmp_path):
+    from vlcsubsync.config import Config
+
+    q = tmp_path / "q"
+    q.mkdir()
+    P.write_kv(q / P.CONTROL_FILE, {"cache": "maybe"})
+    assert D.Daemon.cache_enabled(q, Config(cache=False)) is False
+    assert D.Daemon.cache_enabled(q, Config()) is True
+    P.write_kv(q / P.CONTROL_FILE, {"cache": "0"})
+    assert D.Daemon.cache_enabled(q, Config()) is False
+    assert D.Daemon.cache_enabled(tmp_path / "none", SimpleNamespace()) is True
+
+
+def test_heartbeat_cache_when_config_fails(env):
+    def broken():
+        raise RuntimeError("bad config")
+
+    with Harness(env, FakeRunner(), config_loader=broken):
+        wait_for(lambda: (hb := P.read_heartbeat(env.queue)) and hb.cache is True)
+    assert "cache" not in P.Heartbeat(time=1, pid=2, version="x").to_dict()
+
+
+def test_poll_commands_clears_once_and_retries_locked_file(env, monkeypatch):
+    q1, q2 = env.tmp / "q1", env.tmp / "q2"
+    d = D.Daemon(
+        [q1, q2],
+        use_default_queues=False,
+        runner=FakeRunner(),
+        cache_dir=env.tmp / "c",
+        lock_path=env.tmp / "l",
+    )
+    d.scan_queue_dirs()
+    (env.tmp / "c").mkdir()
+    (env.tmp / "c" / "k.meta").write_text("file=k.srt\n")
+    calls = []
+    monkeypatch.setattr(D, "clear_results_cache", lambda c: calls.append(c) or (1, 0))
+    for q in (q1, q2):
+        P.write_kv(q / P.CLEAR_CACHE_FILE, {"time": 1})
+    assert d.poll_commands() == 1 and len(calls) == 1  # both asked: one clear
+    assert d.poll_commands() == 0 and len(calls) == 1
+    # a locked file (Windows) is taken on a later poll
+    P.write_kv(q1 / P.CLEAR_CACHE_FILE, {"time": 1})
+    real_unlink = Path.unlink
+    monkeypatch.setattr(Path, "unlink", lambda self, *a: (_ for _ in ()).throw(PermissionError()))
+    assert d.poll_commands() == 0 and (q1 / P.CLEAR_CACHE_FILE).exists()
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    assert d.poll_commands() == 1 and len(calls) == 2
+
+
+def test_clear_cache_file_present_at_start_is_handled(env):
+    cache = env.tmp / "cache" / "results"
+    cache.mkdir(parents=True)
+    (cache / "k.meta").write_text("file=k.srt\n")
+    (env.queue).mkdir(parents=True)
+    P.write_kv(env.queue / P.CLEAR_CACHE_FILE, {"time": 1})
+    with Harness(env, FakeRunner()):
+        wait_for(lambda: not cache.exists())
+    assert not (env.queue / P.CLEAR_CACHE_FILE).exists()
+
+
+def test_cache_entry_deleted_before_copy_resyncs(env, monkeypatch):
+    """`clear-cache` between the lookup and the copy: the job syncs again."""
+    media = make_media(env)
+    runner = FakeRunner()
+    gone = env.tmp / "gone.srt"
+    monkeypatch.setattr(
+        D.Daemon, "_cached_result", lambda self, *a: (gone, {"applied": "1", "file": "x"})
+    )
+    with Harness(env, runner) as h:
+        h.submit("g_1", media, sub_index=0)
+        st = h.wait_state("g_1", "done", "error")
+        assert st.state == "done" and len(runner.calls) == 1
+
+
+def test_clear_results_cache(env):
+    d = env.tmp / "cache" / "results"
+    assert D.clear_results_cache(d) == (0, 0)  # no cache yet
+    d.mkdir(parents=True)
+    for k in ("a", "b"):
+        (d / f"{k}.meta").write_text("file=x.srt\n")
+        (d / f"{k}.srt").write_text("1\n")
+    assert D.clear_results_cache(d) == (2, 0)
+    assert not d.exists()
+
+
 def test_cache_key_includes_mode(env):
     from vlcsubsync.config import Config
 

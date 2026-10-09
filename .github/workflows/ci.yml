@@ -21,13 +21,18 @@ jobs:
   lint:
     name: Lint (ruff, luacheck)
     runs-on: ubuntu-latest
+    env:
+      # Must match the astral-sh/ruff-pre-commit `rev` in .pre-commit-config.yaml.
+      # Renovate updates that rev; the custom regex manager in renovate.json bumps
+      # this pin from the same tags (same "CI tooling" group), so keep them in sync.
+      RUFF_VERSION: "0.16.10"
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
       - name: ruff check
-        run: uvx ruff check .
+        run: uvx "ruff@${RUFF_VERSION}" check .
       - name: ruff format --check
-        run: uvx ruff format --check .
+        run: uvx "ruff@${RUFF_VERSION}" format --check .
       - uses: leafo/gh-actions-lua@v13
         with:
           luaVersion: "5.1"
@@ -57,6 +62,9 @@ jobs:
           cache-dependency-glob: pyproject.toml
       - name: Install
         run: uv pip install -e ".[dev]"
+      - name: Install ffmpeg (media tests generate files with it)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Unit tests (excludes slow / vlc via pyproject addopts)
         run: pytest -q
 

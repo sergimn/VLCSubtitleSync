@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Continue'
 "PS arch: $env:PROCESSOR_ARCHITECTURE / W6432: $env:PROCESSOR_ARCHITEW6432  ps: $([Environment]::Is64BitProcess)"
 $log = Join-Path $env:RUNNER_TEMP 'x86-install.log'
 $ps86 = "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue  # do not leak pwsh 7 modules into Windows PowerShell
 $inner = Join-Path $PSScriptRoot 'inner.ps1'
 $p = Start-Process $ps86 -WorkingDirectory "$env:WINDIR\System32" -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$inner`"" -PassThru -NoNewWindow -RedirectStandardOutput $log -RedirectStandardError "$log.err"
 $t0 = Get-Date

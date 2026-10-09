@@ -565,6 +565,20 @@ link) is `disable --now`'d *before* its file is replaced, and an XDG autostart
 out and replaced. Not verified on a Mac in this change. launchd also throttles
 relaunches (10 s by default), which only delays a restart right after an exit.
 
+**`setup --vlc-dir X`**: the daemon only finds the default VLC dirs by itself, so the
+start command gets `--queue-dir <X>/subsync` for each custom dir (ExecStart,
+`ProgramArguments`, launcher `args`), and the path unit / LaunchAgent / launchers
+watch the custom dirs *plus* the detected usable VLC installs instead of replacing
+them. A later `setup` (plain, as on upgrade, or for another `--vlc-dir`) keeps the
+custom dirs found in the installed command whose queue dir still exists;
+`uninstall --vlc-dir X` drops X and rewrites the start-with-VLC files for whatever
+remains (removing them only when nothing does). `doctor` lists those dirs. Launcher
+`args` are whitespace-split by the Lua side, so in `mode=spawn` (Windows, Linux
+without systemd) a custom dir whose path has whitespace (after the 8.3 short form
+on Windows) cannot be passed: setup warns, leaves it out of `args` and writes no
+launcher there (its VLC would only start a helper that ignores it). systemd and
+launchd take arguments one by one and have no such limit.
+
 **Windows**: setup writes `<q>/launcher` (`mode=spawn`, absolute path of the GUI-subsystem
 `vlc-subsync-daemon.exe`, as an 8.3 short path if it has non-ASCII characters, since
 Lua's `os.execute` uses the ANSI code page). The intf runs `start "" /B "<exe>"`.

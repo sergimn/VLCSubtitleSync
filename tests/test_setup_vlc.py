@@ -733,3 +733,160 @@ def test_windows_percent_in_exe_path_warns(tmp_path, monkeypatch):
     ctx = fs.ctx()
     assert S.run_setup(ctx, model=False) == 0
     assert any("'%'" in w for w in ctx.warnings)
+
+
+# ------------------------------------------------------------------ setup --vlc-dir
+
+
+def _queue_dir_pairs(args):
+    return [args[i + 1] for i, a in enumerate(args[:-1]) if a == "--queue-dir"]
+
+
+def test_daemon_command_passes_queue_dirs(tmp_path, monkeypatch):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "vlc-subsync").write_text("")
+    monkeypatch.setattr(S, "_bin_dir", lambda: bindir)
+    ctx = S.Context(platform="linux", home=tmp_path, env={})
+    q = tmp_path / "my vlc" / "subsync"
+    assert S.daemon_command(ctx, queue_dirs=[q]) == [
+        str(bindir / "vlc-subsync"),
+        "serve",
+        "--queue-dir",
+        str(q),
+    ]
+    assert S.daemon_command(ctx) == [str(bindir / "vlc-subsync"), "serve"]
+
+
+def test_setup_vlc_dir_systemd_keeps_default_and_watches_custom(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    native_q = fs.home / ".local/share/vlc/subsync"
+    custom = tmp_path / "portable"
+    custom_q = custom / "subsync"
+    assert S.run_setup(fs.ctx(), model=False) == 0  # the detected VLC first
+    assert S.run_setup(fs.ctx(), model=False, vlc_dirs=[str(custom)]) == 0
+
+    units = fs.home / ".config/systemd/user"
+    service = (units / "vlc-subsync.service").read_text()
+    [exec_start] = [ln for ln in service.splitlines() if ln.startswith("ExecStart=")]
+    assert exec_start.endswith(f" serve --queue-dir {custom_q}")
+    path_unit = (units / "vlc-subsync.path").read_text().splitlines()
+    for q in (native_q, custom_q):
+        assert f"PathModified={q / 'intf_state'}" in path_unit
+        assert f"DirectoryNotEmpty={q / 'requests'}" in path_unit
+    launcher = P.read_kv(custom_q / "launcher")
+    assert launcher["mode"] == "service"
+    assert _queue_dir_pairs(launcher["args"].split()) == [str(custom_q)]
+    rows = {label: (value, ok) for label, value, ok in S.lifecycle_status(fs.ctx(), [native_q])}
+    assert rows["--vlc-dir queue dir"] == (str(custom_q), True)
+
+    # removing only the custom dir keeps the helper starting for the detected VLC
+    assert S.run_uninstall(fs.ctx(), vlc_dirs=[str(custom)]) == 0
+    assert not custom_q.exists()
+    service = (units / "vlc-subsync.service").read_text()
+    assert "--queue-dir" not in service
+    path_unit = (units / "vlc-subsync.path").read_text()
+    assert str(native_q / "intf_state") in path_unit and str(custom_q) not in path_unit
+    assert native_q.is_dir() and P.read_kv(native_q / "launcher")["mode"] == "service"
+    assert ["systemctl", "--user", "restart", "vlc-subsync.path"] in fs.commands
+
+
+@pytest.mark.parametrize("systemd", [True, False])
+def test_vlc_dirs_accumulate_across_setups(tmp_path, systemd):
+    """A later `setup` (plain, as the installer runs on upgrade, or for another
+    --vlc-dir) keeps the --vlc-dir dirs set up earlier; `uninstall --vlc-dir`
+    removes only its own."""
+    fs = FakeSystem(tmp_path, "linux", systemd=systemd)
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    native_q = fs.home / ".local/share/vlc/subsync"
+    x_q, y_q = tmp_path / "x" / "subsync", tmp_path / "y" / "subsync"
+
+    def passed(q):
+        return _queue_dir_pairs(P.read_kv(q / "launcher")["args"].split())
+
+    assert S.run_setup(fs.ctx(), model=False, vlc_dirs=[str(x_q.parent)]) == 0
+    assert S.run_setup(fs.ctx(), model=False, vlc_dirs=[str(y_q.parent)]) == 0
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    for q in (native_q, x_q, y_q):
+        assert sorted(passed(q)) == sorted([str(x_q), str(y_q)])
+    assert S.installed_queue_dir_args(fs.ctx(), [native_q]) == [y_q, x_q]
+
+    assert S.run_uninstall(fs.ctx(), vlc_dirs=[str(x_q.parent)]) == 0
+    assert not x_q.exists()
+    assert passed(native_q) == [str(y_q)] and passed(y_q) == [str(y_q)]
+    assert S.run_uninstall(fs.ctx(), vlc_dirs=[str(y_q.parent)]) == 0
+    assert passed(native_q) == []
+
+
+def test_setup_vlc_dir_only_custom_when_nothing_detected(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    custom_q = tmp_path / "portable" / "subsync"
+    assert S.run_setup(fs.ctx(), model=False, vlc_dirs=[str(custom_q.parent)]) == 0
+    path_unit = (fs.home / ".config/systemd/user/vlc-subsync.path").read_text()
+    assert path_unit.count("PathModified=") == 1 and str(custom_q) in path_unit
+    # uninstalling the only configured dir removes the units
+    assert S.run_uninstall(fs.ctx(), vlc_dirs=[str(custom_q.parent)]) == 0
+    assert not (fs.home / ".config/systemd/user/vlc-subsync.path").exists()
+
+
+def test_setup_vlc_dir_skips_unusable_detected_install(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    (fs.root / "snap/vlc").mkdir(parents=True)  # snap installed, never started
+    custom_q = tmp_path / "portable" / "subsync"
+    assert S.run_setup(fs.ctx(), model=False, vlc_dirs=[str(custom_q.parent)]) == 0
+    path_unit = (fs.home / ".config/systemd/user/vlc-subsync.path").read_text()
+    assert "snap" not in path_unit and str(custom_q) in path_unit
+
+
+def test_setup_vlc_dir_macos(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "_uid", lambda: 501)
+    fs = FakeSystem(tmp_path, "macos")
+    (fs.root / "Applications/VLC.app").mkdir(parents=True)
+    data_q = fs.home / "Library/Application Support/org.videolan.vlc/subsync"
+    custom_q = tmp_path / "portable vlc" / "subsync"
+    assert S.run_setup(fs.ctx(), model=False, vlc_dirs=[str(custom_q.parent)]) == 0
+    plist_path = fs.home / "Library/LaunchAgents" / f"{S.LAUNCHD_LABEL}.plist"
+    plist = plistlib.loads(plist_path.read_bytes())
+    assert plist["ProgramArguments"][-3:] == ["serve", "--queue-dir", str(custom_q)]
+    assert plist["WatchPaths"] == [str(custom_q / "intf_state"), str(data_q / "intf_state")]
+    assert plist["QueueDirectories"] == [str(custom_q / "requests"), str(data_q / "requests")]
+    assert S.installed_queue_dir_args(fs.ctx()) == [custom_q]
+
+
+def test_setup_vlc_dir_without_systemd_spawns_with_queue_dir(tmp_path):
+    fs = FakeSystem(tmp_path, "linux", systemd=False)
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    native_q = fs.home / ".local/share/vlc/subsync"
+    custom_q = tmp_path / "portable" / "subsync"
+    spaced_q = tmp_path / "my vlc" / "subsync"
+    ctx = fs.ctx()
+    dirs = [str(custom_q.parent), str(spaced_q.parent)]
+    assert S.run_setup(ctx, model=False, vlc_dirs=dirs) == 0
+    for q in (native_q, custom_q):
+        launcher = P.read_kv(q / "launcher")
+        assert launcher["mode"] == "spawn"
+        # the Lua side splits args on whitespace: the spaced path cannot be passed
+        assert _queue_dir_pairs(launcher["args"].split()) == [str(custom_q)]
+    assert not (spaced_q / "launcher").exists()
+    assert any("spaces" in w and str(spaced_q) in w for w in ctx.warnings)
+
+
+def test_setup_vlc_dir_windows_launchers(tmp_path, monkeypatch):
+    bindir = tmp_path / "Scripts"
+    bindir.mkdir()
+    exe = bindir / "vlc-subsync-daemon.exe"
+    exe.write_text("")
+    monkeypatch.setattr(S, "_bin_dir", lambda: bindir)
+    fs = FakeSystem(tmp_path, "windows")
+    appdata_q = fs.home / "AppData/Roaming/vlc/subsync"
+    appdata_q.parent.mkdir(parents=True)
+    custom_q = tmp_path / "portable" / "subsync"
+    assert S.run_setup(fs.ctx(), model=False, vlc_dirs=[str(custom_q.parent)]) == 0
+    for q in (appdata_q, custom_q):
+        assert P.read_kv(q / "launcher") == {
+            "version": "1",
+            "mode": "spawn",
+            "exe": str(exe),
+            "args": f"--queue-dir {custom_q}",
+        }

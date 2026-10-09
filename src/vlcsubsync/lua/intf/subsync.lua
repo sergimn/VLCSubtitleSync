@@ -375,6 +375,8 @@ function M.write_state(force)
         { "media", S.media_path or "" },
         { "job", S.job and S.job.id or "" },
         { "daemon", S.hb_alive and 1 or 0 },
+        -- sync_now_mode values this intf understands (older intfs lack the key)
+        { "modes", "fast,thorough,exhaustive" },
     })
     if ok then
         S.state_written = t
@@ -387,6 +389,26 @@ end
 
 ---------------------------------------------------------------- control
 
+M.MODES = { fast = true, thorough = true, exhaustive = true }
+
+-- `m` if it is a known sync mode, else "" (= the daemon's configured mode).
+function M.valid_mode(m)
+    m = trim(tostring(m or "")):lower()
+    if M.MODES[m] then return m end
+    return ""
+end
+
+-- OSD text of a starting job; slow modes warn that they take a while.
+function M.syncing_text(mode)
+    if mode == "exhaustive" or mode == "thorough" then
+        return "Syncing subtitles (" .. mode .. ", may take a while)…"
+    end
+    return "Syncing subtitles…"
+end
+
+-- Returns true (plus the requested mode, "" = default) when "Sync now" was asked
+-- for since the last call, false otherwise. The extension writes
+-- sync_now=<counter> and, for "Sync now (exhaustive)", sync_now_mode=exhaustive.
 function M.read_control()
     local c = M.read_kv(join(S.q, "control"))
     if not c then
@@ -409,7 +431,7 @@ function M.read_control()
     end
     if n > S.sync_now_seen then
         S.sync_now_seen = n
-        return true
+        return true, M.valid_mode(c.sync_now_mode)
     end
     if n < S.sync_now_seen then S.sync_now_seen = n end -- counter reset
     return false
@@ -532,7 +554,8 @@ function M.ensure_dirs()
     mkdir(join(S.q, "out"))
 end
 
-function M.submit(sel, force)
+function M.submit(sel, force, mode)
+    mode = M.valid_mode(mode)
     -- one job in flight per input: a newer request supersedes the old one
     if S.job then
         if S.job.req_path then os.remove(S.job.req_path) end
@@ -542,7 +565,7 @@ function M.submit(sel, force)
     M.ensure_dirs()
     local id = M.new_id()
     local path = join(join(S.q, "requests"), id .. ".req")
-    local ok, err = M.write_kv(path, {
+    local kv = {
         { "version", 1 },
         { "id", id },
         { "media", S.media_path },
@@ -552,23 +575,26 @@ function M.submit(sel, force)
         { "sub_label", sel.sub_label or "" },
         { "sub_path", "" },
         { "force", force and 1 or 0 },
-    })
+    }
+    if mode ~= "" then kv[#kv + 1] = { "mode", mode } end
+    local ok, err = M.write_kv(path, kv)
     if not ok then
         log_err(err)
         M.osd("SubSync: cannot write request (see log)")
         M.set_state("error", "cannot write request", nil)
         return nil
     end
-    log_info(string.format("request %s: audio=%d sub=%d media=%s",
-        id, sel.audio, sel.sub, S.media_path))
+    log_info(string.format("request %s: audio=%d sub=%d mode=%s media=%s",
+        id, sel.audio, sel.sub, mode ~= "" and mode or "default", S.media_path))
     S.job = {
         id = id, key = sel.key, audio = sel.audio, sub = sel.sub,
-        sub_label = sel.sub_label, req_path = path, started = now_us(),
+        sub_label = sel.sub_label, req_path = path, started = now_us(), mode = mode,
         status_path = join(join(S.q, "jobs"), id .. ".status"),
     }
-    M.osd("Syncing subtitles…")
+    local text = M.syncing_text(mode)
+    M.osd(text)
     S.last_progress_osd = now_us()
-    M.set_state("syncing", "Syncing subtitles…", nil)
+    M.set_state("syncing", text, nil)
     if not M.daemon_alive(true) then
         M.warn_daemon()
     end
@@ -698,7 +724,8 @@ function M.handle_status(input, snap)
     if state == "queued" or state == "running" then
         local p = tonumber(st.progress) or 0
         local msg = st.message or ""
-        local text = string.format("Syncing subtitles… %d%%", math.floor(p * 100 + 0.5))
+        local head = M.syncing_text(job.mode):gsub("…$", "")
+        local text = string.format("%s… %d%%", head, math.floor(p * 100 + 0.5))
         if msg ~= "" then text = text .. " – " .. msg end
         M.set_state("syncing", text, nil)
         if text ~= job.last_text and t - (S.last_progress_osd or 0) >= M.OSD_PROGRESS_US then
@@ -745,7 +772,7 @@ end
 function M.tick()
     local t = now_us()
     M.check_helper()
-    local sync_now = M.read_control()
+    local sync_now, sync_mode = M.read_control()
 
     local get_input = vlc.object and vlc.object.input
     if type(get_input) ~= "function" then
@@ -834,7 +861,8 @@ function M.tick()
     if sync_now then
         if sel.key then
             -- re-syncing an already synced track: bypass the daemon's cache
-            S.pending = { due = t, key = sel.key, force = sel.is_ours and true or false, explicit = true }
+            S.pending = { due = t, key = sel.key, force = sel.is_ours and true or false,
+                          explicit = true, mode = sync_mode }
         else
             M.osd("SubSync: select a subtitle track first")
         end
@@ -853,7 +881,7 @@ function M.tick()
                 }
             end
             if p.explicit then
-                M.submit(fsel, p.force)
+                M.submit(fsel, p.force, p.mode)
             else
                 M.fire(input, snap, fsel, p.force)
             end

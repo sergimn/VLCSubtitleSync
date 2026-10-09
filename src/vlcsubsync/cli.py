@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__
+from .config import MODES
 
 DISPLAY_NAME = "SubSync"
 
@@ -45,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--model", help="Whisper model name (overrides config for all languages)")
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), help="inference device")
+    p.add_argument(
+        "--mode",
+        choices=MODES,
+        help="fast (default): sampled windows; thorough: ~2.5x more windows; "
+        "exhaustive: transcribe every 30 s with speech (slow on CPU). Overrides config",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
 
     p = sub.add_parser("serve", help="run the background daemon used by VLC")
@@ -166,6 +173,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
         config.model_en = config.model_multi = args.model
     if args.device:
         config.device = args.device
+    if args.mode:
+        config = config.with_mode(args.mode)
     output = (
         os.path.abspath(args.output) if args.output else default_output_path(media, source.path)
     )

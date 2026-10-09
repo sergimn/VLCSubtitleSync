@@ -62,6 +62,7 @@ From the menu **View → SubSync** you can:
 | Menu item | What it does |
 |---|---|
 | Sync subtitles now | force a re-sync of the current tracks (ignores the cache) |
+| Sync now (exhaustive) | re-sync by transcribing the whole file, 30 s at a time: for files the normal sync gets wrong. Much slower, especially on a CPU (see [Sync modes](#sync-modes)) |
 | Auto-sync: ON/OFF | turn automatic syncing on or off (remembered) |
 | Status… | show what SubSync is doing and the last result |
 
@@ -73,6 +74,12 @@ From the menu **View → SubSync** you can:
 The first sync of a file usually takes **30–90 seconds on a typical CPU** (seconds
 with an NVIDIA GPU). SubSync only transcribes a few 30-second samples spread over the
 file, not the whole movie. Playback continues normally meanwhile.
+
+The section check (see *How it works*) may transcribe a few extra samples: at most
+2, plus 1 per 30 minutes of video, by default. Often none are needed, but on a CPU each
+one adds a second or so (one extra sample on a 28-minute episode: 19.2 s instead of
+19.1 s). Set `verify_windows=0` in `config.ini` to never transcribe extra samples
+for it.
 
 ## How it works
 
@@ -106,6 +113,20 @@ background priority on macOS, "below normal" on Windows) and at most half your C
 cores, so playback stays smooth. It frees the speech model from memory a minute after
 the last sync.
 
+While it runs a sync, the helper uses low priority (nice 10 and idle disk priority on
+Linux, background priority on macOS, "below normal" on Windows) and at most half your
+CPU cores, so playback stays smooth. It frees the speech model from memory a minute
+after the last sync.
+
+Step 5 in more detail: SubSync first fits one timing line (offset and, if the
+subtitles were made for another frame rate, a drift factor) per section of the video.
+It then checks each section in the middle, transcribing one more sample there if
+needed. Where the check disagrees by more than a quarter second, the section is split
+in two and each half is refitted, recursively. Finally it fine-tunes each section:
+the median gap between the spoken words and the subtitle lines, the moments where
+speech starts, and a gentle correction that follows slow local wobble (never more
+than half a second, and smooth from line to line).
+
 If the subtitle language and the spoken language differ (say English audio with
 Spanish subtitles), there is no text to compare. SubSync then lines up the subtitle
 timing with the moments where people are speaking. That method is less precise but
@@ -121,6 +142,7 @@ vlc-subsync sync movie.mkv                       # audio track 0, subtitle track
 vlc-subsync sync movie.mkv --audio 1 --sub 0     # 2nd audio track, 1st subtitle track
 vlc-subsync sync movie.mkv --sub-file movie.en.srt -o fixed.srt
 vlc-subsync sync movie.mkv --model small.en --device cuda
+vlc-subsync sync movie.mkv --mode exhaustive     # transcribe everything (slow)
 
 vlc-subsync doctor            # check the installation
 vlc-subsync setup             # (re)install the VLC integration
@@ -148,17 +170,66 @@ Optional. Create or edit `config.ini` in the SubSync config folder:
 <!-- TODO(lead): verify macOS/Windows paths = platformdirs.user_config_dir("vlc-subsync", appauthor=False). `vlc-subsync doctor` prints the actual path. -->
 
 ```ini
+mode=fast               # fast | thorough | exhaustive (see "Sync modes" below)
 model_en=base.en        # Whisper model for English subtitles (tiny.en, base.en, small.en, ...)
 model_multi=base        # model for every other language (tiny, base, small, medium, ...)
 device=auto             # auto | cpu | cuda   (auto falls back to CPU if CUDA fails)
 compute_type=int8       # CTranslate2 compute type (int8, int8_float16, float16, float32)
-windows=auto            # number of 30 s audio samples to transcribe, or auto
+windows=auto            # number of 30 s audio samples to transcribe, or auto (per mode);
+                        # a number is ignored in exhaustive mode, which covers everything
+verify_windows=auto     # extra samples the section check may transcribe (0 = none)
 min_confidence=0.5      # below this the original timing is kept (0..1)
 threads=0               # CPU threads, 0 = automatic (half the cores, at most 8)
 ```
 
 `vlc-subsync doctor` prints the location it uses. The helper reads the file again for
 every sync, so a change applies to the next one.
+
+### Sync modes
+
+| mode | what it transcribes |
+|---|---|
+| `fast` (default) | about one 30 s sample per 4 minutes (at least 8), plus a few extra samples to check each section |
+| `thorough` | about 2.5× more samples (one per ~96 s, at least 20) and a 3× larger budget for the section check |
+| `exhaustive` | the whole file in consecutive 30 s pieces, skipping the ones with no speech. All matches feed the fit and the fine-tuning. The section check uses those pieces and transcribes nothing extra |
+
+Set the default with `mode=` in `config.ini`. You can also choose a mode for one run:
+**View → SubSync → Sync now (exhaustive)** in VLC, or `vlc-subsync sync --mode …` on
+the command line. A cached exhaustive result is reused when the file is opened again,
+including by later fast syncs, but only if it was applied. A forced re-sync ("Sync
+subtitles now" on an already synced track) replaces the cached results of the other
+modes, so the newest result is what you get next time.
+
+After upgrading SubSync, **restart VLC** before using "Sync now (exhaustive)". Until
+then the old interface script keeps running and can't do it. The menu says so instead
+of running a normal sync.
+
+Measured on a real 28.7 min TV episode (`--audio 0 --sub 0`). Its subtitles were timed
+for 29.97 fps, so they drift +25% and start almost 3 minutes off. Hardware: RTX 3050 Ti
+Laptop GPU and i7-12700H CPU (20 threads), base.en model, already loaded. Accuracy is
+the per-line start error against a full `small.en` transcript (240 of 464 lines
+measured, `scripts/measure_real.py`):
+
+| mode | windows | GPU (CUDA) | CPU | median | p90 | p95 |
+|---|---|---|---|---|---|---|
+| unsynced | – | – | – | 173 s | 280 s | 298 s |
+| fast | 12 / 13 | 13.5 s | 19.7 s | 0.31 s | 0.79–0.80 s | 1.20–1.22 s |
+| thorough | 22 / 24 | 17.4 s | 28.3 s | 0.30–0.31 s | 0.79–0.82 s | 1.19–1.21 s |
+| exhaustive | 50 (8 silent skipped) | 25.8 s | 45.2 s | 0.31 s | 0.82–0.83 s | 1.18–1.21 s |
+
+Ranges and "GPU / CPU" pairs cover the GPU and CPU runs. Runtimes include about 7.5 s
+of audio decoding and speech detection. `vlc-subsync sync --mode …` writes the same
+output; started cold, it adds about 1 s to load the model. All modes find the same
+single +25% line, so the extra windows do not improve accuracy on this file. The
+roughly 0.3 s median looks like the limit of this measurement: subtitle lines usually
+start a little before the first word is spoken. Exhaustive mode is meant for harder files, such as ones with short
+sections the samples miss or few matching words.
+
+Rough exhaustive-mode cost per hour of video: about 1 minute on this GPU and about
+2 minutes on this 20-thread CPU. Expect roughly 5–10 minutes per hour on an older
+4-core laptop CPU (an estimate, not measured). Transcription time grows with the
+number of windows with speech. Fast mode stays under a minute per hour on either
+device.
 
 ## Languages
 
@@ -182,9 +253,11 @@ them in `config.ini`.
 - **The first sync of a file takes ~30–90 s on CPU.** The synced track appears when
   it's ready, and results are cached afterwards.
 - **Small residual offsets are possible.** The fit is one timing line per section of
-  the video, built from a sample of the audio, so individual lines can still be a
-  fraction of a second early or late. Drift outside 0.78–1.28× (−22% / +28%)
-  isn't handled.
+  the video, built from a sample of the audio and fine-tuned locally, so individual
+  lines can still be a fraction of a second early or late (on a real TV episode the
+  typical line is within 0.3 s of the spoken words). Sections shorter than about four
+  minutes, or a timing change between two samples that no check landed on, may be
+  missed. Drift outside 0.78–1.28× (−22% / +28%) isn't handled.
 - Subtitles that don't match the dialogue at all (a different cut with re-edited
   lines, or a heavily paraphrased translation) may not be accepted. SubSync then keeps
   the original timing and tells you so instead of making things worse.

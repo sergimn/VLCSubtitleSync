@@ -147,6 +147,19 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --no-model
+      - name: install.ps1 again from 32-bit Windows PowerShell (upgrade)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Remove-Item Env:PSModulePath  # pwsh 7's would break Windows PowerShell
+          & "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 --no-model
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed ($LASTEXITCODE)" }
+      - name: Speech engine check times out instead of hanging
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+          .\.github\ci\engine-check-timeout.ps1
 
       - name: Put the uv tool bin dir on PATH
         shell: bash

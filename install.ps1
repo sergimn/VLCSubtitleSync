@@ -56,13 +56,35 @@ function Test-Arm64 {
 
 # The speech engine (ctranslate2, onnxruntime) needs the Microsoft Visual C++ runtime, which
 # a fresh Windows does not always have. Returns $null when everything imports, else the error.
-function Test-Engine($py) {
-    $ErrorActionPreference = 'Continue'  # stderr of a native command must not throw here
-    $out = & $py -c 'import av, ctranslate2, onnxruntime, faster_whisper' 2>&1
-    if ($LASTEXITCODE -eq 0) { return $null }
-    $last = $out | Select-Object -Last 1
-    if ($null -eq $last) { return "python exited with code $LASTEXITCODE" }
-    return $last.ToString().Trim()
+# The first start of the new Python and its DLLs can be slow (antivirus scanning them), so
+# say that it is still working, and give up with a clear error rather than hang silently.
+function Test-Engine($py, [int]$TimeoutSec = 300) {
+    $tmp = Join-Path $env:TEMP "vlc-subsync-check-$PID"
+    $code = '-c "import sys; [print(m, flush=True) or __import__(m) for m in sys.argv[1:]]"'
+    $p = Start-Process -FilePath $py -ArgumentList "$code av ctranslate2 onnxruntime faster_whisper" `
+        -NoNewWindow -PassThru -RedirectStandardOutput "$tmp.out" -RedirectStandardError "$tmp.err"
+    $null = $p.Handle  # without this, ExitCode can stay empty after the process exits
+    $t0 = Get-Date
+    $told = $false
+    while (-not $p.WaitForExit(2000)) {
+        $secs = ((Get-Date) - $t0).TotalSeconds
+        if (-not $told -and $secs -ge 20) {
+            Say 'Still checking; the first start can take a few minutes while antivirus scans the new files'
+            $told = $true
+        }
+        if ($secs -ge $TimeoutSec) {
+            $module = Get-Content "$tmp.out" -ErrorAction SilentlyContinue | Select-Object -Last 1
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Remove-Item "$tmp.out", "$tmp.err" -ErrorAction SilentlyContinue
+            Fail ("loading the speech engine ($module) did not finish in $([int]($TimeoutSec / 60)) minutes. " +
+                'Something on this PC, often antivirus, is holding it; allow it or wait for its scan, then run this installer again')
+        }
+    }
+    $last = Get-Content "$tmp.err" -ErrorAction SilentlyContinue | Where-Object { $_.Trim() } | Select-Object -Last 1
+    Remove-Item "$tmp.out", "$tmp.err" -ErrorAction SilentlyContinue
+    if ($p.ExitCode -eq 0) { return $null }
+    if (-not $last) { return "python exited with code $($p.ExitCode)" }
+    return $last.Trim()
 }
 
 function Install-VcRuntime {
@@ -135,6 +157,7 @@ function Invoke-Main {
     $toolDir = (& $uv tool dir --color never) | Select-Object -Last 1
     $py = if ($toolDir) { Join-Path $toolDir.Trim() 'vlc-subsync\Scripts\python.exe' } else { $null }
     if ($py -and (Test-Path $py)) {
+        Say 'Checking that the speech engine loads'
         $err = Test-Engine $py
         if ($err) {
             Say "The speech engine cannot load yet ($err)"

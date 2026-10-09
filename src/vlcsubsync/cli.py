@@ -276,11 +276,11 @@ def cmd_clear_cache(args: argparse.Namespace) -> int:
     from . import daemon as D
 
     d = D.results_cache_dir()
-    n = D.clear_results_cache(d)
-    if d.exists():
-        print(f"error: could not delete everything in {d}", file=sys.stderr)
+    removed, left = D.clear_results_cache(d)
+    print(f"Deleted {removed} cached result(s) from {d}")
+    if left:
+        print(f"error: could not delete {left} file(s) in {d}", file=sys.stderr)
         return 1
-    print(f"Deleted {n} cached result(s) from {d}")
     return 0
 
 

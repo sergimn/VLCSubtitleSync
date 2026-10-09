@@ -338,16 +338,20 @@ def test_cache_off_neither_reuses_nor_stores(env):
         h.wait_state("n_3", "done")
         assert len(runner.calls) == 3
         assert len(list(cache.glob("*.meta"))) == 1  # ...and nothing new was stored
+        # a forced sync with the cache off leaves the stored results alone too
+        h.submit("n_4", media, sub_index=0, mode="exhaustive", force=True)
+        h.wait_state("n_4", "done")
+        assert len(list(cache.glob("*.meta"))) == 1
 
 
 def test_clear_results_cache(env):
     d = env.tmp / "cache" / "results"
-    assert D.clear_results_cache(d) == 0  # no cache yet
+    assert D.clear_results_cache(d) == (0, 0)  # no cache yet
     d.mkdir(parents=True)
     for k in ("a", "b"):
         (d / f"{k}.meta").write_text("file=x.srt\n")
         (d / f"{k}.srt").write_text("1\n")
-    assert D.clear_results_cache(d) == 2
+    assert D.clear_results_cache(d) == (2, 0)
     assert not d.exists()
 
 

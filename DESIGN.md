@@ -187,7 +187,8 @@ args=                                  # whitespace-separated arguments (POSIX: 
 Daemon housekeeping: delete `.req` once picked up; delete jobs/out older than 7 days.
 Result cache key = sha1(media path, size, mtime, audio_index, sub source identity,
 model, version, effective mode) → reuse previous output instantly unless `force=1`.
-`cache=off` in `config.ini` skips both the lookup and the store (debugging);
+`cache=off` in `config.ini` skips both the lookup and the store (debugging), and
+leaves stored results untouched (a forced sync drops no other mode's entry);
 `vlc-subsync clear-cache` deletes the results dir (`D.clear_results_cache`).
 Effective mode = the request's `mode=`, else the config's. A lookup tries the
 exhaustive key, then thorough, down to the job's own mode: a result of a *more*

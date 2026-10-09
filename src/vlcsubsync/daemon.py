@@ -91,16 +91,20 @@ def results_cache_dir() -> Path:
     return user_cache_dir() / "results"
 
 
-def clear_results_cache(cache_dir: Path | None = None) -> int:
+def clear_results_cache(cache_dir: Path | None = None) -> tuple[int, int]:
     """Delete every stored result (``cache_dir`` defaults to :func:`results_cache_dir`).
 
-    Returns the number of results removed. Safe while the helper runs: a job that
-    misses the cache simply syncs again.
+    Returns ``(removed, left)``: the number of results deleted and of those that could
+    not be (e.g. a file locked on Windows). Safe while the helper runs: a job that
+    misses the cache simply syncs again, and a result stored meanwhile is not counted.
     """
     d = Path(cache_dir) if cache_dir else results_cache_dir()
-    n = sum(1 for _ in d.glob("*.meta")) if d.is_dir() else 0
+    before = list(d.iterdir()) if d.is_dir() else []
     shutil.rmtree(d, ignore_errors=True)
-    return n
+    left = sum(1 for f in before if f.exists())
+    n = sum(1 for f in before if f.suffix == ".meta")
+    left_meta = sum(1 for f in before if f.suffix == ".meta" and f.exists())
+    return n - left_meta, left
 
 
 def platform_key(platform: str | None = None) -> str:

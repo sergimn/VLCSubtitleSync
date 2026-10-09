@@ -184,7 +184,7 @@ cache=on                # off = always sync again, never reuse or store results
 `vlc-subsync doctor` prints the location it uses. The helper reads the file again for
 every sync, so a change applies to the next one.
 
-Results are cached for 7 days. To debug, set `cache=off` so every sync runs again
+Results are kept for 7 days after their last use. To debug, set `cache=off` so every sync runs again
 and nothing is stored, or run `vlc-subsync clear-cache` to delete what is stored.
 
 ### Sync modes

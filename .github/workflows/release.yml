@@ -1,60 +1,257 @@
 name: Release
 
+# Two steps, so a person writes the notes and decides when a release ships.
+#
+# 1. Actions > Release > Run workflow (from main) with the version, e.g. 1.0.0.
+#    The `prepare` job bumps the version on a release/vX.Y.Z branch, tags it vX.Y.Z
+#    and opens a "Release X.Y.Z" PR whose release-notes/vX.Y.Z.md is a skeleton
+#    to fill in (with the PRs merged since the last release already listed).
+# 2. Merge that PR to publish: the `publish` job moves the tag to the merge commit
+#    on main, builds from it and creates the GitHub Release with those notes and
+#    the assets (wheel, sdist, installers pinned to this release, and SubSync-X.Y.Z.zip
+#    with those installers, the file to upload to addons.videolan.org).
+#    Close it without merging to cancel: the `cancel` job deletes the tag and branch.
+#
+# Needs Settings > Actions > General > "Allow GitHub Actions to create and approve
+# pull requests". A PR opened with GITHUB_TOKEN does not trigger pull_request
+# workflows, so `prepare` starts CI on the release branch itself; later pushes to
+# the branch (editing the notes) trigger it as usual.
+
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release: MAJOR.MINOR.PATCH, without a leading v (e.g. 1.0.0)"
+        required: true
+        type: string
+  pull_request:
+    types: [closed]
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
-  release:
+  prepare:
+    name: Prepare (tag + release PR)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release branch and the tag
+      pull-requests: write # open the release PR
+      actions: write # start CI on the release branch
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check the input
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::Run this workflow from main (it was run from $GITHUB_REF)."
+            exit 1
+          fi
+          if ! printf '%s' "$VERSION" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::The version must look like 1.0.0 (got '$VERSION')."
+            exit 1
+          fi
+          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
+          echo "BRANCH=release/v$VERSION" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - name: Check the version is new
+        run: |
+          current="$(python3 scripts/version.py)"
+          if ! python3 -c 'import sys; a, b = (tuple(map(int, v.split("."))) for v in sys.argv[1:]); sys.exit(a <= b)' "$VERSION" "$current"; then
+            echo "::error::$VERSION is not newer than the version on main ($current)."
+            exit 1
+          fi
+          if git ls-remote --exit-code origin "refs/tags/$TAG" "refs/heads/$BRANCH" >/dev/null; then
+            echo "::error::$TAG or $BRANCH already exists. Close its release PR (that deletes both) or delete them, then run again."
+            exit 1
+          fi
+
+      - name: Bump the version
+        run: |
+          git switch -c "$BRANCH"
+          python3 scripts/version.py set "$VERSION"
+      - name: Release notes skeleton
+        run: |
+          # The PRs merged since the latest release (or since the start, for the first one).
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" --jq .body > "$RUNNER_TEMP/changes.md"
+          mkdir -p release-notes
+          python3 scripts/release_notes.py skeleton "$VERSION" "$RUNNER_TEMP/changes.md" \
+            > "release-notes/$TAG.md"
+          cat "release-notes/$TAG.md"
+
+      - name: Commit, tag and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Release $VERSION"
+          git tag -a "$TAG" -m "SubSync $VERSION"
+          git push --atomic origin "$BRANCH" "refs/tags/$TAG"
+
+      - name: Open the release PR
+        run: |
+          cat > "$RUNNER_TEMP/pr.md" <<EOF
+          Release **SubSync $VERSION**, tagged \`$TAG\`.
+
+          1. Write the release notes in [\`release-notes/$TAG.md\`](https://github.com/$GITHUB_REPOSITORY/edit/$BRANCH/release-notes/$TAG.md) (edit it on this branch). The list of merged PRs is already there; HTML comments and empty sections are left out of the release.
+          2. **Merge** this PR to publish the release: the tag moves to the merge commit on main, and the GitHub Release is created with these notes and the wheel, sdist, installers and SubSync-$VERSION.zip (for addons.videolan.org) attached.
+          3. Or **close** it without merging to cancel: the tag and this branch are deleted.
+
+          CI was started on this branch by the release workflow (pull requests opened by GitHub Actions do not start it themselves).
+          EOF
+          if ! url="$(gh pr create --base main --head "$BRANCH" --title "Release $VERSION" \
+              --body-file "$RUNNER_TEMP/pr.md")"; then
+            git push --atomic origin --delete "$BRANCH" "refs/tags/$TAG"
+            echo "::error::Could not open the release PR, so the tag and branch were deleted. Enable Settings > Actions > General > \"Allow GitHub Actions to create and approve pull requests\", then run again."
+            exit 1
+          fi
+          gh pr edit "$url" --add-assignee "$GITHUB_ACTOR" || true
+          gh pr edit "$url" --add-reviewer "$GITHUB_ACTOR" || true
+          gh workflow run ci.yml --ref "$BRANCH"
+          echo "Release PR: $url" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish the release
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.merged &&
+      startsWith(github.event.pull_request.head.ref, 'release/v') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # move the tag, create the release, delete the branch
+      pull-requests: write # comment on the release PR
+    env:
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+      MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
       - uses: astral-sh/setup-uv@v10.2.0
 
-      - name: Check tag matches package version
+      - name: Check the tag and version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          ver="$(sed -n 's/^version *= *"\(.*\)"/\1/p' pyproject.toml | head -n1)"
-          if [ -z "$ver" ]; then
-            ver="$(sed -n 's/^__version__ *= *"\(.*\)"/\1/p' src/vlcsubsync/__init__.py | head -n1)"
+          VERSION="${BRANCH#release/v}"
+          TAG="v$VERSION"
+          printf '%s' "$VERSION" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'
+          if ! git ls-remote --exit-code origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::$TAG does not exist: this PR was not opened by the prepare job."
+            exit 1
           fi
-          echo "tag=$tag package=$ver"
-          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag != package version $ver"; exit 1; }
+          ver="$(python3 scripts/version.py)"
+          if [ "$ver" != "$VERSION" ]; then
+            echo "::error::$BRANCH merged, but the version on main is $ver."
+            exit 1
+          fi
+          {
+            echo "VERSION=$VERSION"
+            echo "TAG=$TAG"
+          } >> "$GITHUB_ENV"
 
       - name: Build sdist + wheel
         run: uv build
-
       - name: Smoke-test the wheel
         run: |
-          uv venv --python 3.12 /tmp/smoke
-          uv pip install --python /tmp/smoke dist/*.whl
-          /tmp/smoke/bin/vlc-subsync --version
+          uv venv --python 3.12 "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke" dist/*.whl
+          out="$("$RUNNER_TEMP/smoke/bin/vlc-subsync" --version)"
+          echo "$out"
+          [ "$out" = "vlc-subsync $VERSION" ]
 
-      - name: Installer assets pinned to this release
-        # The released install scripts install *this* version (the wheel attached to
-        # the release) instead of the main-branch archive.
+      - name: Assets
         run: |
           mkdir -p release
+          # The released installers install this release's wheel, not the main branch.
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           whl="$(basename dist/*.whl)"
-          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${whl}"
-          sed "s#^DEFAULT_SOURCE=.*#DEFAULT_SOURCE=\"${url}\"#" install.sh > release/install.sh
-          sed "s#^\$DefaultSource = .*#\$DefaultSource = '${url}'#" install.ps1 > release/install.ps1
-          cp install.cmd release/install.cmd
-          grep -q "$url" release/install.sh
-          grep -q "$url" release/install.ps1
+          sed "s#^DEFAULT_SOURCE=.*#DEFAULT_SOURCE=\"${base}/${whl}\"#" install.sh > release/install.sh
+          sed "s#^\$DefaultSource = '[^']*'#\$DefaultSource = '${base}/${whl}'#" install.ps1 > release/install.ps1
+          sed "s#https://raw.githubusercontent.com/[^/]*/[^/]*/main/install.ps1#${base}/install.ps1#" \
+            install.cmd > release/install.cmd
+          grep -q "${base}/${whl}" release/install.sh
+          grep -q "${base}/${whl}" release/install.ps1
+          grep -q "${base}/install.ps1" release/install.cmd
+          # One downloadable file for addons.videolan.org (a download page; it installs
+          # nothing into VLC): the three installers. The Lua scripts alone do nothing
+          # without the helper, so they are not shipped on their own.
+          pkg="$RUNNER_TEMP/SubSync-$VERSION"
+          mkdir -p "$pkg"
+          cp release/install.sh release/install.ps1 release/install.cmd "$pkg/"
+          cat > "$pkg/INSTALL.txt" <<EOF
+          SubSync $VERSION: automatic subtitle sync for VLC 3
+          https://github.com/${GITHUB_REPOSITORY}
+
+          Close VLC, then run the installer for your system. It sets up everything
+          SubSync needs (including its own Python) and adds it to VLC. Then restart VLC.
+
+            Windows:        double-click install.cmd
+            Linux / macOS:  open a terminal in this folder and run: sh install.sh
+
+          Running it again upgrades an existing install. To remove SubSync:
+            Windows:        install.cmd --uninstall
+            Linux / macOS:  sh install.sh --uninstall
+          EOF
+          (cd "$RUNNER_TEMP" && zip -X -r "$GITHUB_WORKSPACE/release/SubSync-$VERSION.zip" "SubSync-$VERSION")
+          python3 scripts/release_notes.py render "release-notes/$TAG.md" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
           ls -la dist release
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            dist/*.whl
-            dist/*.tar.gz
-            release/install.sh
-            release/install.ps1
-            release/install.cmd
+      - name: Move the tag to the merge commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f -a "$TAG" -m "SubSync $VERSION" "$MERGE_SHA"
+          git push -f origin "refs/tags/$TAG"
+
+      - name: Create the GitHub Release
+        run: |
+          files=(dist/*.whl dist/*.tar.gz release/*)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # a re-run after a failure further down: refresh it
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$TAG" "${files[@]}" --verify-tag --latest \
+              --title "SubSync $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          url="$(gh release view "$TAG" --json url --jq .url)"
+          echo "Release: $url" >> "$GITHUB_STEP_SUMMARY"
+          gh pr comment "$PR_URL" --body "Published $url"
+      - name: Delete the release branch
+        run: git push origin --delete "$BRANCH" || true # already gone if the repo auto-deletes
+
+  cancel:
+    name: Cancel the release
+    if: >-
+      github.event_name == 'pull_request' && !github.event.pull_request.merged &&
+      startsWith(github.event.pull_request.head.ref, 'release/v') &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # delete the tag and the branch
+      pull-requests: write # comment on the release PR
+    env:
+      BRANCH: ${{ github.event.pull_request.head.ref }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+    steps:
+      - name: Delete the tag and the branch
+        run: |
+          TAG="v${BRANCH#release/v}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$TAG is already released; leaving it alone."
+            exit 1
+          fi
+          for ref in "tags/$TAG" "heads/$BRANCH"; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/$ref" || echo "$ref: already gone"
+          done
+          gh pr comment "$PR_URL" --body "Release cancelled: deleted the tag \`$TAG\` and the branch. Run the Release workflow again to start over."

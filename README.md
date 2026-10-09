@@ -403,6 +403,21 @@ so with a snap you must opt in (`VLC_SUBSYNC_E2E_ALLOW_SNAP=1`) and the test the
 the real `~/snap/vlc/current/.local/share/vlc/subsync` queue folder, cleaning up after
 itself.
 
+### Releasing
+
+1. **Actions → Release → Run workflow** on `main`, with the new version (`1.0.0`). It
+   bumps the version everywhere (`scripts/version.py`), tags `v1.0.0` and opens a
+   *Release 1.0.0* PR with a release-notes skeleton in `release-notes/v1.0.0.md` that
+   already lists the PRs merged since the last release.
+2. Write the notes in that PR, then **merge** it. The tag moves to the merge commit and
+   the GitHub Release is published with the notes and the assets: wheel, sdist, the
+   installers pinned to that release, and `SubSync-1.0.0.zip` (those installers plus an
+   `INSTALL.txt`: the file to upload to addons.videolan.org). **Closing** the PR without
+   merging cancels the release and deletes the tag.
+
+The workflow opens the PR as GitHub Actions, which needs *Settings → Actions → General →
+Allow GitHub Actions to create and approve pull requests*.
+
 ### Test fixtures
 
 `tests/fixtures/` holds about 2 MB of generated media with exact ground truth:

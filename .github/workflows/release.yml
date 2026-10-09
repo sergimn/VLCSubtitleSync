@@ -39,7 +39,7 @@ jobs:
   prepare:
     name: Prepare (tag + release PR)
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write # push the release branch and the tag
       pull-requests: write # open the release PR
@@ -124,7 +124,7 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'release/v') &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login == 'github-actions[bot]'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write # move the tag, create the release, delete the branch
       pull-requests: write # comment on the release PR
@@ -236,7 +236,7 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'release/v') &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login == 'github-actions[bot]'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write # delete the tag and the branch
       pull-requests: write # comment on the release PR

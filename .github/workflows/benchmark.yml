@@ -1,0 +1,110 @@
+name: Benchmark
+
+# Sync accuracy on the committed TTS fixtures (scripts/bench_fixtures.py).
+# main: results in the step summary + the `benchmark-results` artifact (the PR baseline).
+# PRs: the same run, compared with the latest main artifact in a sticky PR comment.
+# Informational only: a worse result never fails the job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  bench:
+    name: Sync accuracy benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read # download the baseline artifact from another run
+      pull-requests: write # sticky comment
+    env:
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      GH_TOKEN: ${{ github.token }}
+      BENCH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          activate-environment: true
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+      - name: Install
+        run: uv pip install -e ".[dev]"
+      - name: Cache Whisper models
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: hf-whisper-tiny.en-base.en-base-v1
+      - name: Download models
+        run: python -m vlcsubsync.cli download-models tiny.en base.en base
+
+      - name: Run benchmark
+        run: python scripts/bench_fixtures.py run --out bench
+      - name: Publish summary
+        run: cat bench/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results
+          path: |
+            bench/results.json
+            bench/summary.md
+            bench/srt/
+          retention-days: 90
+
+      - name: Fetch main baseline
+        id: baseline
+        if: github.event_name == 'pull_request'
+        run: |
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow benchmark.yml \
+            --branch main --event push --status success --limit 1 \
+            --json databaseId,url --jq '.[0] // empty | "\(.databaseId) \(.url)"' || true)
+          if [ -z "$run" ]; then
+            echo "No successful benchmark run on main yet."
+            exit 0
+          fi
+          read -r id url <<< "$run"
+          if gh run download "$id" --repo "$GITHUB_REPOSITORY" -n benchmark-results -D baseline; then
+            echo "url=$url" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::could not download the baseline artifact of run $id"
+          fi
+      - name: Compare with main
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_URL: ${{ steps.baseline.outputs.url }}
+        run: |
+          python scripts/bench_fixtures.py compare bench/results.json \
+            --base baseline/results.json --base-url "$BASE_URL" > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment on PR
+        # fork PRs get a read-only token; their comparison is in the step summary
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]")
+                      | select(.body | contains("<!-- vlcsubsync-benchmark -->")) | .id')
+          id=${ids%%$'\n'*}
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -F body=@comment.md > /dev/null
+          else
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file comment.md
+          fi

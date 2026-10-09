@@ -55,9 +55,15 @@ VLC settings are kept. Before it changes `vlcrc` it saves a backup copy next to 
 ## Usage
 
 Open a video and choose a subtitle track (embedded, or a `.srt`/`.ass`/`.vtt` file next
-to the video). That's all. You'll see *"Syncing subtitles…"* in the top-right corner, then
-*"Subtitles synced: offset +2.35s"*. A new subtitle track is added and selected. The
-original track is still in the **Subtitle → Sub Track** menu if you want it back.
+to the video). That's all. A few seconds later a new subtitle track is added and
+selected. The original track is still in the **Subtitle → Sub Track** menu if you want
+it back.
+
+SubSync only puts a message on screen when something goes wrong, for example
+*"SubSync: not synced (… too few transcript matches …) – keeping original timing"*
+when the subtitles don't match the audio well enough. Turn on **View → SubSync → Show
+all messages** to also see its progress (*"Syncing subtitles… 42%"*) and results
+(*"Subtitles synced: offset +2.35s"*) in the top-right corner.
 
 A sync runs again when you pick a different subtitle track or a different audio
 track (for example after switching to another language's dub). Results are cached, so
@@ -72,6 +78,7 @@ From the menu **View → SubSync** you can:
 | Auto-sync: ON/OFF | turn automatic syncing on or off (remembered) |
 | Status… | show what SubSync is doing and the last result |
 | Experimental: no extra track (live delay): ON/OFF | correct the subtitle track you picked instead of adding a synced copy (remembered; see [below](#experimental-no-extra-subtitle-track-live-delay)) |
+| Show all messages: ON/OFF | OFF (the default) shows only errors on screen; ON also shows progress, results and confirmations of these menu items (remembered) |
 | Use cached results: ON/OFF | for debugging: OFF syncs every time and stores nothing (remembered; overrides `cache=` in `config.ini`) |
 | Delete cached results | for debugging: delete every stored result, like `vlc-subsync clear-cache` (a sync running at that moment still stores its own) |
 
@@ -256,7 +263,8 @@ change). The helper sends the timing it found (offset, drift and sections); twic
 second the script sets the delay that fits the current playback position. The menu
 toggle wins over `config.ini` once you have used it.
 
-You see *"Subtitles synced (live delay, experimental): …"*. Your own
+With **Show all messages** on, you see *"Subtitles synced (live delay, experimental):
+…"*. Your own
 <kbd>G</kbd>/<kbd>H</kbd> adjustments are kept on top of the correction. Switching to
 another subtitle or audio track gives the delay back to your own value (normally 0).
 
@@ -273,8 +281,9 @@ Limitations, why it is experimental:
   pauses playback (sound and picture) for the difference. With an offset that's a
   single pause; with drift towards earlier subtitles it is a short pause every second
   or two, adding up to the largest correction needed (about 5 s over the 3-minute test
-  above; at −4% a 2-hour film would add up to almost 5 minutes). The message says
-  *"may pause playback up to N s in total"* when this applies. Drift the other way
+  above; at −4% a 2-hour film would add up to almost 5 minutes). With **Show all
+  messages** on, the message says *"may pause playback up to N s in total"* when this
+  applies. Drift the other way
   (subtitles that must appear later) and positive offsets cost nothing.
 - A line that VLC has already prepared keeps its old timing, so a correction takes
   effect from the next line or two, not on the line on screen. In the test, a line

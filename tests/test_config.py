@@ -64,3 +64,16 @@ def test_default_path_env_override(tmp_path, monkeypatch):
     assert default_config_path() == tmp_path / "config.ini"
     Config(model_multi="small").save()
     assert Config.load().model_multi == "small"
+
+
+def test_verify_windows(tmp_path):
+    assert Config().verify_windows == "auto"
+    assert Config().verify_budget(45 * 60) == 3
+    assert Config().verify_budget(20 * 60) == 2
+    assert Config(verify_windows="0").verify_budget(3600) == 0
+    assert Config(verify_windows="7").verify_budget(60) == 7
+    p = tmp_path / "config.ini"
+    p.write_text("verify_windows=5\n", encoding="utf-8")
+    assert Config.load(p).verify_windows == "5"
+    p.write_text("verify_windows=-1\nverify_windows=lots\n", encoding="utf-8")
+    assert Config.load(p).verify_windows == "auto"  # invalid values ignored

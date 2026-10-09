@@ -38,6 +38,9 @@ class Config:
     device: str = "auto"  # auto | cpu | cuda
     compute_type: str = "int8"
     windows: str = "auto"  # "auto" or a positive integer (number of 30 s windows)
+    # Extra 30 s windows the bisection verification may transcribe: "auto" or an
+    # integer >= 0 (0 = verify with the windows already transcribed only).
+    verify_windows: str = "auto"
     min_confidence: float = 0.5
     threads: int = 0  # 0 = let CTranslate2 decide
     extra: dict[str, str] = field(default_factory=dict)  # unknown keys, preserved on save
@@ -52,6 +55,16 @@ class Config:
             except (ValueError, OverflowError):
                 pass
         return max(8, round(duration / 240.0))
+
+    def verify_budget(self, duration: float) -> int:
+        """Window budget of the bisection verification for a ``duration`` s file."""
+        v = str(self.verify_windows).strip().lower()
+        if v and v != "auto":
+            try:
+                return max(0, int(float(v)))
+            except (ValueError, OverflowError):
+                pass
+        return 2 + int(duration // 1800)
 
     # -- persistence -----------------------------------------------------------------
     @classmethod
@@ -112,6 +125,10 @@ class Config:
             elif key == "device":
                 if value.lower() in _VALID_DEVICES:
                     self.device = value.lower()
+            elif key == "verify_windows":
+                v = value.lower()
+                if v == "auto" or int(float(v)) >= 0:
+                    self.verify_windows = v if v == "auto" else str(int(float(v)))
             elif key == "windows":
                 w = value.lower()
                 if w == "auto" or int(float(w)) > 0:

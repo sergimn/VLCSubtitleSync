@@ -73,6 +73,12 @@ The first sync of a file usually takes **30–90 seconds on a typical CPU** (sec
 with an NVIDIA GPU). SubSync only transcribes a few 30-second samples spread over the
 file, not the whole movie. Playback continues normally meanwhile.
 
+The section check (see *How it works*) may transcribe a few extra samples: at most
+2, plus 1 per 30 minutes of video, by default. Often none are needed, but on a CPU each
+one adds a second or so (one extra sample on a 28-minute episode: 19.2 s instead of
+19.1 s). Set `verify_windows=0` in `config.ini` to never transcribe extra samples
+for it.
+
 ## How it works
 
 ```
@@ -94,10 +100,12 @@ which also works for the sandboxed snap and flatpak builds of VLC.
 
 Step 5 in more detail: SubSync first fits one timing line (offset and, if the
 subtitles were made for another frame rate, a drift factor) per section of the video.
-It then fine-tunes each section: the median gap between the spoken words and the
-subtitle lines, the moments where speech starts, and a gentle correction that
-follows slow local wobble (never more than half a second, and smooth from line to
-line).
+It then checks each section in the middle, transcribing one more sample there if
+needed. Where the check disagrees by more than a quarter second, the section is split
+in two and each half is refitted, recursively. Finally it fine-tunes each section:
+the median gap between the spoken words and the subtitle lines, the moments where
+speech starts, and a gentle correction that follows slow local wobble (never more
+than half a second, and smooth from line to line).
 
 If the subtitle language and the spoken language differ (say English audio with
 Spanish subtitles), there is no text to compare. SubSync then lines up the subtitle
@@ -145,6 +153,7 @@ model_multi=base        # model for every other language (tiny, base, small, med
 device=auto             # auto | cpu | cuda   (auto falls back to CPU if CUDA fails)
 compute_type=int8       # CTranslate2 compute type (int8, int8_float16, float16, float32)
 windows=auto            # number of 30 s audio samples to transcribe, or auto
+verify_windows=auto     # extra samples the section check may transcribe (0 = none)
 min_confidence=0.5      # below this the original timing is kept (0..1)
 threads=0               # CPU threads, 0 = automatic
 ```
@@ -175,8 +184,10 @@ them in `config.ini`.
   it's ready, and results are cached afterwards.
 - **Small residual offsets are possible.** The fit is one timing line per section of
   the video, built from a sample of the audio and fine-tuned locally, so individual
-  lines can still be a fraction of a second early or late. Drift outside 0.78–1.28×
-  (−22% / +28%) isn't handled.
+  lines can still be a fraction of a second early or late (on a real TV episode the
+  typical line is within 0.3 s of the spoken words). Sections shorter than about four
+  minutes, or a timing change between two samples that no check landed on, may be
+  missed. Drift outside 0.78–1.28× (−22% / +28%) isn't handled.
 - Subtitles that don't match the dialogue at all (a different cut with re-edited
   lines, or a heavily paraphrased translation) may not be accepted. SubSync then keeps
   the original timing and tells you so instead of making things worse.

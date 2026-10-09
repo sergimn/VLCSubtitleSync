@@ -49,6 +49,7 @@ SCALE_CANDIDATES = (
 SCALE_MIN, SCALE_MAX = 0.78, 1.28
 
 INLIER_THRESHOLD = 1.0  # s, residual for an anchor to count as consistent
+WINDOW_BIAS = 0.2  # s, shared timestamp bias of one Whisper window (real-world ~0.2-0.4)
 CHARS_PER_SECOND = 15.0  # typical speaking rate used to place tokens inside a cue
 
 
@@ -67,8 +68,13 @@ class Cue:
 @dataclass
 class SubTokens:
     tokens: list[str]
-    times: np.ndarray  # estimated time of each token (s, subtitle clock)
+    times: np.ndarray  # estimated time of each token (s, subtitle clock, at scale 1)
     cue: np.ndarray  # cue index of each token
+    # In-cue timing: time = cue start + min(lead / scale, cap). ``lead`` is the speech
+    # before the token at the nominal speaking rate (audio clock), ``cap`` the same
+    # fraction of the cue's duration (subtitle clock). See :meth:`_AnchorArrays.x`.
+    lead: np.ndarray | None = None
+    cap: np.ndarray | None = None
 
 
 @dataclass
@@ -79,6 +85,8 @@ class Anchor:
     window: int = -1
     cue: int = -1
     token: int = -1  # transcript token index within its window (groups alternatives)
+    lead: float = 0.0  # in-cue timing of the subtitle token (see SubTokens)
+    cap: float = 0.0
 
 
 @dataclass
@@ -154,6 +162,8 @@ def subtitle_tokens(cues: Sequence[Cue], cps: float = CHARS_PER_SECOND) -> SubTo
     tokens: list[str] = []
     times: list[float] = []
     cue_idx: list[int] = []
+    leads: list[float] = []
+    caps: list[float] = []
     for ci, cue in enumerate(cues):
         toks = tokenize(cue.text)
         if not toks:
@@ -163,11 +173,21 @@ def subtitle_tokens(cues: Sequence[Cue], cps: float = CHARS_PER_SECOND) -> SubTo
         total = float(lens.sum())
         dur = max(cue.end - cue.start, 0.0)
         frac = before / total
-        t = cue.start + np.minimum(before / cps, frac * dur)
+        lead = before / cps
+        cap = frac * dur
+        t = cue.start + np.minimum(lead, cap)
         tokens.extend(toks)
         times.extend(t.tolist())
         cue_idx.extend([ci] * len(toks))
-    return SubTokens(tokens, np.asarray(times, dtype=float), np.asarray(cue_idx, dtype=int))
+        leads.extend(lead.tolist())
+        caps.extend(cap.tolist())
+    return SubTokens(
+        tokens,
+        np.asarray(times, dtype=float),
+        np.asarray(cue_idx, dtype=int),
+        np.asarray(leads, dtype=float),
+        np.asarray(caps, dtype=float),
+    )
 
 
 def _word_tokens(words: Sequence[Word], offset: float) -> tuple[list[str], list[float]]:
@@ -259,6 +279,8 @@ def find_anchors(
                                 wi,
                                 int(sub.cue[p + k]),
                                 j + k,
+                                float(sub.lead[p + k]) if sub.lead is not None else 0.0,
+                                float(sub.cap[p + k]) if sub.cap is not None else 0.0,
                             )
                 covered_until = max(covered_until, j + n - 1)
                 break
@@ -349,20 +371,52 @@ def _irls(
     return s, o
 
 
-def _snap_scale(x, y, w, s, o) -> tuple[float, float]:
+def _window_medians(r: np.ndarray, win: np.ndarray) -> np.ndarray:
+    """Median residual of each window (inliers only)."""
+    m = np.abs(r) < INLIER_THRESHOLD
+    return np.array([np.median(r[m & (win == k)]) for k in np.unique(win[m])])
+
+
+def _slope_se(x: np.ndarray, r: np.ndarray, win: np.ndarray) -> float:
+    """Standard error of a line's slope when each window is one noisy observation
+    (its words share a timestamp bias): robust spread of the per-window median
+    residuals over sqrt(windows) x spread of the window positions."""
+    m = np.abs(r) < INLIER_THRESHOLD
+    ks = np.unique(win[m])
+    if ks.size < 4:
+        return 0.0
+    d = np.array([np.median(r[m & (win == k)]) for k in ks])
+    xw = np.array([np.median(x[m & (win == k)]) for k in ks])
+    spread = max(1.4826 * float(np.median(np.abs(d - np.median(d)))), 0.03)
+    sx = float(np.std(xw))
+    return spread / (math.sqrt(ks.size) * sx) if sx > 0 else 0.0
+
+
+def _snap_scale(x, y, w, s, o, win=None) -> tuple[float, float]:
     """Snap a free-fit scale to a known framerate ratio if it is very close and the fit
-    does not get worse."""
-    for cand in SCALE_CANDIDATES:
+    does not get worse: per anchor, or per transcription window when ``win`` is given
+    (a window's word timestamps share a bias, so one window with many anchors must not
+    tilt the line away from an exact ratio)."""
+    for cand in sorted(SCALE_CANDIDATES, key=lambda c: abs(s - c)):
         if abs(s - cand) < 0.0015 and cand != s:
             s2, o2 = _irls(x, y, w, cand, o + (s - cand) * float(np.median(x)), True)
-            r1 = np.abs(y - (s * x + o))
-            r2 = np.abs(y - (s2 * x + o2))
-            m1 = r1 < INLIER_THRESHOLD
-            m2 = r2 < INLIER_THRESHOLD
-            if m2.sum() >= m1.sum() and np.median(r2[m2] if m2.any() else r2) <= (
-                np.median(r1[m1] if m1.any() else r1) + 0.05
-            ):
+            r1 = y - (s * x + o)
+            r2 = y - (s2 * x + o2)
+            m1 = np.abs(r1) < INLIER_THRESHOLD
+            m2 = np.abs(r2) < INLIER_THRESHOLD
+            a1 = np.abs(r1[m1] if m1.any() else r1)
+            a2 = np.abs(r2[m2] if m2.any() else r2)
+            if m2.sum() >= m1.sum() and np.median(a2) <= np.median(a1) + 0.05:
                 return s2, o2
+            if win is not None and m2.sum() >= 0.97 * m1.sum():
+                d1 = _window_medians(r1, win)
+                d2 = _window_medians(r2, win)
+                if d1.size >= 4 and np.median(np.abs(d2)) <= np.median(np.abs(d1)) + 0.02:
+                    return s2, o2
+                # ... or the free slope is within 2 standard errors of the ratio, the
+                # error estimated from the spread of the per-window medians
+                if d1.size >= 4 and abs(s - cand) <= 2.0 * _slope_se(x, r1, win):
+                    return s2, o2
     return s, o
 
 
@@ -502,18 +556,69 @@ def _choose_boundary(
     return best_t
 
 
-def _fit_segment(xs, ys, ws, line: _Line, dom_s: float | None) -> tuple[float, float]:
+def _fit_segment(xs, ys, ws, line: _Line, dom_s: float | None, wins=None) -> tuple[float, float]:
     """Refit one segment. Long, well-supported segments get a free scale (snapped to a
     framerate ratio when close); short ones reuse the dominant scale (or the best known
     ratio if there is no dominant scale yet)."""
     free = xs.size >= 15 and float(np.ptp(xs)) >= 600.0
     if free and (dom_s is None or abs(line.scale - dom_s) > 0.002):
         s, o = _irls(xs, ys, ws, line.scale, line.offset, False)
-        return _snap_scale(xs, ys, ws, s, o)
+        return _snap_scale(xs, ys, ws, s, o, wins)
     if dom_s is None:
         return _best_candidate_scale(xs, ys, ws, line.scale, line.offset)
     o0 = float(np.median(ys - dom_s * xs))
     return _irls(xs, ys, ws, dom_s, o0, True)
+
+
+@dataclass
+class _AnchorArrays:
+    """Anchors as arrays, sorted by subtitle time. ``grp`` numbers transcript tokens
+    (a token's candidate anchors are alternatives, one of them at most is right)."""
+
+    anchors: list[Anchor]
+    x0: np.ndarray  # subtitle time at scale 1
+    y: np.ndarray
+    w: np.ndarray
+    win: np.ndarray
+    grp: np.ndarray
+    base: np.ndarray  # cue start
+    lead: np.ndarray
+    cap: np.ndarray
+
+    @classmethod
+    def build(cls, anchors: Sequence[Anchor]) -> _AnchorArrays:
+        A = sorted(anchors, key=lambda a: (a.sub_time, a.audio_time))
+        x0 = np.array([a.sub_time for a in A], dtype=float)
+        lead = np.array([a.lead for a in A], dtype=float)
+        cap = np.array([a.cap for a in A], dtype=float)
+        gkeys: dict[tuple, int] = {}
+        grp = np.array(
+            [
+                gkeys.setdefault((a.window, a.token) if a.token >= 0 else ("i", i), len(gkeys))
+                for i, a in enumerate(A)
+            ],
+            dtype=int,
+        )
+        return cls(
+            A,
+            x0,
+            np.array([a.audio_time for a in A], dtype=float),
+            np.array([a.weight for a in A], dtype=float),
+            np.array([a.window for a in A], dtype=int),
+            grp,
+            x0 - np.minimum(lead, cap),
+            lead,
+            cap,
+        )
+
+    def x(self, scale) -> np.ndarray:
+        """Subtitle times with in-cue offsets for drift ``scale`` (scalar or per anchor)."""
+        return self.base + np.minimum(self.lead / scale, self.cap)
+
+    def x_for(self, mapping: Mapping) -> np.ndarray:
+        starts = np.array([s.start for s in mapping.segments])
+        idx = np.clip(np.searchsorted(starts, self.x0, side="right") - 1, 0, None)
+        return self.x(np.array([s.scale for s in mapping.segments])[idx])
 
 
 def fit_mapping(
@@ -536,23 +641,20 @@ def fit_mapping(
     """
     if len(anchors) < 3:
         return AlignResult(Mapping.identity(), "none", 0.0, 0, len(anchors))
-    A = sorted(anchors, key=lambda a: (a.sub_time, a.audio_time))
-    x = np.array([a.sub_time for a in A])
-    y = np.array([a.audio_time for a in A])
-    w = np.array([a.weight for a in A])
-    win = np.array([a.window for a in A])
-    gkeys: dict[tuple, int] = {}
-    grp = np.array(
-        [
-            gkeys.setdefault((a.window, a.token) if a.token >= 0 else ("i", i), len(gkeys))
-            for i, a in enumerate(A)
-        ]
-    )
-    rng = np.random.default_rng(seed)
+    arr = _AnchorArrays.build(anchors)
+    A = arr.anchors
+    y, w, win, grp = arr.y, arr.w, arr.win, arr.grp
 
-    lines = _candidate_lines(x, y, w, rng)
+    lines = _candidate_lines(arr.x0, y, w, np.random.default_rng(seed))
     if not lines:
         return AlignResult(Mapping.identity(), "none", 0.0, 0, len(A))
+    # In-cue token times assume the nominal speaking rate in the *audio* clock: under
+    # drift they move with the dominant scale (else later words in long cues are
+    # biased by up to (1 - 1/scale) x their in-cue offset). Re-run with corrected times.
+    x_scale = lines[0].scale
+    x = arr.x(x_scale)
+    if abs(x_scale - 1.0) > 1e-3:
+        lines = _candidate_lines(x, y, w, np.random.default_rng(seed)) or lines
     L = len(lines)
     S = np.array([ln.scale for ln in lines])
     O = np.array([ln.offset for ln in lines])  # noqa: E741
@@ -605,10 +707,10 @@ def fit_mapping(
     # Dominant segment = widest sub-time span; its scale is shared by short segments.
     dom_i = max(range(len(groups)), key=lambda i: float(np.ptp(x[groups[i][0]])))
     m, ln, _ = groups[dom_i]
-    dom_s, dom_o = _fit_segment(x[m], y[m], w[m], ln, None)
+    dom_s, dom_o = _fit_segment(x[m], y[m], w[m], ln, None, win[m])
     fitted: list[tuple[np.ndarray, Segment]] = []
     for i, (m, ln, _wins) in enumerate(groups):
-        s, o = (dom_s, dom_o) if i == dom_i else _fit_segment(x[m], y[m], w[m], ln, dom_s)
+        s, o = (dom_s, dom_o) if i == dom_i else _fit_segment(x[m], y[m], w[m], ln, dom_s, win[m])
         # members w.r.t. the refined line
         m2 = np.isin(win, _wins) & (np.abs(y - (s * x + o)) < INLIER_THRESHOLD)
         if not m2.any():
@@ -659,39 +761,57 @@ def fit_mapping(
             yk = y[win == k]
             ambiguous.append((float(yk.min()) - 60.0, float(yk.max()) + 60.0))
 
-    # Statistics / confidence: one vote per transcript token (its candidates are
-    # alternatives), so repeated phrases do not dilute the inlier ratio.
-    pred = mapping.map_array(x)
-    res = np.abs(y - pred)
+    conf, n_in, n_groups, med, stats = _fit_stats(mapping, arr, n_windows)
+    return AlignResult(
+        mapping,
+        "whisper",
+        conf,
+        n_in,
+        n_groups,
+        med,
+        ambiguous,
+        details={**stats, "lines": L, "x_scale": x_scale},
+    )
+
+
+def _fit_stats(mapping: Mapping, arr: _AnchorArrays, n_windows: int):
+    """Confidence and statistics of ``mapping`` against the anchors: one vote per
+    transcript token (its candidates are alternatives), so repeated phrases do not
+    dilute the inlier ratio. ``n_windows`` = windows transcribed.
+    Returns ``(confidence, inliers, groups, median, details)``.
+    """
+    x = arr.x_for(mapping)
+    y, w, win, grp = arr.y, arr.w, arr.win, arr.grp
+    signed = y - mapping.map_array(x)
+    res = np.abs(signed)
     inl = res < INLIER_THRESHOLD
     n_groups = int(grp.max()) + 1
     g_weight = np.bincount(grp, weights=w, minlength=n_groups)
     g_in = np.bincount(grp, weights=inl.astype(float), minlength=n_groups) > 0
     n_in = int(g_in.sum())
     ratio = float(g_weight[g_in].sum() / g_weight.sum()) if g_weight.sum() > 0 else 0.0
-    med = float(np.median(res[inl])) if inl.any() else 99.0
+    # Residual term: a window's words share a timestamp bias of ~WINDOW_BIAS on real
+    # audio (that is not misfit of the line), so up to that much of each window's
+    # median residual is removed first. A line off by more still shows the excess.
+    adj = signed.copy()
+    for k in set(win[inl].tolist()):
+        mk = inl & (win == k)
+        adj[mk] -= np.clip(np.median(signed[mk]), -WINDOW_BIAS, WINDOW_BIAS)
+    med = float(np.median(np.abs(adj[inl]))) if inl.any() else 99.0
     win_with = len(set(win[inl].tolist())) if inl.any() else 0
-    n_win = max(n_windows, len(win_ids), 1)
+    n_win = max(n_windows, len(set(win.tolist())), 1)
     coverage = min(1.0, win_with / n_win)
     conf = (
         (1.0 - math.exp(-n_in / 12.0))
         * (0.35 + 0.65 * ratio)
         * (0.4 + 0.6 * coverage)
         * math.exp(-max(0.0, med - 0.25) / 0.4)
-        * (0.95 ** (len(final) - 1))
+        * (0.95 ** (len(mapping.segments) - 1))
     )
     if n_in < 6:
         conf = min(conf, 0.2)
-    return AlignResult(
-        mapping,
-        "whisper",
-        float(max(0.0, min(1.0, conf))),
-        n_in,
-        n_groups,
-        med,
-        ambiguous,
-        details={"ratio": ratio, "coverage": coverage, "lines": L},
-    )
+    conf = float(max(0.0, min(1.0, conf)))
+    return conf, n_in, n_groups, med, {"ratio": ratio, "coverage": coverage}
 
 
 def speech_onsets(speech: np.ndarray, resolution: float = 0.01, min_silence: float = 0.2):

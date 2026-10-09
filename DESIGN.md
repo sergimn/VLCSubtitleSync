@@ -168,14 +168,25 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
    else multilingual model with `language=<guess>`; if audio language (whisper
    detect) ≠ subtitle language → skip to VAD fallback.
 4. Anchors: normalize words (lowercase, strip punctuation, numbers→digits); subtitle
-   tokens get times by interpolating within each cue. Match rare-ish n-grams (n=3, then
-   2) between transcript windows and the *whole* subtitle token stream (no assumption
-   on offset magnitude) → (sub_time, audio_time) pairs, weighted by n-gram uniqueness.
+   tokens get times inside each cue: `cue start + min(lead / scale, cap)`, where
+   `lead` = characters before the token at a nominal 15 chars/s and `cap` = the same
+   fraction of the cue's duration. The speaking rate is nominal in the *audio* clock,
+   so under drift the in-cue offset is divided by the fitted scale (without this, a
+   1.25× file biases later words by up to 25% of their in-cue offset; fit_mapping
+   refits once with the first line's scale). Match rare-ish n-grams (n=3, then 2)
+   between transcript windows and the *whole* subtitle token stream (no assumption on
+   offset magnitude) → (sub_time, audio_time) pairs, weighted by n-gram uniqueness.
 5. Fit `audio = scale*sub + offset` robustly (RANSAC + IRLS refine). Scales are bounded
    to 0.78–1.28 (−22% / +28%). Long segments use a free fit that snaps to a known
    framerate ratio (`align.SCALE_CANDIDATES`) when within 0.0015 of it; short or sparse
    segments pick the best-fitting ratio, with a prior towards 1.0 that grows with the
-   ratio's size. Ratios beyond ±10% also need at least 10 anchors:
+   ratio's size. Snapping is judged per anchor *or* per transcription window: a
+   window's word timestamps share a bias of 0.2–0.4 s on real audio, so one biased
+   window must not tilt the line off an exact ratio. The ratio is taken if the
+   per-window median residuals are no worse, or if the free slope is within 2
+   standard errors of it, with each window one observation (SE = robust spread of
+   the window medians / (√windows · spread of window positions)). Ratios beyond ±10%
+   also need at least 10 anchors:
 
    | ratio | typical cause |
    |---|---|
@@ -193,7 +204,12 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`.
 6. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
    with the subtitle-on mask at 10 ms resolution over the same candidate scales
    (FFT), pick best.
-7. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
+7. Confidence: (1 − e^(−inliers/12)) · (0.35 + 0.65·inlier weight ratio) ·
+   (0.4 + 0.6·window coverage) · e^(−max(0, residual − 0.25)/0.4) · 0.95^(segments−1).
+   The residual is the median |inlier residual| after removing up to 0.2 s of each
+   window's median (its shared timestamp bias is not misfit; a line off by more still
+   shows the excess).
+8. Quality gate: apply only if confidence ≥ threshold; clamp cue overlaps; write
    output in the source format when possible (ASS keeps styles), else SRT.
 
 ## Config (`config.ini` in platformdirs user config dir `vlc-subsync`)

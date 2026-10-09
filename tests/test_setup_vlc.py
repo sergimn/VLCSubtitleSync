@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -124,14 +126,13 @@ def test_minimal_vlcrc_is_vlc_parsable():
 
 
 class FakeSystem:
-    def __init__(self, tmp_path, platform, *, systemd=True, which=None, lnk_ok=True):
+    def __init__(self, tmp_path, platform, *, systemd=True, which=None):
         self.home = tmp_path / "home"
         self.root = tmp_path / "root"
         self.home.mkdir()
         self.root.mkdir()
         self.platform = platform
         self.systemd = systemd
-        self.lnk_ok = lnk_ok
         self.commands: list[list[str]] = []
         self.popens: list[list[str]] = []
         self.lines: list[str] = []
@@ -149,12 +150,11 @@ class FakeSystem:
         self.commands.append(list(args))
         if args[:3] == ["systemctl", "--user", "show-environment"]:
             return subprocess.CompletedProcess(args, 0 if self.systemd else 1, "", "")
-        if args and args[0] == "powershell" and self.lnk_ok:
-            lnk = S.windows_startup_dir(self.ctx()) / S.WINDOWS_SHORTCUT
-            lnk.write_bytes(b"lnk")
-            return subprocess.CompletedProcess(args, 0, "", "")
-        if args and args[0] == "powershell":
-            return subprocess.CompletedProcess(args, 1, "", "COM error")
+        if args[:3] == ["systemctl", "--user", "is-enabled"]:
+            return subprocess.CompletedProcess(args, 0, "enabled\n", "")
+        if args[:3] == ["systemctl", "--user", "is-active"]:
+            state = "active" if args[3].endswith(".path") else "inactive"
+            return subprocess.CompletedProcess(args, 0, state + "\n", "")
         return subprocess.CompletedProcess(args, 0, "", "")
 
     def popen(self, cmd, **kw):
@@ -233,66 +233,6 @@ def test_snap_binary_on_path_is_not_native(tmp_path):
     assert kinds == ["snap"]
 
 
-def test_setup_and_uninstall_linux_systemd(tmp_path):
-    fs = FakeSystem(tmp_path, "linux")
-    (fs.home / "snap/vlc/current").mkdir(parents=True)
-    (fs.home / "snap/vlc/common").mkdir(parents=True)
-    rc_path = fs.home / "snap/vlc/common/vlcrc"
-    rc_path.write_text(VLC_STYLE.replace("#extraintf=", "extraintf=http"), encoding="utf-8")
-    original = rc_path.read_bytes()
-
-    assert S.run_setup(fs.ctx(), model=False) == 0
-    data = fs.home / "snap/vlc/current/.local/share/vlc"
-    assert scripts_installed(data)
-    text = rc_path.read_text(encoding="utf-8")
-    assert active(text, "extraintf") == ["http:luaintf"]
-    assert active(text, "lua-intf") == ["subsync"]
-    assert (rc_path.parent / "vlcrc.subsync-backup").read_bytes() == original
-    for sub in ("requests", "jobs", "out"):
-        assert (data / "subsync" / sub).is_dir()
-    unit = fs.home / ".config/systemd/user/vlc-subsync.service"
-    assert "ExecStart=" in unit.read_text() and " serve" in unit.read_text()
-    assert ["systemctl", "--user", "enable", "vlc-subsync.service"] in fs.commands
-    assert ["systemctl", "--user", "restart", "vlc-subsync.service"] in fs.commands
-
-    # idempotent re-run
-    assert S.run_setup(fs.ctx(), model=False) == 0
-    assert rc_path.read_text(encoding="utf-8") == text
-    assert (rc_path.parent / "vlcrc.subsync-backup").read_bytes() == original
-    state = P.read_kv(rc_path.parent / "vlcrc.subsync-state")
-    assert state["added_luaintf"] == "1"
-
-    assert S.run_uninstall(fs.ctx()) == 0
-    assert rc_path.read_bytes() == original
-    assert not scripts_installed(data)
-    assert not (data / "subsync").exists()
-    assert not unit.exists()
-    assert not (rc_path.parent / "vlcrc.subsync-state").exists()
-    assert not (rc_path.parent / "vlcrc.subsync-backup").exists()
-    assert ["systemctl", "--user", "disable", "--now", "vlc-subsync.service"] in fs.commands
-
-
-def test_setup_creates_missing_vlcrc_and_uninstall(tmp_path):
-    fs = FakeSystem(tmp_path, "linux", systemd=False)
-    (fs.home / ".config/vlc").mkdir(parents=True)
-    assert S.run_setup(fs.ctx(), model=False) == 0
-    rc_path = fs.home / ".config/vlc/vlcrc"
-    text = rc_path.read_text(encoding="utf-8-sig")
-    assert active(text, "extraintf") == ["luaintf"]
-    assert active(text, "lua-intf") == ["subsync"]
-    assert not (rc_path.parent / "vlcrc.subsync-backup").exists()
-    # no systemd -> XDG autostart + detached start
-    desktop = fs.home / ".config/autostart/vlc-subsync.desktop"
-    content = desktop.read_text()
-    assert "Exec=" in content and "Name=SubSync" in content and "Icon=" in content
-    assert fs.popens and fs.popens[-1][-1] == "serve"
-
-    assert S.run_uninstall(fs.ctx()) == 0
-    text = rc_path.read_text(encoding="utf-8-sig")
-    assert active(text, "extraintf") == [] and active(text, "lua-intf") == []
-    assert not desktop.exists()
-
-
 def test_user_saved_prefs_then_rerun(tmp_path):
     """VLC rewrites vlcrc on 'Save preferences'; setup must cope."""
     fs = FakeSystem(tmp_path, "linux", systemd=False)
@@ -330,63 +270,6 @@ def test_dry_run_changes_nothing(tmp_path):
     assert not any(c[:3] == ["systemctl", "--user", "enable"] for c in fs.commands)
 
 
-def test_setup_macos(tmp_path, monkeypatch):
-    monkeypatch.setattr(S, "_uid", lambda: 501)
-    fs = FakeSystem(tmp_path, "macos")
-    (fs.root / "Applications/VLC.app").mkdir(parents=True)
-    [inst] = S.detect_vlc_installs(fs.ctx())
-    assert inst.kind == "macos" and inst.detected
-    assert S.run_setup(fs.ctx(), model=False) == 0
-    data = fs.home / "Library/Application Support/org.videolan.vlc"
-    assert scripts_installed(data)
-    rc = fs.home / "Library/Preferences/org.videolan.vlc/vlcrc"
-    assert active(rc.read_text(encoding="utf-8-sig"), "lua-intf") == ["subsync"]
-    assert (data / "subsync/requests").is_dir()
-    plist_path = fs.home / "Library/LaunchAgents" / f"{S.LAUNCHD_LABEL}.plist"
-    plist = plistlib.loads(plist_path.read_bytes())
-    assert plist["Label"] == S.LAUNCHD_LABEL
-    assert plist["ProgramArguments"][-1] == "serve"
-    assert plist["RunAtLoad"] is True
-    assert ["launchctl", "bootstrap", "gui/501", str(plist_path)] in fs.commands
-
-    assert S.run_uninstall(fs.ctx()) == 0
-    assert not plist_path.exists()
-    assert not scripts_installed(data)
-    assert ["launchctl", "bootout", f"gui/501/{S.LAUNCHD_LABEL}"] in fs.commands
-
-
-def test_setup_windows(tmp_path):
-    fs = FakeSystem(tmp_path, "windows")
-    appdata = fs.home / "AppData/Roaming"
-    (appdata / "vlc").mkdir(parents=True)
-    [inst] = S.detect_vlc_installs(fs.ctx())
-    assert inst.kind == "windows" and inst.vlcrc == appdata / "vlc" / "vlcrc"
-    assert S.run_setup(fs.ctx(), model=False) == 0
-    assert scripts_installed(appdata / "vlc")
-    assert active((appdata / "vlc/vlcrc").read_text(encoding="utf-8-sig"), "extraintf") == [
-        "luaintf"
-    ]
-    assert (appdata / "vlc/subsync/out").is_dir()
-    ps = [c for c in fs.commands if c[0] == "powershell"]
-    assert ps and "WScript.Shell" in ps[0][-1] and "IconLocation" in ps[0][-1]
-    lnk = S.windows_startup_dir(fs.ctx()) / S.WINDOWS_SHORTCUT
-    assert lnk.exists()
-    assert fs.popens  # daemon started detached
-
-    assert S.run_uninstall(fs.ctx()) == 0
-    assert not lnk.exists()
-    assert not scripts_installed(appdata / "vlc")
-
-
-def test_windows_shortcut_failure_falls_back(tmp_path, monkeypatch):
-    fs = FakeSystem(tmp_path, "windows", lnk_ok=False)
-    (fs.home / "AppData/Roaming/vlc").mkdir(parents=True)
-    calls = []
-    monkeypatch.setattr(S, "_set_run_key", lambda ctx, cmd: calls.append(cmd) or True)
-    assert S.run_setup(fs.ctx(), model=False) == 0
-    assert calls and calls[0]
-
-
 def test_custom_vlc_dir(tmp_path):
     fs = FakeSystem(tmp_path, "linux", systemd=False)
     custom = tmp_path / "portable"
@@ -417,11 +300,6 @@ def test_vlc_running_warning(tmp_path):
     ctx.vlc_running = lambda: True
     S.run_setup(ctx, model=False, autostart=False)
     assert any("restart VLC" in w for w in ctx.warnings)
-
-
-def test_systemd_unit_quoting():
-    text = S.systemd_unit_text(["/home/a b/bin/vlc-subsync", "serve"])
-    assert 'ExecStart="/home/a b/bin/vlc-subsync" serve' in text
 
 
 def test_daemon_command_prefers_venv_script(tmp_path, monkeypatch):
@@ -515,3 +393,343 @@ def test_uninstall_cleans_legacy_snap_vlcrc(tmp_path):
     assert S.run_uninstall(fs.ctx()) == 0
     assert not legacy.exists()
     assert not (legacy.parent / "vlcrc.subsync-state").exists()
+
+
+# ------------------------------------------------------------------ helper lifecycle
+
+
+def _snap_with_vlcrc(fs):
+    (fs.home / "snap/vlc/current").mkdir(parents=True)
+    (fs.home / "snap/vlc/common").mkdir(parents=True)
+    rc_path = fs.home / "snap/vlc/common/vlcrc"
+    rc_path.write_text(VLC_STYLE.replace("#extraintf=", "extraintf=http"), encoding="utf-8")
+    return rc_path
+
+
+def test_setup_and_uninstall_linux_systemd(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    rc_path = _snap_with_vlcrc(fs)
+    original = rc_path.read_bytes()
+
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    data = fs.home / "snap/vlc/current/.local/share/vlc"
+    q = data / "subsync"
+    assert scripts_installed(data)
+    text = rc_path.read_text(encoding="utf-8")
+    assert active(text, "extraintf") == ["http:luaintf"]
+    assert active(text, "lua-intf") == ["subsync"]
+    assert (rc_path.parent / "vlcrc.subsync-backup").read_bytes() == original
+    for sub in ("requests", "jobs", "out"):
+        assert (q / sub).is_dir()
+
+    units = fs.home / ".config/systemd/user"
+    service = (units / "vlc-subsync.service").read_text()
+    path_unit = (units / "vlc-subsync.path").read_text().splitlines()
+    assert "ExecStart=" in service and " serve" in service
+    assert "[Install]" not in service  # never started at login by itself
+    assert f"PathModified={q / 'intf_state'}" in path_unit
+    assert f"DirectoryNotEmpty={q / 'requests'}" in path_unit
+    assert ["systemctl", "--user", "enable", "--now", "vlc-subsync.path"] in fs.commands
+    # nothing is started or enabled for login
+    assert not any(c[-1] == "vlc-subsync.service" and "enable" in c for c in fs.commands)
+    assert not any("restart" in c or "start" in c for c in fs.commands)
+    assert P.read_kv(q / "launcher")["mode"] == "service"
+    assert fs.popens == []
+
+    # idempotent re-run
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    assert rc_path.read_text(encoding="utf-8") == text
+    assert (rc_path.parent / "vlcrc.subsync-backup").read_bytes() == original
+    assert P.read_kv(rc_path.parent / "vlcrc.subsync-state")["added_luaintf"] == "1"
+
+    fs.commands.clear()
+    assert S.run_uninstall(fs.ctx()) == 0
+    assert rc_path.read_bytes() == original
+    assert not scripts_installed(data)
+    assert not q.exists()
+    assert not (units / "vlc-subsync.service").exists()
+    assert not (units / "vlc-subsync.path").exists()
+    assert not (rc_path.parent / "vlcrc.subsync-state").exists()
+    assert not (rc_path.parent / "vlcrc.subsync-backup").exists()
+    assert ["systemctl", "--user", "disable", "--now", "vlc-subsync.path"] in fs.commands
+    assert ["systemctl", "--user", "stop", "vlc-subsync.service"] in fs.commands
+    assert ["systemctl", "--user", "daemon-reload"] in fs.commands
+
+
+def test_setup_without_systemd_uses_lua_spawn(tmp_path):
+    fs = FakeSystem(tmp_path, "linux", systemd=False)
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    _snap_with_vlcrc(fs)
+    ctx = fs.ctx()
+    assert S.run_setup(ctx, model=False) == 0
+    rc_path = fs.home / ".config/vlc/vlcrc"
+    text = rc_path.read_text(encoding="utf-8-sig")
+    assert active(text, "extraintf") == ["luaintf"]
+    assert active(text, "lua-intf") == ["subsync"]
+    native_q = fs.home / ".local/share/vlc/subsync"
+    launcher = P.read_kv(native_q / "launcher")
+    assert launcher["mode"] == "spawn"
+    assert launcher["exe"] and launcher["args"].endswith("serve")
+    # no login autostart of any kind, nothing started now
+    assert not (fs.home / ".config/autostart/vlc-subsync.desktop").exists()
+    assert not (fs.home / ".config/systemd/user/vlc-subsync.path").exists()
+    assert fs.popens == []
+    # the sandboxed snap cannot spawn the helper: warned
+    assert any("sandboxed" in w for w in ctx.warnings)
+
+    assert S.run_uninstall(fs.ctx()) == 0
+    text = rc_path.read_text(encoding="utf-8-sig")
+    assert active(text, "extraintf") == [] and active(text, "lua-intf") == []
+    assert not native_q.exists()
+
+
+def test_systemd_unit_rendering():
+    text = S.systemd_service_text(["/home/a b/bin/vlc-subsync", "serve", "50%"])
+    assert 'ExecStart="/home/a b/bin/vlc-subsync" serve 50%%' in text
+    for line in ("Type=simple", "Nice=10", "IOSchedulingClass=idle", "CPUSchedulingPolicy=batch"):
+        assert line in text.splitlines()
+    assert "Restart" not in text and "[Install]" not in text
+    env = S.systemd_service_text(["x"], environment={"VLC_SUBSYNC_STATE_DIR": "/t/s"})
+    assert "Environment=VLC_SUBSYNC_STATE_DIR=/t/s" in env
+
+    qs = [Path("/h/.local/share/vlc/subsync"), Path("/h/snap/vlc/current/.local/share/vlc/subsync")]
+    lines = S.systemd_path_text(qs).splitlines()
+    assert lines.index("[Path]") < lines.index("Unit=vlc-subsync.service")
+    assert f"PathModified={qs[1] / 'intf_state'}" in lines
+    assert f"DirectoryNotEmpty={qs[0] / 'requests'}" in lines
+    assert "WantedBy=default.target" in lines
+    custom = S.systemd_path_text([Path("/q%x")], service="vlc-subsync-test.service")
+    assert "Unit=vlc-subsync-test.service" in custom
+    assert "PathModified=" + str(Path("/q%%x") / "intf_state") in custom
+
+
+def test_launchd_plist_rendering(tmp_path):
+    qs = [tmp_path / "q1", tmp_path / "q2"]
+    plist = plistlib.loads(S.launchd_plist(["/bin/vlc-subsync", "serve"], tmp_path, qs))
+    assert plist["WatchPaths"] == [str(q / "intf_state") for q in qs]
+    assert plist["QueueDirectories"] == [str(q / "requests") for q in qs]
+    assert plist["ProcessType"] == "Background" and plist["LowPriorityIO"] is True
+    assert "KeepAlive" not in plist and "RunAtLoad" not in plist
+    assert plist["ProgramArguments"] == ["/bin/vlc-subsync", "serve"]
+
+
+def test_setup_macos(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "_uid", lambda: 501)
+    fs = FakeSystem(tmp_path, "macos")
+    (fs.root / "Applications/VLC.app").mkdir(parents=True)
+    [inst] = S.detect_vlc_installs(fs.ctx())
+    assert inst.kind == "macos" and inst.detected
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    data = fs.home / "Library/Application Support/org.videolan.vlc"
+    assert scripts_installed(data)
+    rc = fs.home / "Library/Preferences/org.videolan.vlc/vlcrc"
+    assert active(rc.read_text(encoding="utf-8-sig"), "lua-intf") == ["subsync"]
+    assert (data / "subsync/requests").is_dir()
+    plist_path = fs.home / "Library/LaunchAgents" / f"{S.LAUNCHD_LABEL}.plist"
+    plist = plistlib.loads(plist_path.read_bytes())
+    assert plist["Label"] == S.LAUNCHD_LABEL
+    assert plist["ProgramArguments"][-1] == "serve"
+    assert "RunAtLoad" not in plist and "KeepAlive" not in plist
+    assert plist["WatchPaths"] == [str(data / "subsync" / "intf_state")]
+    assert ["launchctl", "bootstrap", "gui/501", str(plist_path)] in fs.commands
+    assert P.read_kv(data / "subsync" / "launcher")["mode"] == "service"
+
+    assert S.run_uninstall(fs.ctx()) == 0
+    assert not plist_path.exists()
+    assert not scripts_installed(data)
+    assert ["launchctl", "bootout", f"gui/501/{S.LAUNCHD_LABEL}"] in fs.commands
+
+
+def test_setup_macos_replaces_keepalive_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(S, "_uid", lambda: 501)
+    fs = FakeSystem(tmp_path, "macos")
+    (fs.root / "Applications/VLC.app").mkdir(parents=True)
+    plist_path = fs.home / "Library/LaunchAgents" / f"{S.LAUNCHD_LABEL}.plist"
+    plist_path.parent.mkdir(parents=True)
+    plist_path.write_bytes(
+        plistlib.dumps({"Label": S.LAUNCHD_LABEL, "RunAtLoad": True, "KeepAlive": {}})
+    )
+    assert S.legacy_autostart_artifacts(fs.ctx()) == [plist_path]
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    plist = plistlib.loads(plist_path.read_bytes())
+    assert "KeepAlive" not in plist and "RunAtLoad" not in plist
+    assert S.legacy_autostart_artifacts(fs.ctx()) == []
+
+
+def test_setup_windows_launcher_and_no_startup_shortcut(tmp_path, monkeypatch):
+    bindir = tmp_path / "Scripts"
+    bindir.mkdir()
+    exe = bindir / "vlc-subsync-daemon.exe"
+    exe.write_text("")
+    monkeypatch.setattr(S, "_bin_dir", lambda: bindir)
+    fs = FakeSystem(tmp_path, "windows")
+    appdata = fs.home / "AppData/Roaming"
+    (appdata / "vlc").mkdir(parents=True)
+    [inst] = S.detect_vlc_installs(fs.ctx())
+    assert inst.kind == "windows" and inst.vlcrc == appdata / "vlc" / "vlcrc"
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    assert scripts_installed(appdata / "vlc")
+    assert active((appdata / "vlc/vlcrc").read_text(encoding="utf-8-sig"), "extraintf") == [
+        "luaintf"
+    ]
+    assert (appdata / "vlc/subsync/out").is_dir()
+    launcher = P.read_kv(appdata / "vlc/subsync/launcher")
+    assert launcher == {"version": "1", "mode": "spawn", "exe": str(exe), "args": ""}
+    # no login autostart, nothing started now
+    assert not (S.windows_startup_dir(fs.ctx()) / S.WINDOWS_SHORTCUT).exists()
+    assert not any(c[0] == "powershell" for c in fs.commands)
+    assert fs.popens == []
+    rows = S.lifecycle_status(fs.ctx(), [inst.queue_dir])
+    assert rows and rows[0][2] is True and str(exe) in rows[0][1]
+
+    assert S.run_uninstall(fs.ctx()) == 0
+    assert not scripts_installed(appdata / "vlc")
+    assert not (appdata / "vlc/subsync").exists()
+
+
+class FakeWinreg:
+    HKEY_CURRENT_USER = "HKCU"
+    KEY_ALL_ACCESS = 0xF003F
+
+    def __init__(self, values):
+        self.values = values
+
+    def OpenKey(self, root, path, reserved, access):  # noqa: N802
+        assert path.endswith(r"CurrentVersion\Run")
+        return contextlib.nullcontext(self)
+
+    def DeleteValue(self, key, name):  # noqa: N802
+        if name not in self.values:
+            raise FileNotFoundError(name)
+        del self.values[name]
+
+
+def test_setup_windows_removes_startup_shortcut_and_run_key(tmp_path, monkeypatch):
+    reg = FakeWinreg({"SubSync": "C:\\x\\vlc-subsync-daemon.exe", "Other": "keep"})
+    monkeypatch.setitem(sys.modules, "winreg", reg)
+    fs = FakeSystem(tmp_path, "windows")
+    (fs.home / "AppData/Roaming/vlc").mkdir(parents=True)
+    lnk = S.windows_startup_dir(fs.ctx()) / S.WINDOWS_SHORTCUT
+    lnk.parent.mkdir(parents=True)
+    lnk.write_bytes(b"lnk")
+    assert S.legacy_autostart_artifacts(fs.ctx()) == [lnk]
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    assert not lnk.exists()
+    assert reg.values == {"Other": "keep"}
+    assert any("Run" in line and "removed" in line for line in fs.lines)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_setup_linux_migrates_always_on_service(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    units = fs.home / ".config/systemd/user"
+    (units / "default.target.wants").mkdir(parents=True)
+    old = units / "vlc-subsync.service"
+    old.write_text(
+        "[Unit]\nDescription=old\n[Service]\nExecStart=/x serve\nRestart=on-failure\n"
+        "[Install]\nWantedBy=default.target\n"
+    )
+    (units / "default.target.wants" / "vlc-subsync.service").symlink_to(old)
+    desktop = fs.home / ".config/autostart/vlc-subsync.desktop"
+    desktop.parent.mkdir(parents=True)
+    desktop.write_text("[Desktop Entry]\nExec=/x serve\n")
+    assert len(S.legacy_autostart_artifacts(fs.ctx())) == 2
+
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    disable = ["systemctl", "--user", "disable", "--now", "vlc-subsync.service"]
+    enable = ["systemctl", "--user", "enable", "--now", "vlc-subsync.path"]
+    # the old service is stopped and disabled before its unit file is replaced
+    assert fs.commands.index(disable) < fs.commands.index(enable)
+    assert not (units / "default.target.wants" / "vlc-subsync.service").is_symlink()
+    assert not desktop.exists()
+    assert "[Install]" not in old.read_text() and "Restart" not in old.read_text()
+    assert S.legacy_autostart_artifacts(fs.ctx()) == []
+
+
+def test_uninstall_removes_legacy_artifacts(tmp_path):
+    fs = FakeSystem(tmp_path, "linux", systemd=False)
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    units = fs.home / ".config/systemd/user"
+    units.mkdir(parents=True)
+    (units / "vlc-subsync.service").write_text("[Service]\n[Install]\nWantedBy=default.target\n")
+    desktop = fs.home / ".config/autostart/vlc-subsync.desktop"
+    desktop.parent.mkdir(parents=True)
+    desktop.write_text("[Desktop Entry]\n")
+    assert S.run_uninstall(fs.ctx()) == 0
+    assert not desktop.exists()
+    assert not (units / "vlc-subsync.service").exists()
+
+
+def test_dry_run_migration_touches_nothing(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    units = fs.home / ".config/systemd/user"
+    units.mkdir(parents=True)
+    (units / "vlc-subsync.service").write_text("[Service]\n[Install]\nWantedBy=default.target\n")
+    before = sorted(p for p in tmp_path.rglob("*"))
+    assert S.run_setup(fs.ctx(dry_run=True), model=False) == 0
+    assert sorted(p for p in tmp_path.rglob("*")) == before
+    assert not any("disable" in c for c in fs.commands)
+
+
+def test_lifecycle_status_linux(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    rows = S.lifecycle_status(fs.ctx())
+    assert rows[0][2] is False and "not configured" in rows[0][1]
+    S.run_setup(fs.ctx(), model=False)
+    rows = {label: (value, ok) for label, value, ok in S.lifecycle_status(fs.ctx())}
+    assert rows["vlc-subsync.path"][1] is True
+    assert rows["vlc-subsync.service"] == ("inactive (normal while VLC is closed)", None)
+
+
+def test_launcher_data_windows_and_posix():
+    w = S.launcher_data("spawn", [r"C:\Py\Scripts\vlc-subsync-daemon.exe"], "windows")
+    assert w == {
+        "version": 1,
+        "mode": "spawn",
+        "exe": r"C:\Py\Scripts\vlc-subsync-daemon.exe",
+        "args": "",
+    }
+    p = S.launcher_data("service", ["/usr/bin/python3", "-m", "vlcsubsync.cli", "serve"], "linux")
+    assert p["exe"] == "/usr/bin/python3" and p["args"] == "-m vlcsubsync.cli serve"
+
+
+def test_service_has_start_limit():
+    lines = S.systemd_service_text(["/x", "serve"]).splitlines()
+    unit = lines[: lines.index("[Service]")]
+    assert "StartLimitIntervalSec=600" in unit and "StartLimitBurst=20" in unit
+
+
+def test_resetup_restarts_path_unit_when_watches_change(tmp_path):
+    fs = FakeSystem(tmp_path, "linux")
+    (fs.home / ".config/vlc").mkdir(parents=True)
+    restart = ["systemctl", "--user", "restart", "vlc-subsync.path"]
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    assert restart not in fs.commands  # first install: enable --now is enough
+
+    fs.commands.clear()
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    assert restart not in fs.commands  # unchanged watches
+
+    # a new VLC (the snap) shows up: the path unit must watch it too
+    (fs.home / "snap/vlc/current").mkdir(parents=True)
+    fs.commands.clear()
+    assert S.run_setup(fs.ctx(), model=False) == 0
+    path_unit = (fs.home / ".config/systemd/user/vlc-subsync.path").read_text()
+    assert str(Path("snap/vlc/current")) in path_unit
+    reload_ = ["systemctl", "--user", "daemon-reload"]
+    assert reload_ in fs.commands and restart in fs.commands
+    assert fs.commands.index(reload_) < fs.commands.index(restart)
+
+
+def test_windows_percent_in_exe_path_warns(tmp_path, monkeypatch):
+    bindir = tmp_path / "50%off" / "Scripts"
+    bindir.mkdir(parents=True)
+    (bindir / "vlc-subsync-daemon.exe").write_text("")
+    monkeypatch.setattr(S, "_bin_dir", lambda: bindir)
+    fs = FakeSystem(tmp_path, "windows")
+    (fs.home / "AppData/Roaming/vlc").mkdir(parents=True)
+    ctx = fs.ctx()
+    assert S.run_setup(ctx, model=False) == 0
+    assert any("'%'" in w for w in ctx.warnings)

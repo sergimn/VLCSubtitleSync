@@ -13,9 +13,10 @@ input.
 * Spawning processes from VLC Lua is unreliable: `os.execute` flashes a console window
   on Windows, blocks the interface, and is denied entirely for sandboxed VLC
   (snap/flatpak). So the Lua side and Python side talk through a **file-based job
-  queue** in VLC's user-data dir, and the helper runs as a small per-user **daemon**
-  started at login (it also keeps the Whisper model warm). Lua still *tries* to
-  start the daemon itself (non-Windows, non-sandboxed) if no heartbeat is seen.
+  queue** in VLC's user-data dir. The helper is a small per-user **daemon** that
+  **starts with VLC and exits ~15 s after it** (never at login): a systemd path unit
+  or a launchd agent starts it when VLC writes its `intf_state`; on Windows and on
+  Linux without systemd the Lua intf launches it itself. See "Lifecycle".
 * Fully automatic mode needs a **Lua interface script** (`lua/intf/subsync.lua`,
   enabled via `vlcrc`: `extraintf=luaintf`, `lua-intf=subsync`), because VLC
   extensions must be activated manually each session. A companion **extension**
@@ -59,8 +60,8 @@ src/vlcsubsync/
   sync.py                      # orchestration: sync_subtitles(...) -> SyncResult
   protocol.py                  # key=value file format, request/status dataclasses, atomic writes
   daemon.py                    # queue watcher, heartbeat, job runner, result cache
-  lifecycle.py                 # model unloading, process priority of the daemon
-  setup_vlc.py                 # install/uninstall Lua scripts, vlcrc edits, autostart, dirs
+  lifecycle.py                 # idle exit (VLC gone), model unloading, process priority
+  setup_vlc.py                 # install/uninstall Lua scripts, vlcrc edits, start-with-VLC, dirs
   lua/intf/subsync.lua         # shipped as package data, copied into VLC by `setup`
   lua/extensions/subsync_ext.lua
 tests/                         # pytest; tests/lua/ runs Lua via `lupa` with a mocked `vlc` module
@@ -171,6 +172,14 @@ display only, except `modes`): `state`, `message`, `last_result`, `modes` (the
 `sync_now_mode` values it understands; an intf from before sync modes lacks it, and
 the extension then asks for a VLC restart instead of claiming an exhaustive sync).
 
+`<q>/launcher` (setup → intf), see "Lifecycle":
+```
+version=1
+mode=spawn                             # spawn: intf starts exe; service: systemd/launchd does
+exe=C:\Users\me\...\Scripts\vlc-subsync-daemon.exe   # absolute (8.3 short form if non-ASCII)
+args=                                  # whitespace-separated arguments (POSIX: `serve`)
+```
+
 Daemon housekeeping: delete `.req` once picked up; delete jobs/out older than 7 days.
 Result cache key = sha1(media path, size, mtime, audio_index, sub source identity,
 model, version, effective mode) → reuse previous output instantly unless `force=1`.
@@ -195,6 +204,12 @@ thorough mode also answers a later cheaper request for the same file and tracks
 
 ### Lua behaviour (intf)
 Loop every ~500 ms (`vlc.misc.mwait`); VLC 3 has no `should_die()` — `mwait` raises "Interrupted." when the interface is closing, which ends the loop.
+`intf_state` is rewritten at least every 5 s while VLC runs and gets `state=stopped`
+when the loop ends; the daemon's idle exit relies on both. With `launcher` `mode=spawn`
+the intf starts the helper at startup and whenever the heartbeat is stale (checked
+every 2 s), at most once per 60 s and 3 times per session; `mode=service` never
+spawns. Without a `launcher` file (set up by an older version) it tries once, when a
+job finds no heartbeat, from the usual install paths (non-Windows, non-sandboxed).
 Trigger a sync when, for the current input, (a) playback started with a sub track
 selected, (b) `spu-es` changed to a non-disabled track that isn't one we added, or
 (c) `audio-es` changed while a sub track is selected; debounce 1.5 s; only one job in
@@ -362,9 +377,45 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job w
 `min_confidence=0.5`, `threads=0` (= `max(1, min(8, cpu_count // 2))`, leaving half
 the cores to VLC), `sync_mode=track|delay` (how VLC applies a result; reported to the
 intf in each done status, default track). Invalid values are ignored (default kept).
+The daemon loads the config for every job.
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 
-## Daemon resources
+## Installation UX
+* Linux/macOS: `curl -LsSf https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.sh | sh`
+* Windows: double-click `install.cmd` (or `irm …/install.ps1 | iex`).
+Steps: install `uv` if missing → `uv tool install --python 3.12 vlc-subsync@<archive url>`
+→ `vlc-subsync setup` which: copies Lua scripts into every detected VLC (native,
+snap, flatpak), edits each `vlcrc` (`extraintf` append `luaintf` preserving existing
+entries, `lua-intf=subsync`) with a backup, creates queue dirs, registers the
+start-with-VLC mechanism and the `launcher` files (see "Lifecycle"; nothing is
+started now), removes the login autostart of earlier versions, pre-downloads the
+default English model. `vlc-subsync uninstall` reverses everything (including any
+leftover earlier-version autostart). `vlc-subsync doctor` diagnoses, including the
+lifecycle state (path unit enabled/active, LaunchAgent loaded, launcher exe present,
+leftover login autostart).
+
+## Lifecycle (the helper runs only while VLC runs)
+
+Owner requirement: the helper is **not** a login service.
+
+**Exit** (`lifecycle.IdleExitPolicy`, checked every second; injectable monotonic and
+wall clocks). VLC counts as alive if any watched queue's `intf_state` has
+`time` ≤ 20 s old and `state != stopped`. When no VLC is alive and no job is queued
+or running for 15 s, the daemon exits (code 0). A fresh daemon that has seen neither
+VLC nor a job waits up to 60 s first (VLC may still be starting, or a request
+started it); a `state=stopped` written in the last 60 s cuts that wait. So: VLC
+closed → exit ~15–17 s later; VLC killed → ~35 s (20 s staleness + 15 s); a job in
+flight always finishes first. Before exiting it polls `requests/` once more and then
+empties `requests/` (else `DirectoryNotEmpty` / `QueueDirectories` would restart it
+forever): non-`.req` entries older than 60 s (files and directories) are deleted, and
+`.req` files still there after 10 s are ones it could not read or delete. Whatever it
+cannot delete is moved to `<q>/rejected/` (cleaned after 7 days); if even that fails it
+logs it once. At startup only the non-`.req` junk is cleaned. `serve --persistent` disables all this.
+If a new instance starts while the old one is exiting, it waits up to 3 s for the lock.
+Started by systemd (`INVOCATION_ID` set) while another instance keeps the lock (e.g. a
+manual `serve --persistent`), it stays up while VLC runs, retrying the lock, instead
+of exiting: every exit would count toward the unit's start limit as VLC keeps
+triggering the path unit, and hitting it fails the path unit until `reset-failed`.
 
 **Models**: 60 s after the last job that ran the engine, the *worker thread* calls
 `transcribe.clear_cache()` (drops each model under its transcriber lock), drops the
@@ -378,13 +429,55 @@ Linux nice/ioprio are per thread and inherited): nice ≥ 10 (never lowered), Li
 arches only), Windows `BELOW_NORMAL_PRIORITY_CLASS`. Every step is best effort and
 never raises. `VLC_SUBSYNC_PRIORITY=normal` skips it (tests).
 
-## Installation UX
-* Linux/macOS: `curl -LsSf https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.sh | sh`
-* Windows: double-click `install.cmd` (or `irm …/install.ps1 | iex`).
-Steps: install `uv` if missing → `uv tool install --python 3.12 vlc-subsync@<archive url>`
-→ `vlc-subsync setup` which: copies Lua scripts into every detected VLC (native,
-snap, flatpak), edits each `vlcrc` (`extraintf` append `luaintf` preserving existing
-entries, `lua-intf=subsync`) with a backup, creates queue dirs, registers autostart
-(systemd user unit / launchd agent / Windows Startup shortcut to the GUI exe
-`vlc-subsync-daemon`), starts the daemon, pre-downloads the default English model.
-`vlc-subsync uninstall` reverses everything. `vlc-subsync doctor` diagnoses.
+**Linux (systemd user session)**: `~/.config/systemd/user/vlc-subsync.path`, enabled
+(`WantedBy=default.target`: only the inotify watch inside the user manager exists at
+login, no process), with `PathModified=<q>/intf_state` and
+`DirectoryNotEmpty=<q>/requests` for each usable queue dir, `Unit=vlc-subsync.service`.
+The service is `Type=simple`, `Nice=10`, `IOSchedulingClass=idle`,
+`CPUSchedulingPolicy=batch`, no `Restart=` (VLC's next 5 s write starts it again) and
+no `[Install]` (never enabled by itself). `StartLimitIntervalSec=600` +
+`StartLimitBurst=20` stop a crash loop (a VLC session normally starts it once);
+re-running setup does `reset-failed`. When re-setup changes the watched paths (e.g. a
+new snap install), it runs `daemon-reload` and then `restart vlc-subsync.path`, since
+a running path unit keeps its old watches. The Lua intf's tmp+rename write triggers
+`PathModified` (the watched inode is replaced).
+*Snap*: the queue dir is `~/snap/vlc/current/.local/share/vlc/subsync`, and
+`current` is a symlink to the revision dir that snapd switches on refresh. systemd
+resolves the symlink when it sets the watch (inotify follows it), but it also watches
+every parent directory, so the switch of `current` in `~/snap/vlc` makes it re-set
+the watches on the new target. Verified with systemd 249: after swapping
+`current` from `x1` to `x2`, writes to the old revision no longer trigger, and writes
+through `current` (now `x2`) do. The snap queue dir is therefore written with
+`current`, never with a revision number.
+*No systemd user session*: `launcher` `mode=spawn`; the intf runs
+`'<exe>' 'serve' >/dev/null 2>&1 &`. Snap/flatpak VLC cannot do that (sandbox), so
+setup warns that those need a manually started `vlc-subsync serve --persistent`.
+Migration: an old always-on unit (has `[Install]` or a `default.target.wants`
+link) is `disable --now`'d *before* its file is replaced, and an XDG autostart
+`.desktop` is removed.
+
+**macOS**: `~/Library/LaunchAgents/io.github.sergimn.vlc-subsync.plist` with
+`WatchPaths` = each `<q>/intf_state`, `QueueDirectories` = each `<q>/requests`,
+`ProcessType=Background`, `LowPriorityIO=true`, no `KeepAlive`, no `RunAtLoad`; setup
+`bootout`s and `bootstrap`s it. An old plist with `KeepAlive`/`RunAtLoad` is booted
+out and replaced. Not verified on a Mac in this change. launchd also throttles
+relaunches (10 s by default), which only delays a restart right after an exit.
+
+**Windows**: setup writes `<q>/launcher` (`mode=spawn`, absolute path of the GUI-subsystem
+`vlc-subsync-daemon.exe`, as an 8.3 short path if it has non-ASCII characters, since
+Lua's `os.execute` uses the ANSI code page). The intf runs `start "" /B "<exe>"`.
+Startup shortcut and `HKCU\…\Run\SubSync` of earlier versions are removed.
+Options considered (VLC 3 Lua has no process API besides `os.execute`/`io.popen`, both
+C `system()`/`_popen()`, i.e. `cmd.exe /c`):
+* `os.execute('"<exe>"')`: cmd.exe gets a console (VLC has none to share), which may
+  flash. cmd.exe does not wait for a GUI program, but `start` makes that explicit.
+* `os.execute('start "" /B "<exe>"')`: same single cmd.exe flash, returns at once;
+  the GUI exe opens no window. **Chosen.**
+* `io.popen`: same cmd.exe, plus a pipe; no benefit.
+* `wscript //B launcher.vbs` (`WshShell.Run cmd, 0`): still launched through cmd.exe,
+  so the same flash. It only helps to hide *console* programs, adds a process, often
+  triggers antivirus heuristics, and VBScript is deprecated by Microsoft.
+Residual behaviour (from documentation, **not verified on Windows**): one brief
+console flash when VLC starts and the helper is not already running; at most 3 per
+session if it keeps dying. A `%` in the exe path could be expanded by cmd.exe (the
+default install paths have none).

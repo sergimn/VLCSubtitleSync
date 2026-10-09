@@ -47,6 +47,18 @@ function Get-ToolBinDir($uv) {
     return $dir.Trim()
 }
 
+# The Python of the SubSync tool environment. SubSync's own commands run through it, not
+# through vlc-subsync.exe: uv makes that launcher on install, so Smart App Control and
+# App Control policies know nothing about it and block it, while python.exe is the same
+# file on every PC.
+function Get-ToolPython($uv) {
+    $dir = (& $uv tool dir --color never) | Select-Object -Last 1
+    if ($LASTEXITCODE -ne 0 -or -not $dir) { return $null }
+    $py = Join-Path $dir.Trim() 'vlc-subsync\Scripts\python.exe'
+    if (Test-Path $py) { return $py }
+    return $null
+}
+
 function Test-Arm64 {
     if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { return $true }
     try {
@@ -56,13 +68,35 @@ function Test-Arm64 {
 
 # The speech engine (ctranslate2, onnxruntime) needs the Microsoft Visual C++ runtime, which
 # a fresh Windows does not always have. Returns $null when everything imports, else the error.
-function Test-Engine($py) {
-    $ErrorActionPreference = 'Continue'  # stderr of a native command must not throw here
-    $out = & $py -c 'import av, ctranslate2, onnxruntime, faster_whisper' 2>&1
-    if ($LASTEXITCODE -eq 0) { return $null }
-    $last = $out | Select-Object -Last 1
-    if ($null -eq $last) { return "python exited with code $LASTEXITCODE" }
-    return $last.ToString().Trim()
+# The first start of the new Python and its DLLs can be slow (antivirus scanning them), so
+# say that it is still working, and give up with a clear error rather than hang silently.
+function Test-Engine($py, [int]$TimeoutSec = 300) {
+    $tmp = Join-Path $env:TEMP "vlc-subsync-check-$PID"
+    $code = '-c "import sys; [print(m, flush=True) or __import__(m) for m in sys.argv[1:]]"'
+    $p = Start-Process -FilePath $py -ArgumentList "$code av ctranslate2 onnxruntime faster_whisper" `
+        -NoNewWindow -PassThru -RedirectStandardOutput "$tmp.out" -RedirectStandardError "$tmp.err"
+    $null = $p.Handle  # without this, ExitCode can stay empty after the process exits
+    $t0 = Get-Date
+    $told = $false
+    while (-not $p.WaitForExit(2000)) {
+        $secs = ((Get-Date) - $t0).TotalSeconds
+        if (-not $told -and $secs -ge 20) {
+            Say 'Still checking; the first start can take a few minutes while antivirus scans the new files'
+            $told = $true
+        }
+        if ($secs -ge $TimeoutSec) {
+            $module = Get-Content "$tmp.out" -ErrorAction SilentlyContinue | Select-Object -Last 1
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Remove-Item "$tmp.out", "$tmp.err" -ErrorAction SilentlyContinue
+            Fail ("loading the speech engine ($module) did not finish in $([int]($TimeoutSec / 60)) minutes. " +
+                'Something on this PC, often antivirus, is holding it; allow it or wait for its scan, then run this installer again')
+        }
+    }
+    $last = Get-Content "$tmp.err" -ErrorAction SilentlyContinue | Where-Object { $_.Trim() } | Select-Object -Last 1
+    Remove-Item "$tmp.out", "$tmp.err" -ErrorAction SilentlyContinue
+    if ($p.ExitCode -eq 0) { return $null }
+    if (-not $last) { return "python exited with code $($p.ExitCode)" }
+    return $last.Trim()
 }
 
 function Install-VcRuntime {
@@ -83,10 +117,9 @@ function Invoke-Main {
     if ($Uninstall) {
         Say 'Uninstalling SubSync'
         if (-not $uv) { Fail 'uv not found; nothing to uninstall?' }
-        $bin = Get-ToolBinDir $uv
-        $exe = if ($bin) { Join-Path $bin 'vlc-subsync.exe' } else { $null }
-        if ($exe -and (Test-Path $exe)) {
-            & $exe uninstall @SetupArgs
+        $py = Get-ToolPython $uv
+        if ($py) {
+            & $py -m vlcsubsync.cli uninstall @SetupArgs
             if ($LASTEXITCODE -ne 0) { Warn 'vlc-subsync uninstall reported problems' }
         } else {
             Warn 'vlc-subsync not found; skipping VLC cleanup'
@@ -132,27 +165,31 @@ function Invoke-Main {
     $exe = Join-Path $bin 'vlc-subsync.exe'
     if (-not (Test-Path $exe)) { Fail "vlc-subsync.exe not found in $bin" }
 
-    $toolDir = (& $uv tool dir --color never) | Select-Object -Last 1
-    $py = if ($toolDir) { Join-Path $toolDir.Trim() 'vlc-subsync\Scripts\python.exe' } else { $null }
-    if ($py -and (Test-Path $py)) {
-        $err = Test-Engine $py
-        if ($err) {
-            Say "The speech engine cannot load yet ($err)"
-            Say 'Installing the Microsoft Visual C++ runtime it needs (Windows may ask for permission)'
-            try { $code = Install-VcRuntime } catch {
-                Fail "could not install the Microsoft Visual C++ runtime ($_). Install it from $VcRedistUrl, then run this installer again"
-            }
-            if ($code -notin 0, 1638, 3010) { Warn "the Visual C++ runtime installer exited with code $code" }
-            $err = Test-Engine $py
-            if ($err) { Fail "the speech engine still cannot load: $err" }
+    $py = Get-ToolPython $uv
+    if (-not $py) { Fail 'cannot find the Python that SubSync was installed with' }
+    Say 'Checking that the speech engine loads'
+    $err = Test-Engine $py
+    if ($err) {
+        Say "The speech engine cannot load yet ($err)"
+        Say 'Installing the Microsoft Visual C++ runtime it needs (Windows may ask for permission)'
+        try { $code = Install-VcRuntime } catch {
+            Fail "could not install the Microsoft Visual C++ runtime ($_). Install it from $VcRedistUrl, then run this installer again"
         }
-    } else {
-        Warn 'cannot find the SubSync Python; skipping the speech engine check'
+        if ($code -notin 0, 1638, 3010) { Warn "the Visual C++ runtime installer exited with code $code" }
+        $err = Test-Engine $py
+        if ($err) { Fail "the speech engine still cannot load: $err" }
     }
 
     Say 'Configuring VLC'
-    & $exe setup @SetupArgs
-    if ($LASTEXITCODE -ne 0) { Fail "vlc-subsync setup failed (run `"$exe doctor`" for details)" }
+    & $py -m vlcsubsync.cli setup @SetupArgs
+    if ($LASTEXITCODE -ne 0) { Fail "vlc-subsync setup failed (run `"$py`" -m vlcsubsync.cli doctor for details)" }
+
+    $blocked = $false
+    try { & $exe --version | Out-Null } catch { $blocked = $true }
+    if ($blocked) {
+        Warn ('Windows (Smart App Control or an App Control policy) blocks the vlc-subsync command. ' +
+            'SubSync still works in VLC. To run its commands, use: & "' + $py + '" -m vlcsubsync.cli doctor')
+    }
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not ($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $bin.TrimEnd('\') })) {

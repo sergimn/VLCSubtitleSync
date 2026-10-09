@@ -181,8 +181,8 @@ mode: the toggle asks for a restart) and `delay_active=1|0`.
 ```
 version=1
 mode=spawn                             # spawn: intf starts exe; service: systemd/launchd does
-exe=C:\Users\me\...\Scripts\vlc-subsync-daemon.exe   # absolute (8.3 short form if non-ASCII)
-args=                                  # whitespace-separated arguments (POSIX: `serve`)
+exe=C:\Users\me\...\Scripts\pythonw.exe   # absolute (8.3 short form if non-ASCII)
+args=-m vlcsubsync.cli serve --no-console  # whitespace-separated arguments (POSIX: `serve`)
 ```
 
 Daemon housekeeping: delete `.req` once picked up; delete jobs/out older than 7 days.
@@ -597,9 +597,14 @@ on Windows) cannot be passed: setup warns, leaves it out of `args` and writes no
 launcher there (its VLC would only start a helper that ignores it). systemd and
 launchd take arguments one by one and have no such limit.
 
-**Windows**: setup writes `<q>/launcher` (`mode=spawn`, absolute path of the GUI-subsystem
-`vlc-subsync-daemon.exe`, as an 8.3 short path if it has non-ASCII characters, since
-Lua's `os.execute` uses the ANSI code page). The intf runs `start "" /B "<exe>"`.
+**Windows**: setup writes `<q>/launcher` (`mode=spawn`, absolute path of the tool
+environment's GUI-subsystem `pythonw.exe` with `-m vlcsubsync.cli serve --no-console`,
+as an 8.3 short path if it has non-ASCII characters, since Lua's `os.execute` uses the
+ANSI code page). The intf runs `start "" /B "<exe>" <args>`. Not the
+`vlc-subsync-daemon.exe` entry point: uv generates that launcher on install, so it has
+no reputation and Smart App Control / App Control for Business block it ("An
+Application Control policy has blocked this file"), while `pythonw.exe` is the same
+file on every PC. The entry point remains the fallback when there is no `pythonw.exe`.
 Startup shortcut and `HKCU\…\Run\SubSync` of earlier versions are removed.
 Options considered (VLC 3 Lua has no process API besides `os.execute`/`io.popen`, both
 C `system()`/`_popen()`, i.e. `cmd.exe /c`):

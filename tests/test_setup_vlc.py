@@ -408,6 +408,15 @@ def test_daemon_command_prefers_venv_script(tmp_path, monkeypatch):
     wctx = S.Context(platform="windows", home=tmp_path, env={}, which=lambda n: None)
     (bindir / "vlc-subsync-daemon.exe").write_text("")
     assert S.daemon_command(wctx, gui=True) == [str(bindir / "vlc-subsync-daemon.exe")]
+    # pythonw.exe wins: App Control blocks the launcher exes uv makes on install
+    (bindir / "pythonw.exe").write_text("")
+    assert S.daemon_command(wctx, gui=True) == [
+        str(bindir / "pythonw.exe"),
+        "-m",
+        "vlcsubsync.cli",
+        "serve",
+        "--no-console",
+    ]
 
 
 def test_setup_cleans_legacy_snap_vlcrc(tmp_path):

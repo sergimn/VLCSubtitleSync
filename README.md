@@ -115,7 +115,7 @@ seconds after VLC closes (or after the last sync finishes, if one is still runni
 | Linux with systemd | `vlc-subsync.path` watches the SubSync files in VLC's folders and starts `vlc-subsync.service` when VLC writes them. Only that file watch is active while VLC is closed; no process runs. |
 | Linux without systemd | the SubSync script inside VLC starts the helper (not possible for snap/flatpak VLC, see Troubleshooting) |
 | macOS | a LaunchAgent that launchd starts when VLC writes its status file (no `KeepAlive`, no `RunAtLoad`) |
-| Windows | the SubSync script inside VLC starts `vlc-subsync-daemon.exe` |
+| Windows | the SubSync script inside VLC starts the helper with `pythonw.exe` |
 
 While it runs, the helper uses low priority (nice 10 and idle disk priority on Linux,
 background priority on macOS, "below normal" on Windows) and at most half your CPU
@@ -358,11 +358,18 @@ CUDA. The helper not running is normal while VLC is closed. Things to try:
   <!-- TODO(lead): verify document-portal paths with flatpak VLC -->
 - **Windows: a console window flashes when VLC starts**: VLC can start programs only
   through `cmd.exe`, which gets a window for a moment. SubSync uses `start "" /B`, so
-  `cmd.exe` exits at once and the helper itself (`vlc-subsync-daemon.exe`) has no
+  `cmd.exe` exits at once and the helper itself (`pythonw.exe`) has no
   window. Expect at most one brief flash per VLC session, and none if the helper is
   already running. This is based on Windows documentation and has not been tested
   on Windows yet. If your antivirus quarantined the helper, allow it and re-run the
   installer.
+- **Windows: "An Application Control policy has blocked this file"**: Smart App
+  Control (Windows 11) or a company App Control policy blocks the `vlc-subsync.exe`
+  command, because uv creates that small launcher on your PC and Windows has never
+  seen it. SubSync does not need it: the installer and VLC run SubSync through its
+  Python (`pythonw.exe`), which Windows does recognise. To run a SubSync command
+  yourself, use the line the installer prints, for example
+  `& "$env:APPDATA\uv\tools\vlc-subsync\Scripts\python.exe" -m vlcsubsync.cli doctor`.
 
 ## Uninstall
 

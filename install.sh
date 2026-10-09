@@ -1,7 +1,7 @@
 #!/bin/sh
 # SubSync (vlc-subsync) installer for Linux and macOS.
 #
-#   curl -LsSf https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.sh | sh
+#   curl -LsSf https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.sh | sh
 #   curl -LsSf .../install.sh | sh -s -- --uninstall
 #
 # Options (anything else is passed on to `vlc-subsync setup`, e.g. --no-model):

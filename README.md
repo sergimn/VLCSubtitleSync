@@ -29,14 +29,14 @@ starts together with VLC and quits shortly after VLC closes: nothing runs at log
 **Linux / macOS**: paste in a terminal:
 
 ```sh
-curl -LsSf https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.sh | sh
+curl -LsSf https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.sh | sh
 ```
 
 **Windows**: download [`install.cmd`](https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.cmd)
 and double-click it, or paste in PowerShell:
 
 ```powershell
-powershell -c "irm https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.ps1 | iex"
+powershell -c "irm https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.ps1 | iex"
 ```
 
 Then **restart VLC**. The first install downloads about 200 MB (Python runtime,
@@ -361,11 +361,11 @@ CUDA. The helper not running is normal while VLC is closed. Things to try:
 ## Uninstall
 
 ```sh
-curl -LsSf https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.sh | sh -s -- --uninstall
+curl -LsSf https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.sh | sh -s -- --uninstall
 ```
 
 Windows: run `install.cmd --uninstall`, or in PowerShell
-`$env:VLC_SUBSYNC_UNINSTALL=1; irm https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.ps1 | iex`.
+`$env:VLC_SUBSYNC_UNINSTALL=1; irm https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.ps1 | iex`.
 
 If the program is still installed you can also run `vlc-subsync uninstall`, which
 removes the VLC scripts, restores your `vlcrc` settings and removes what starts the

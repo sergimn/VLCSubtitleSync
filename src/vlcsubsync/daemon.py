@@ -546,6 +546,19 @@ class _StatusWriter:
         self._last_state = status.state
 
 
+def _unlink_retry(path: Path, attempts: int = 10, delay: float = 0.05) -> None:
+    """Unlink, retrying briefly on PermissionError: on Windows a file another process
+    has open (a reader, an indexer, antivirus) cannot be deleted for a moment."""
+    for i in range(attempts):
+        try:
+            path.unlink()
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def _short(msg: object, limit: int = 240) -> str:
     text = " ".join(str(msg).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -944,7 +957,7 @@ class Daemon:
                 paths.append(self.cache_dir / meta["file"])
             for p in paths:
                 try:
-                    p.unlink()
+                    _unlink_retry(p)
                     log.debug("dropped cached %s result %s", m, p.name)
                 except FileNotFoundError:
                     pass

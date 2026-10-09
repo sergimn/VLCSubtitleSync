@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -15,17 +15,20 @@ import numpy as np
 from . import vad
 from .align import (
     AlignResult,
+    Anchor,
     Cue,
     Mapping,
     apply_mapping,
     find_anchors,
     fit_mapping,
-    refine_with_speech,
+    refine_local,
+    subdivide,
     subtitle_tokens,
     vad_align,
 )
 from .config import Config
 from .media import SAMPLE_RATE, probe, read_media
+from .protocol import MapSegment
 from .subtitles import (
     dialogue_events,
     find_sidecars,
@@ -38,6 +41,8 @@ from .transcribe import Transcriber, Word, get_model, get_transcriber
 log = logging.getLogger(__name__)
 
 WINDOW_SECONDS = 30.0
+# Exhaustive mode skips a consecutive window with less detected speech than this (s).
+MIN_SPEECH_SECONDS = 0.5
 MIN_WHISPER_ANCHORS = 6
 LANG_PROB_MIN = 0.5
 
@@ -66,6 +71,28 @@ class SyncResult:
     anchors: int
     applied: bool
     message: str
+    # The full piecewise mapping (audio = scale*sub + offset + knots), time-ordered;
+    # empty when not applied. Delay mode applies it live in VLC (protocol.MapSegment).
+    mapping_segments: list[MapSegment] = field(default_factory=list)
+
+
+def mapping_segments(mapping: Mapping) -> list[MapSegment]:
+    """``align.Mapping`` → protocol segments (sub-time bounds, open at both ends)."""
+    segs = mapping.segments
+    out = []
+    for i, s in enumerate(segs):
+        lo = s.start if i > 0 and math.isfinite(s.start) else None
+        hi = segs[i + 1].start if i + 1 < len(segs) else None
+        out.append(
+            MapSegment(
+                lo,
+                hi,
+                float(s.scale),
+                float(s.offset),
+                tuple((float(t), float(c)) for t, c in s.knots),
+            )
+        )
+    return out
 
 
 def resolve_subtitle_source(
@@ -163,6 +190,36 @@ def pick_windows(
     return sorted(starts)
 
 
+def exhaustive_windows(
+    speech_sec: np.ndarray,
+    duration: float,
+    win: float = WINDOW_SECONDS,
+    min_speech: float = MIN_SPEECH_SECONDS,
+) -> list[float]:
+    """Consecutive window starts 0, win, 2·win, ... covering ``[0, duration)``, without
+    the windows whose detected speech (seconds, from ``speech_sec``) is < ``min_speech``.
+    The last window may be shorter than ``win``."""
+    if duration <= 0:
+        return []
+    n = int(math.ceil(duration / win - 1e-9))
+    cs = np.concatenate([[0.0], np.cumsum(speech_sec)]) if speech_sec.size else np.zeros(1)
+    total = speech_sec.size
+    starts = []
+    for i in range(n):
+        lo = min(int(round(i * win)), total)
+        hi = min(int(round((i + 1) * win)), total)
+        if cs[hi] - cs[lo] >= min_speech:
+            starts.append(float(i * win))
+    return starts
+
+
+def plan_windows(speech_sec: np.ndarray, duration: float, config: Config) -> list[float]:
+    """Initial transcription windows for ``config``'s mode (see ``config.MODES``)."""
+    if config.effective_mode == "exhaustive":
+        return exhaustive_windows(speech_sec, duration)
+    return pick_windows(speech_sec, duration, config.window_count(duration))
+
+
 # --------------------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------------------
@@ -226,6 +283,8 @@ def sync_subtitles(
     the output keeps the original timings.
     """
     t0 = time.monotonic()
+    mode = config.effective_mode
+    exhaustive = mode == "exhaustive"
     prog = _Progress(progress)
     prog(0.0, "Reading media")
     audio, subs, fmt, info = _load_source(media_path, audio_index, subtitle, prog)
@@ -247,9 +306,12 @@ def sync_subtitles(
     log.info("subtitle language guess: %s", sub_lang)
 
     fit: AlignResult | None = None
+    anchors: list[Anchor] = []
     reason = ""
-    k = config.window_count(duration)
-    windows = pick_windows(speech_sec, duration, k)
+    # sampled-window count (sizes the adaptive budget); exhaustive mode does not sample
+    k = 0 if exhaustive else config.window_count(duration)
+    windows = plan_windows(speech_sec, duration, config)
+    log.info("mode %s: %d initial windows over %.0fs", mode, len(windows), duration)
 
     # Language check / model selection.
     prog(0.37, "Detecting language")
@@ -284,14 +346,18 @@ def sync_subtitles(
     elif windows:
         sub_tok = subtitle_tokens(cues)
         transcribed: list[tuple[float, list[Word]]] = []
-        budget_extra = max(4, k // 2)
+        # Exhaustive mode already covers every window with speech: nothing to add.
+        budget_extra = 0 if exhaustive else max(4, k // 2)
         planned = len(windows)
 
         def run_windows(starts: list[float]) -> None:
             for st in starts:
                 n_done = len(transcribed)
                 frac = n_done / max(planned, 1)
-                prog(0.38 + 0.54 * frac, f"Transcribing {n_done + 1}/{planned}")
+                label = f"Transcribing {n_done + 1}/{planned}"
+                if exhaustive:
+                    label += " (exhaustive)"
+                prog(0.38 + 0.54 * frac, label)
                 a = int(st * SAMPLE_RATE)
                 b = min(audio.shape[0], int((st + WINDOW_SECONDS) * SAMPLE_RATE))
                 try:
@@ -347,6 +413,43 @@ def sync_subtitles(
                 len(new), fit.anchors, fit.total_anchors, fit.confidence,
                 len(fit.mapping.segments),
             )  # fmt: skip
+
+        # Bisection verification: check each segment at its midpoint (transcribing a
+        # window there if none is near, within a budget), split where it disagrees.
+        verify_left = config.verify_budget(duration)
+
+        def verify_probe(centre: float, near: float) -> tuple[list[Anchor], bool]:
+            """Transcribe a window near ``centre`` unless one is within ``near`` s or the
+            budget is spent; returns (anchors, whether a window was transcribed)."""
+            nonlocal anchors, verify_left, planned
+            if verify_left <= 0 or not 0.0 <= centre <= duration:
+                return anchors, False
+            if any(abs(st + 0.5 * WINDOW_SECONDS - centre) <= near for st, _w in transcribed):
+                return anchors, False
+            taken = [st for st, _w in transcribed]
+            lo = max(0.0, centre - near)
+            hi = min(duration, centre + near)
+            new = pick_windows(speech_sec, duration, 1, ranges=[(lo, hi)], taken=taken)
+            if not new:
+                return anchors, False
+            verify_left -= len(new)
+            planned += len(new)
+            run_windows(new)
+            anchors = find_anchors(sub_tok, transcribed)
+            return anchors, True
+
+        if fit.anchors >= MIN_WHISPER_ANCHORS:
+            n_before = len(transcribed)
+            fit, anchors = subdivide(
+                fit, anchors, cues, verify_probe, speech, vad.RESOLUTION, len(transcribed)
+            )
+            log.info(
+                "verification: %d checks, %d splits, %d folded, +%d windows: conf %.2f, "
+                "%d segments",
+                fit.details.get("verify_checks", 0), fit.details.get("verify_splits", 0),
+                fit.details.get("verify_folded", 0), len(transcribed) - n_before,
+                fit.confidence, len(fit.mapping.segments),
+            )  # fmt: skip
         if fit.anchors < MIN_WHISPER_ANCHORS:
             reason = f"too few transcript matches ({fit.anchors})"
     else:
@@ -355,9 +458,13 @@ def sync_subtitles(
 
     prog(0.93, "Aligning")
     if fit is not None and fit.anchors >= MIN_WHISPER_ANCHORS:
-        fit.mapping, shift = refine_with_speech(fit.mapping, cues, speech, vad.RESOLUTION)
-        fit.details["onset_shift"] = shift
-        log.info("speech-onset refinement: %+.3fs", shift)
+        fit.mapping, info = refine_local(fit.mapping, anchors, cues, speech, vad.RESOLUTION)
+        fit.details.update(info)
+        log.info(
+            "local refinement: segment shifts %s, speech-onset %+.3fs, %d wobble knots",
+            ", ".join(f"{d:+.3f}" for d in info["segment_shifts"]) or "-",
+            info["onset_shift"], info["knots"],
+        )  # fmt: skip
     final = fit
     if fit is None or fit.anchors < MIN_WHISPER_ANCHORS or fit.confidence < config.min_confidence:
         v = vad_align(speech, cues, vad.RESOLUTION)
@@ -386,6 +493,7 @@ def sync_subtitles(
             anchors=final.anchors,
             applied=True,
             message=message,
+            mapping_segments=mapping_segments(final.mapping),
         )
     else:
         conf = final.confidence if final is not None else 0.0
@@ -406,8 +514,8 @@ def sync_subtitles(
     result.output_path = save_subtitles(out_subs, output_path, fmt)
     t_end = time.monotonic()
     log.info(
-        "sync done in %.1fs (decode %.1f, vad %.1f, whisper %.1f): %s",
-        t_end - t0, t_decode - t0, t_vad - t_decode, t_whisper - t_vad, result.message,
+        "sync done in %.1fs, mode %s (decode %.1f, vad %.1f, whisper %.1f): %s",
+        t_end - t0, mode, t_decode - t0, t_vad - t_decode, t_whisper - t_vad, result.message,
     )  # fmt: skip
     prog(1.0, "Done")
     return result
@@ -415,6 +523,9 @@ def sync_subtitles(
 
 __all__ = [
     "Mapping",
+    "exhaustive_windows",
+    "mapping_segments",
+    "plan_windows",
     "SubtitleSource",
     "SyncError",
     "SyncResult",

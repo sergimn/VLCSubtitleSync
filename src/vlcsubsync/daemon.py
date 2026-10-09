@@ -1,9 +1,11 @@
 """``vlc-subsync serve``: watches the VLC queue dirs and runs sync jobs.
 
-See DESIGN.md ("File protocol").  One worker thread runs jobs one at a time; the main
-thread polls the ``requests/`` dirs, writes heartbeats and does housekeeping.  The job
-runner and the subtitle-source resolver are injectable so the daemon can be tested
-without the sync engine.
+See DESIGN.md ("File protocol", "Lifecycle"). One worker thread runs jobs one at a
+time and unloads the Whisper models after a minute without jobs; the main thread polls
+the ``requests/`` dirs, writes heartbeats, does housekeeping and, unless persistent,
+exits once VLC is gone (see :mod:`vlcsubsync.lifecycle`). The job runner, the
+subtitle-source resolver, the model unloader and the clocks are injectable so the
+daemon can be tested without the sync engine and without sleeping.
 """
 
 from __future__ import annotations
@@ -24,7 +26,16 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from . import __version__
+from . import lifecycle as L
 from . import protocol as P
+from .config import (
+    DEFAULT_MODE,
+    DEFAULT_SYNC_MODE,
+    MODES,
+    mode_rank,
+    normalize_mode,
+    normalize_sync_mode,
+)
 
 log = logging.getLogger("vlcsubsync.daemon")
 
@@ -426,6 +437,15 @@ def resolve_source(
     )
 
 
+def effective_mode(request: P.Request, config: Any) -> str:
+    """Sync mode of a job: the request's ``mode=`` if valid, else the config's."""
+    return (
+        normalize_mode(request.mode)
+        or normalize_mode(getattr(config, "mode", None))
+        or DEFAULT_MODE
+    )
+
+
 def load_config() -> Any:
     """Load the user's Config (lazy import of the engine's config module)."""
     try:
@@ -446,8 +466,9 @@ def load_config() -> Any:
 class EngineRunner:
     """Default job runner: calls ``vlcsubsync.sync.sync_subtitles``.
 
-    Whisper models stay warm between jobs through ``vlcsubsync.transcribe``'s
-    module-level model cache (the daemon process is long-lived).
+    Whisper models stay warm between back-to-back jobs through
+    ``vlcsubsync.transcribe``'s module-level model cache; the daemon unloads them
+    after ``model_idle`` seconds without a job.
     """
 
     def __call__(self, spec: JobSpec, progress: ProgressFn) -> Any:
@@ -482,6 +503,16 @@ class _Job:
     def params(self) -> tuple[Any, ...]:
         r = self.request
         return (r.audio_index, r.sub_index, r.sub_path)
+
+
+def _mode_switch(running: _Job, new: _Job) -> bool:
+    """The user asked for another sync mode for the running job's tracks: an explicit
+    ``mode=`` that differs ("Sync now (exhaustive)" during a fast run), or a forced
+    request in another mode ("Sync subtitles now" during an exhaustive run). Automatic
+    requests (no mode, no force) never cancel a running job."""
+    a = normalize_mode(running.request.mode)
+    b = normalize_mode(new.request.mode)
+    return a != b and (b is not None or new.request.force)
 
 
 class _StatusWriter:
@@ -537,6 +568,17 @@ class Daemon:
         rescan_interval: float = 30.0,
         max_age: float = MAX_AGE_SECONDS,
         version: str = __version__,
+        idle_exit: bool = False,
+        idle_grace: float = L.IDLE_GRACE_SECONDS,
+        startup_grace: float = L.STARTUP_GRACE_SECONDS,
+        intf_max_age: float = L.INTF_FRESH_SECONDS,
+        idle_check_interval: float = 1.0,
+        model_idle: float = L.MODEL_IDLE_SECONDS,
+        model_unloader: Callable[[], int] | None = None,
+        worker_wait: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        lock_wait: float = 3.0,
     ):
         self.extra_queue_dirs = [Path(q) for q in queue_dirs]
         self.use_default_queues = use_default_queues
@@ -554,6 +596,23 @@ class Daemon:
         self.rescan_interval = rescan_interval
         self.max_age = max_age
         self.version = version
+        # lifecycle (see vlcsubsync.lifecycle): exit when VLC is gone, unload models
+        self.idle_exit = idle_exit
+        self.intf_max_age = intf_max_age
+        self.idle_check_interval = idle_check_interval
+        self.model_idle = model_idle
+        self.model_unloader = model_unloader or L.unload_models
+        self.worker_wait = worker_wait
+        self.clock = clock
+        self.wall_clock = wall_clock
+        self.lock_wait = lock_wait
+        self.idle_policy = L.IdleExitPolicy(
+            idle_grace=idle_grace, startup_grace=startup_grace, clock=clock
+        )
+        self.exit_reason = ""
+        self.models_unloaded = 0  # number of unloads (for tests / logs)
+        self._models_loaded = False  # the engine ran since the last unload
+        self._last_job_end = clock()
 
         self.queue_dirs: list[Path] = []
         self.stop_event = threading.Event()
@@ -689,7 +748,7 @@ class Daemon:
             if (
                 running is not None
                 and running.media_key == job.media_key
-                and running.params != job.params
+                and (running.params != job.params or _mode_switch(running, job))
             ):
                 running.cancel_reason = "Superseded by a newer request"
                 running.cancel.set()
@@ -719,13 +778,22 @@ class Daemon:
     # ---------------------------------------------------------------- worker
     def _worker_loop(self) -> None:
         while True:
+            job: _Job | None = None
             with self._cond:
                 while not self._pending and not self.stop_event.is_set():
-                    self._cond.wait(timeout=1.0)
+                    if self.model_unload_due():
+                        break
+                    self._cond.wait(timeout=self.worker_wait)
                 if self.stop_event.is_set():
                     return
-                job = self._pending.pop(0)
-                self._running = job
+                if self._pending:
+                    job = self._pending.pop(0)
+                    self._running = job
+            if job is None:
+                # Unloading runs on the worker thread itself, so it can never race
+                # with a job using the model; a job queued meanwhile just waits.
+                self.unload_models()
+                continue
             try:
                 self.run_job(job)
             except Exception:  # noqa: BLE001 - never let a job kill the worker
@@ -733,9 +801,61 @@ class Daemon:
             finally:
                 with self._cond:
                     self._running = None
+                    self._last_job_end = self.clock()
                 self.jobs_completed += 1
 
-    def cache_key(self, job: _Job, source: ResolvedSource, config: Any) -> str:
+    # ---------------------------------------------------------------- model unloading
+    def model_unload_due(self, now: float | None = None) -> bool:
+        """True when the engine ran and no job has run for ``model_idle`` seconds."""
+        if not self._models_loaded:
+            return False
+        now = self.clock() if now is None else now
+        return now - self._last_job_end >= self.model_idle
+
+    def unload_models(self) -> int:
+        """Free the Whisper models (called on the worker thread when idle)."""
+        self._models_loaded = False
+        before = L.rss_mb()
+        try:
+            released = self.model_unloader()
+        except Exception:  # noqa: BLE001
+            log.exception("unloading models failed; retrying in %.0f s", self.model_idle)
+            with self._cond:
+                self._models_loaded = True  # still loaded: try again later
+                self._last_job_end = self.clock()
+            return 0
+        self.models_unloaded += 1
+        after = L.rss_mb()
+        mem = f"; RSS {before:.0f} -> {after:.0f} MiB" if before and after else ""
+        log.info(
+            "unloaded %d Whisper model(s) after %.0f s without jobs%s",
+            released,
+            self.model_idle,
+            mem,
+        )
+        return released
+
+    # ---------------------------------------------------------------- idle exit
+    def busy(self) -> bool:
+        with self._cond:
+            return bool(self._pending) or self._running is not None
+
+    def check_idle_exit(self) -> bool:
+        """True when VLC is gone and nothing was queued or running for long enough."""
+        activity = L.vlc_activity(
+            self.queue_dirs,
+            self.wall_clock(),
+            max_age=self.intf_max_age,
+            recent=self.idle_policy.startup_grace,
+        )
+        return self.idle_policy.update(
+            vlc_alive=activity.alive, busy=self.busy(), just_stopped=activity.just_stopped
+        )
+
+    def cache_key(
+        self, job: _Job, source: ResolvedSource, config: Any, mode: str | None = None
+    ) -> str:
+        """Result-cache key; ``mode`` defaults to the job's effective sync mode."""
         r = job.request
         media = os.path.abspath(r.media)
         st = os.stat(media)
@@ -748,8 +868,74 @@ class Daemon:
             str(getattr(config, "model_en", "")),
             str(getattr(config, "model_multi", "")),
             self.version,
+            mode or effective_mode(r, config),
         ]
         return hashlib.sha1("\0".join(parts).encode("utf-8")).hexdigest()
+
+    def cache_lookup_keys(
+        self, job: _Job, source: ResolvedSource, config: Any
+    ) -> list[tuple[str, str]]:
+        """``(mode, key)`` pairs whose results may satisfy this job: the most thorough
+        mode first, down to the job's own mode. A result of a more thorough mode is at
+        least as good, so an exhaustive result also answers a later fast/thorough
+        request (never the other way round), but only if it was applied (see
+        :meth:`_cached_result`)."""
+        want = mode_rank(effective_mode(job.request, config))
+        return [
+            (m, self.cache_key(job, source, config, m))
+            for m in reversed(MODES)
+            if mode_rank(m) >= want
+        ]
+
+    def _cached_result(
+        self, job: _Job, source: ResolvedSource, config: Any
+    ) -> tuple[Path, dict[str, str]] | None:
+        """Cached result for ``job``, or None.
+
+        The job's own mode may answer with any cached result, including an unapplied
+        one (no point redoing hopeless work in the same mode). Another, more thorough
+        mode only answers with an *applied* result: an unapplied exhaustive run (e.g.
+        windows lost to CUDA OOM, then the VAD fallback) must not block a fast sync
+        that might succeed.
+        """
+        own = effective_mode(job.request, config)
+        for m, key in self.cache_lookup_keys(job, source, config):
+            hit = self._cache_lookup(key)
+            if hit is None:
+                continue
+            if m != own and not P._to_bool(hit[1].get("applied")):
+                log.debug("ignoring unapplied cached %s result for a %s job", m, own)
+                continue
+            if P._to_bool(hit[1].get("applied")) and not hit[1].get("segments"):
+                # cached before results carried their mapping: delay mode cannot
+                # use it, so re-sync once (the new result replaces it)
+                log.info("cached %s result has no mapping; re-syncing", m)
+                continue
+            return hit
+        return None
+
+    def _cache_drop_other_modes(
+        self, job: _Job, source: ResolvedSource, config: Any, keep: str
+    ) -> None:
+        """Remove the cached results of every mode but ``keep`` for this file and
+        tracks, so the newest (forced) result is what later lookups find."""
+        for m in MODES:
+            if m == keep:
+                continue
+            key = self.cache_key(job, source, config, m)
+            meta_path = self.cache_dir / f"{key}.meta"
+            meta = P.read_kv(meta_path)
+            paths = [meta_path]
+            if meta and meta.get("file"):
+                paths.append(self.cache_dir / meta["file"])
+            for p in paths:
+                try:
+                    p.unlink()
+                    log.debug("dropped cached %s result %s", m, p.name)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    log.warning("cannot drop cached result %s: %s", p, exc)
 
     def _cache_lookup(self, key: str) -> tuple[Path, dict[str, str]] | None:
         meta = P.read_kv(self.cache_dir / f"{key}.meta")
@@ -798,11 +984,14 @@ class Daemon:
                 raise JobError(f"Media file not found: {r.media}")
             source = self.resolver(r)
             config = self.config_loader()
-            key = self.cache_key(job, source, config)
+            mode = effective_mode(r, config)
+            if r.mode and hasattr(config, "with_mode"):
+                config = config.with_mode(r.mode)
+            key = self.cache_key(job, source, config, mode)
             out_dir = job.queue_dir / P.OUT_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            cached = None if r.force else self._cache_lookup(key)
+            cached = None if r.force else self._cached_result(job, source, config)
             if cached is not None:
                 cached_file, meta = cached
                 dest = out_dir / f"{r.id}{cached_file.suffix}"
@@ -813,7 +1002,8 @@ class Daemon:
                 done.progress = 1.0
                 done.output = str(dest)
                 done.time = None
-                log.info("job %s: cache hit (%s)", r.id, key[:12])
+                done.sync_mode = _sync_mode(config)  # the current setting, not the cached one
+                log.info("job %s: cache hit (mode %s)", r.id, mode)
                 writer.write(done, force=True)
                 return done
 
@@ -842,6 +1032,7 @@ class Daemon:
                     )
                 )
 
+            self._models_loaded = True
             result = self.runner(spec, progress)
             if job.cancel.is_set():
                 raise JobCancelled(job.cancel_reason or "Cancelled")
@@ -859,13 +1050,20 @@ class Daemon:
                 offset=_float_or_none(getattr(result, "offset", None)),
                 scale=_float_or_none(getattr(result, "scale", None)),
                 confidence=_float_or_none(getattr(result, "confidence", None)),
+                segments=_segments_or_none(result),
+                sync_mode=_sync_mode(config),
             )
             writer.write(done, force=True)
             self._cache_store(key, output, done)
+            if r.force:
+                # the user asked for a fresh result: it must not be shadowed by an
+                # older result of another (more thorough) mode on the next open
+                self._cache_drop_other_modes(job, source, config, mode)
             log.info(
-                "job %s done in %.1fs: %s (applied=%s)",
+                "job %s done in %.1fs (mode %s): %s (applied=%s)",
                 r.id,
                 time.monotonic() - started,
+                mode,
                 done.message,
                 done.applied,
             )
@@ -891,7 +1089,7 @@ class Daemon:
         dirs: list[tuple[Path, float]] = []
         for q in self.queue_dirs:
             dirs += [(q / P.JOBS_DIR, self.max_age), (q / P.OUT_DIR, self.max_age)]
-            dirs += [(q / P.REQUESTS_DIR, 3600.0)]
+            dirs += [(q / P.REQUESTS_DIR, 3600.0), (q / L.REJECTED_DIR, self.max_age)]
         dirs.append((self.cache_dir, self.max_age))
         active_ids = set()
         with self._cond:
@@ -935,8 +1133,36 @@ class Daemon:
                 self._running.cancel.set()
             self._cond.notify_all()
 
+    def _acquire_lock(self) -> bool:
+        # A previous instance may be exiting right now (VLC closed and re-opened within
+        # the idle grace): wait for it briefly instead of giving up.
+        deadline = time.monotonic() + self.lock_wait
+        while not self.lock.acquire():
+            if time.monotonic() >= deadline:
+                return self._wait_for_lock_while_vlc_runs()
+            time.sleep(0.25)
+        return True
+
+    def _wait_for_lock_while_vlc_runs(self) -> bool:
+        """Started by systemd while another instance holds the lock (e.g. a manual
+        ``serve --persistent``): exiting at once would let VLC's next ``intf_state``
+        write start us again every few seconds, which hits the unit's start limit and
+        fails the path unit. Instead stay active (so further triggers are no-ops) until
+        the lock frees up or VLC is gone."""
+        if not (self.idle_exit and os.environ.get("INVOCATION_ID")):
+            return False
+        log.info("another instance holds the lock; waiting while VLC runs")
+        self.scan_queue_dirs()
+        while not self.stop_event.is_set():
+            if self.lock.acquire():
+                return True
+            if not L.vlc_activity(self.queue_dirs, self.wall_clock()).alive:
+                return False
+            self.stop_event.wait(self.idle_check_interval)
+        return False
+
     def run(self, *, acquire_lock: bool = True) -> int:
-        if acquire_lock and not self.lock.acquire():
+        if acquire_lock and not self._acquire_lock():
             pid = self.lock.holder_pid()
             log.error("another vlc-subsync daemon is already running (pid %s)", pid)
             return ALREADY_RUNNING
@@ -944,9 +1170,15 @@ class Daemon:
             self.scan_queue_dirs()
             if not self.queue_dirs:
                 log.warning("no VLC queue dirs found yet; will keep looking")
-            log.info("vlc-subsync daemon %s started (pid %d)", self.version, os.getpid())
+            log.info(
+                "vlc-subsync daemon %s started (pid %d)%s",
+                self.version,
+                os.getpid(),
+                "; exits when VLC is gone" if self.idle_exit else "",
+            )
+            L.clean_request_junk(self.queue_dirs, self.wall_clock())
             self.start_worker()
-            last_hb = last_scan = 0.0
+            last_hb = last_scan = last_idle = 0.0
             last_hk = time.monotonic() - self.housekeeping_interval + 5.0
             while not self.stop_event.is_set():
                 now = time.monotonic()
@@ -966,6 +1198,18 @@ class Daemon:
                     except Exception:  # noqa: BLE001
                         log.exception("housekeeping failed")
                     last_hk = now
+                if self.idle_exit and now - last_idle >= self.idle_check_interval:
+                    last_idle = now
+                    if self.check_idle_exit():
+                        # last look: a request may have landed since the poll above
+                        if self.poll_requests() == 0:
+                            self.exit_reason = "VLC is not running and no job is pending"
+                            log.info("%s; exiting", self.exit_reason)
+                            L.clean_request_junk(
+                                self.queue_dirs, self.wall_clock(), stuck_requests=True
+                            )
+                            break
+                        self.idle_policy.reset()
                 self.stop_event.wait(self.poll_interval)
         finally:
             self._shutdown()
@@ -987,6 +1231,21 @@ class Daemon:
                     P.Status(id=job.request.id, state="error", message="Daemon stopped"),
                 )
         self.remove_heartbeats()
+
+
+def _sync_mode(config: Any) -> str:
+    """The configured sync_mode (``track`` unless the config says ``delay``)."""
+    return normalize_sync_mode(getattr(config, "sync_mode", None)) or DEFAULT_SYNC_MODE
+
+
+def _segments_or_none(result: Any) -> list[P.MapSegment] | None:
+    """The result's mapping (``SyncResult.mapping_segments``) when it was applied."""
+    if not getattr(result, "applied", True):
+        return None
+    segs = getattr(result, "mapping_segments", None)
+    if not segs:
+        return None
+    return [s for s in segs if isinstance(s, P.MapSegment)] or None
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -1013,10 +1272,18 @@ def serve(
     use_default_queues: bool = True,
     log_to_stderr: bool = True,
     verbose: bool = False,
+    persistent: bool = False,
 ) -> int:
-    """Entry point for ``vlc-subsync serve``."""
+    """Entry point for ``vlc-subsync serve``.
+
+    Unless ``persistent``, the daemon exits by itself once VLC is gone (see
+    DESIGN.md "Lifecycle").
+    """
     setup_logging(to_stderr=log_to_stderr, level=logging.DEBUG if verbose else logging.INFO)
-    daemon = Daemon(queue_dirs, use_default_queues=use_default_queues)
+    applied = L.lower_priority()  # before any thread exists: threads inherit it
+    if applied:
+        log.info("process priority lowered: %s", ", ".join(applied))
+    daemon = Daemon(queue_dirs, use_default_queues=use_default_queues, idle_exit=not persistent)
     install_signal_handlers(daemon)
     try:
         rc = daemon.run()

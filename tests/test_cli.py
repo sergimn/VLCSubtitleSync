@@ -113,6 +113,37 @@ def test_cmd_sync_external(tmp_path, monkeypatch, capsys):
     assert "offset -1.50s" in out and "Applied:    yes" in out and "+4.27" in out
 
 
+def test_parse_sync_mode():
+    assert parse("sync", "m.mkv").mode is None
+    assert parse("sync", "m.mkv", "--mode", "exhaustive").mode == "exhaustive"
+    with pytest.raises(SystemExit):
+        parse("sync", "m.mkv", "--mode", "turbo")
+
+
+@pytest.mark.parametrize("flag", [None, "fast", "thorough", "exhaustive"])
+def test_cmd_sync_mode_flag(tmp_path, monkeypatch, flag):
+    import vlcsubsync.sync as sync_mod
+    from vlcsubsync.config import Config
+
+    Config(mode="thorough").save()  # configured mode; the flag overrides it
+    media = tmp_path / "Movie.mkv"
+    media.write_bytes(b"x")
+    sub = tmp_path / "Movie.srt"
+    sub.write_text("")
+    seen = {}
+
+    def fake_sync(media_path, audio_index, subtitle, output_path, config, progress=None, **kw):
+        seen["mode"] = config.mode
+        return fake_result(output_path)
+
+    monkeypatch.setattr(sync_mod, "sync_subtitles", fake_sync)
+    argv = ["sync", str(media), "--sub-file", str(sub)]
+    if flag:
+        argv += ["--mode", flag]
+    assert cli.main(argv) == 0
+    assert seen["mode"] == (flag or "thorough")
+
+
 def test_cmd_sync_vlc_ordinal(tmp_path, monkeypatch):
     import vlcsubsync.sync as sync_mod
 
@@ -184,7 +215,10 @@ def test_serve_dispatch(monkeypatch):
         "use_default_queues": False,
         "log_to_stderr": True,
         "verbose": True,
+        "persistent": False,
     }
+    assert cli.main(["serve", "--persistent"]) == 0
+    assert got["persistent"] is True
 
 
 def test_daemon_main_no_console(monkeypatch):

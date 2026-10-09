@@ -1,7 +1,8 @@
 """faster-whisper wrapper behind a small :class:`Transcriber` protocol.
 
 Models are loaded lazily and cached per ``(model, device, compute_type, threads)`` so
-the daemon keeps them warm between jobs (:func:`get_transcriber`).
+back-to-back jobs reuse them (:func:`get_transcriber`); the daemon frees them with
+:func:`clear_cache` after a minute without jobs.
 
 ``device="auto"`` tries CUDA first and silently falls back to CPU on *any* CUDA error,
 including errors raised during the first transcription (missing cuDNN/cuBLAS often
@@ -78,7 +79,12 @@ def _cuda_available() -> bool:
 
 
 def default_threads() -> int:
-    return max(1, min(8, os.cpu_count() or 4))
+    """CPU threads for Whisper when ``threads=0``: half the cores, 1..8.
+
+    Leaves the other half to VLC (video decoding, audio output) so playback stays
+    smooth while a sync runs in the background.
+    """
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
 
 
 class WhisperTranscriber:
@@ -240,10 +246,24 @@ def get_model(config: Config, model_name: str) -> WhisperTranscriber:
         return t
 
 
-def clear_cache() -> None:
-    """Drop all cached models (frees memory)."""
+def clear_cache() -> int:
+    """Drop all cached models (frees memory); returns how many were loaded.
+
+    Each model is dropped under its transcriber's lock, so an in-flight transcription
+    finishes first, and a transcriber still referenced elsewhere just reloads lazily
+    on its next use. CTranslate2 frees the memory when the last reference goes.
+    """
     with _cache_lock:
+        transcribers = list(_cache.values())
         _cache.clear()
+    released = 0
+    for t in transcribers:
+        with t._lock:
+            if t._model is not None:
+                t._model = None
+                t.device = None
+                released += 1
+    return released
 
 
 def download_model(model_name: str, download_root: str | None = None) -> str:

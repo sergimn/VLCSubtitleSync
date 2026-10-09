@@ -2,6 +2,8 @@
 
 * detect VLC installs (Linux native / snap / flatpak, macOS, Windows)
 * copy the Lua scripts (package data) into ``<userdatadir>/lua/{intf,extensions}``
+  and list them as one add-on in VLC's ``<userdatadir>/catalog.xml`` (name, icon and
+  description in the Addons Manager)
 * edit ``vlcrc`` (``extraintf`` += ``luaintf``, ``lua-intf=subsync``) with a backup and a
   small state file so ``uninstall`` can revert exactly what we changed
 * create the queue dirs
@@ -16,6 +18,7 @@ filesystem root and subprocess calls.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import os
@@ -27,6 +30,8 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
@@ -49,6 +54,25 @@ STATE_SUFFIX = ".subsync-state"
 LUA_INTF_NAME = "subsync"
 EXTRAINTF_MODULE = "luaintf"
 KNOWN_SCRIPTS = {"intf": ("subsync.lua",), "extensions": ("subsync_ext.lua",)}
+PROJECT_URL = "https://github.com/sergimn/VLCSubtitleSync"
+ADDONS_CATALOG = "catalog.xml"
+ADDONS_NS = "http://videolan.org/ns/vlc/addons/1.0"
+ADDON_ID = str(uuid.uuid5(uuid.NAMESPACE_URL, PROJECT_URL))
+ADDON_ICON = "icon-256.png"
+ADDON_CREATOR = "Sergi Miralles"
+ADDON_SUMMARY = "Syncs subtitles to the audio, automatically"
+ADDON_DESCRIPTION = (
+    "Pick a subtitle track and keep watching: a few seconds later it is swapped for a "
+    "copy synced to the audio track you have selected. It fixes constant delays, drift "
+    "(e.g. a 25 fps subtitle on a 23.976 fps video) and cuts (a subtitle made for a "
+    "version with an extra scene or ad break).\n"
+    "It listens to the audio with OpenAI's Whisper speech model, running locally on "
+    "your computer (offline after the first download). No account, no upload.\n"
+    "View > SubSync has the manual controls. Needs the vlc-subsync helper "
+    "(see the website)."
+)
+# Lua dir under <userdatadir> -> resource type in VLC's addons catalog
+ADDON_RESOURCE_TYPES = {"intf": "interface", "extensions": "extension"}
 
 MINIMAL_VLCRC = (
     "﻿###\n"
@@ -592,6 +616,148 @@ def remove_scripts(ctx: Context, inst: VlcInstall) -> None:
             if p.exists() and ctx.do(f"remove {p}"):
                 p.unlink()
                 ctx.ok(f"removed {p}")
+
+
+# --------------------------------------------------------------------------- Addons Manager
+#
+# VLC's Addons Manager (Tools > Plugins and extensions) lists a Lua script it finds
+# in <userdatadir>/lua/* by file name, with a "broken" icon, unless an entry of
+# <userdatadir>/catalog.xml (its record of installed add-ons) lists the file; that
+# entry gives the name, summary, description and icon (base64 image) it shows
+# (VLC 3.0 modules/misc/addons/fsstorage.c). VLC rewrites the file itself when an
+# add-on is installed or removed there and keeps our entry.
+
+
+def _addon_id_key(value: str) -> str:
+    # VLC writes ids back with its own dash layout
+    return value.replace("-", "").lower()
+
+
+def addon_entry(ns: str, scripts: dict[str, list[tuple[str, bytes]]]) -> ET.Element:
+    """Our ``<addon>`` element of VLC's addons catalog."""
+
+    def q(tag: str) -> str:
+        return f"{{{ns}}}{tag}" if ns else tag
+
+    addon = ET.Element(
+        q("addon"),
+        {
+            "source": "",
+            "type": "extension",
+            "id": ADDON_ID,
+            "downloads": "0",
+            "score": "0",
+            "version": __version__,
+        },
+    )
+    ET.SubElement(addon, q("name")).text = DISPLAY_NAME
+    ET.SubElement(addon, q("summary")).text = ADDON_SUMMARY
+    ET.SubElement(addon, q("description")).text = ADDON_DESCRIPTION
+    icon = asset_path(ADDON_ICON)
+    if icon is not None:
+        ET.SubElement(addon, q("image")).text = base64.b64encode(icon.read_bytes()).decode()
+    authorship = ET.SubElement(addon, q("authorship"))
+    ET.SubElement(authorship, q("creator")).text = ADDON_CREATOR
+    ET.SubElement(authorship, q("sourceurl")).text = PROJECT_URL
+    for sub, files in scripts.items():
+        for name, _data in files:
+            ET.SubElement(addon, q("resource"), {"type": ADDON_RESOURCE_TYPES[sub]}).text = name
+    return addon
+
+
+def _read_catalog(path: Path) -> tuple[ET.Element, str] | None:
+    """(root, namespace) of VLC's addons catalog, a new one if there is none, or
+    None if it can't be read (left alone then)."""
+    if not path.exists():
+        root = ET.Element(f"{{{ADDONS_NS}}}videolan")
+        ET.SubElement(root, f"{{{ADDONS_NS}}}addons")
+        return root, ADDONS_NS
+    try:
+        root = ET.fromstring(path.read_bytes())
+    except (ET.ParseError, OSError):
+        return None
+    ns = root.tag[1:].split("}", 1)[0] if root.tag.startswith("{") else ""
+    if root.tag.rsplit("}", 1)[-1] != "videolan":
+        return None
+    return root, ns
+
+
+def _catalog_addons(root: ET.Element, ns: str) -> ET.Element:
+    tag = f"{{{ns}}}addons" if ns else "addons"
+    addons = root.find(tag)
+    return addons if addons is not None else ET.SubElement(root, tag)
+
+
+def _canon(el: ET.Element) -> tuple[Any, ...]:
+    """Comparable form of an element, ignoring layout whitespace."""
+    return (el.tag, sorted(el.attrib.items()), (el.text or "").strip(), [_canon(c) for c in el])
+
+
+def _is_ours(addon: ET.Element, ns: str) -> bool:
+    if addon.tag != (f"{{{ns}}}addon" if ns else "addon"):
+        return False
+    if _addon_id_key(addon.get("id", "")) == _addon_id_key(ADDON_ID):
+        return True
+    ours = {(ADDON_RESOURCE_TYPES[k], n) for k, names in KNOWN_SCRIPTS.items() for n in names}
+    res = f"{{{ns}}}resource" if ns else "resource"
+    return any((r.get("type"), (r.text or "").strip()) in ours for r in addon.iter(res))
+
+
+def _write_catalog(path: Path, root: ET.Element, ns: str) -> None:
+    if ns:
+        ET.register_namespace("", ns)  # VLC matches element names with their prefix
+    ET.indent(root, space="\t")
+    text = ET.tostring(root, encoding="unicode")
+    P.write_text_atomic(path, '<?xml version="1.0" encoding="UTF-8"?>\n' + text + "\n")
+
+
+def register_addon(
+    ctx: Context, inst: VlcInstall, scripts: dict[str, list[tuple[str, bytes]]]
+) -> None:
+    """Add (or update) our entry in VLC's addons catalog."""
+    if not any(scripts.values()):
+        return
+    path = inst.data_dir / ADDONS_CATALOG
+    read = _read_catalog(path)
+    if read is None:
+        ctx.warn(f"{path} is not a VLC addons catalog: Addons Manager entry not added")
+        return
+    root, ns = read
+    addons = _catalog_addons(root, ns)
+    entry = addon_entry(ns, scripts)
+    old = [a for a in addons if _is_ours(a, ns)]
+    if len(old) == 1 and _canon(old[0]) == _canon(entry):
+        ctx.ok(f"{path} lists {DISPLAY_NAME}")
+        return
+    if not ctx.do(f"list {DISPLAY_NAME} in {path} (VLC Addons Manager)"):
+        return
+    for a in old:
+        addons.remove(a)
+    addons.append(entry)
+    _write_catalog(path, root, ns)
+    ctx.ok(f"listed {DISPLAY_NAME} in {path}")
+
+
+def unregister_addon(ctx: Context, inst: VlcInstall) -> None:
+    """Remove our entry from VLC's addons catalog (the file too if nothing is left)."""
+    path = inst.data_dir / ADDONS_CATALOG
+    if not path.exists():
+        return
+    read = _read_catalog(path)
+    if read is None:
+        return
+    root, ns = read
+    addons = _catalog_addons(root, ns)
+    old = [a for a in addons if _is_ours(a, ns)]
+    if not old or not ctx.do(f"remove {DISPLAY_NAME} from {path}"):
+        return
+    for a in old:
+        addons.remove(a)
+    if len(addons):
+        _write_catalog(path, root, ns)
+    else:
+        path.unlink()
+    ctx.ok(f"removed {DISPLAY_NAME} from {path}")
 
 
 def create_queue_dir(ctx: Context, inst: VlcInstall) -> None:
@@ -1370,6 +1536,7 @@ def run_setup(
             continue
         try:
             install_scripts(ctx, inst, scripts)
+            register_addon(ctx, inst, scripts)
             cleanup_legacy_snap_vlcrc(ctx, inst)
             configure_vlcrc(ctx, inst)
             create_queue_dir(ctx, inst)
@@ -1468,6 +1635,7 @@ def run_uninstall(
         ctx.step(f"{inst.label()}: {inst.data_dir}")
         try:
             remove_scripts(ctx, inst)
+            unregister_addon(ctx, inst)
             cleanup_legacy_snap_vlcrc(ctx, inst)
             unconfigure_vlcrc(ctx, inst)
             remove_queue_dir(ctx, inst)

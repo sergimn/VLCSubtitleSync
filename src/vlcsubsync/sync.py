@@ -15,12 +15,13 @@ import numpy as np
 from . import vad
 from .align import (
     AlignResult,
+    Anchor,
     Cue,
     Mapping,
     apply_mapping,
     find_anchors,
     fit_mapping,
-    refine_with_speech,
+    refine_local,
     subtitle_tokens,
     vad_align,
 )
@@ -247,6 +248,7 @@ def sync_subtitles(
     log.info("subtitle language guess: %s", sub_lang)
 
     fit: AlignResult | None = None
+    anchors: list[Anchor] = []
     reason = ""
     k = config.window_count(duration)
     windows = pick_windows(speech_sec, duration, k)
@@ -355,9 +357,13 @@ def sync_subtitles(
 
     prog(0.93, "Aligning")
     if fit is not None and fit.anchors >= MIN_WHISPER_ANCHORS:
-        fit.mapping, shift = refine_with_speech(fit.mapping, cues, speech, vad.RESOLUTION)
-        fit.details["onset_shift"] = shift
-        log.info("speech-onset refinement: %+.3fs", shift)
+        fit.mapping, info = refine_local(fit.mapping, anchors, cues, speech, vad.RESOLUTION)
+        fit.details.update(info)
+        log.info(
+            "local refinement: segment shifts %s, speech-onset %+.3fs, %d wobble knots",
+            ", ".join(f"{d:+.3f}" for d in info["segment_shifts"]) or "-",
+            info["onset_shift"], info["knots"],
+        )  # fmt: skip
     final = fit
     if fit is None or fit.anchors < MIN_WHISPER_ANCHORS or fit.confidence < config.min_confidence:
         v = vad_align(speech, cues, vad.RESOLUTION)

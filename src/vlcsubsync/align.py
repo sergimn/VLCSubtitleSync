@@ -9,9 +9,11 @@ Pipeline (see DESIGN.md):
    RANSAC candidate lines → Viterbi labelling of time-sorted anchors with a segment
    switch penalty → per-segment IRLS refit (short segments share the dominant scale)
    → boundaries placed at cue gaps (using the speech mask when available).
-4. :func:`vad_align` – fallback: FFT cross-correlation of the speech mask with the
+4. :func:`refine_local` – per-segment median residual, global speech-onset bias
+   (:func:`refine_with_speech`), smooth local wobble knots; each bounded ±0.5 s.
+5. :func:`vad_align` – fallback: FFT cross-correlation of the speech mask with the
    subtitle-on mask over framerate scale candidates.
-5. :func:`apply_mapping` – retime every event (cue durations scale with the
+6. :func:`apply_mapping` – retime every event (cue durations scale with the
    segment, introduced overlaps are clamped, nothing is dropped).
 
 Everything is deterministic (seeded RNG).
@@ -95,9 +97,23 @@ class Segment:
     scale: float
     offset: float
     anchors: int = 0
+    # Smooth local correction: (subtitle time, seconds) knots, linearly interpolated
+    # and held flat outside (see :func:`refine_local`). Empty = none.
+    knots: tuple[tuple[float, float], ...] = ()
+
+    def line(self, t: float) -> float:
+        return self.scale * t + self.offset
+
+    def correction(self, t):
+        if not self.knots:
+            return 0.0 if np.ndim(t) == 0 else np.zeros(np.shape(t))
+        kx = [k[0] for k in self.knots]
+        ky = [k[1] for k in self.knots]
+        c = np.interp(t, kx, ky)
+        return float(c) if np.ndim(t) == 0 else c
 
     def map(self, t: float) -> float:
-        return self.scale * t + self.offset
+        return self.scale * t + self.offset + self.correction(t)
 
 
 @dataclass
@@ -125,7 +141,12 @@ class Mapping:
         idx = np.clip(np.searchsorted(starts, t, side="right") - 1, 0, len(self.segments) - 1)
         sc = np.array([s.scale for s in self.segments])[idx]
         of = np.array([s.offset for s in self.segments])[idx]
-        return sc * t + of
+        out = sc * t + of
+        for i, s in enumerate(self.segments):
+            if s.knots:
+                m = idx == i
+                out[m] += s.correction(np.asarray(t)[m])
+        return out
 
     def dominant(self, cue_starts: Sequence[float] | None = None) -> Segment:
         """Segment covering most cues (or most anchors if no cues are given)."""
@@ -830,6 +851,39 @@ def speech_onsets(speech: np.ndarray, resolution: float = 0.01, min_silence: flo
     return np.asarray(keep, dtype=float) * resolution
 
 
+def _onset_deltas(
+    mapping: Mapping, cue_starts: np.ndarray, onsets: np.ndarray, search: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """For every cue: (nearest speech onset - mapped start, |delta| <= search)."""
+    starts = mapping.map_array(cue_starts)
+    if onsets.size == 0:
+        return np.zeros_like(starts), np.zeros(starts.shape, dtype=bool)
+    idx = np.searchsorted(onsets, starts)
+    lo = onsets[np.clip(idx - 1, 0, onsets.size - 1)]
+    hi = onsets[np.clip(idx, 0, onsets.size - 1)]
+    nearest = np.where(np.abs(lo - starts) <= np.abs(hi - starts), lo, hi)
+    delta = nearest - starts
+    return delta, np.abs(delta) <= search
+
+
+def _median_se(d: np.ndarray) -> tuple[float, float, float]:
+    """(median, MAD, standard error of the median for a ~normal core)."""
+    med = float(np.median(d))
+    mad = float(np.median(np.abs(d - med)))
+    return med, mad, 1.858 * max(mad, 0.01) / math.sqrt(d.size)
+
+
+def _shift_mapping(mapping: Mapping, shifts: Sequence[float] | float) -> Mapping:
+    if isinstance(shifts, (int, float)):
+        shifts = [float(shifts)] * len(mapping.segments)
+    return Mapping(
+        [
+            Segment(s.start, s.scale, s.offset + d, s.anchors, s.knots)
+            for s, d in zip(mapping.segments, shifts, strict=True)
+        ]
+    )
+
+
 def refine_with_speech(
     mapping: Mapping,
     cues: Sequence[Cue],
@@ -837,33 +891,242 @@ def refine_with_speech(
     resolution: float = 0.01,
     search: float = 0.5,
     max_shift: float = 0.4,
+    max_se: float = 0.04,
 ) -> tuple[Mapping, float]:
     """Remove a constant residual bias (Whisper word timestamps are typically a bit
     late/early depending on the model) by snapping mapped cue starts to nearby speech
-    onsets. Only applied when many cues agree on the same small shift.
+    onsets. Applied when the median shift is *precise*: enough cues, standard error of
+    the median ≤ ``max_se`` and a coherent core (MAD ≤ 0.25 s; real dialogue has a
+    0.1-0.2 s MAD, so a spread gate alone rejects useful shifts).
 
     Returns ``(mapping, shift_applied)``.
     """
     onsets = speech_onsets(speech, resolution)
     if onsets.size < 5 or not cues:
         return mapping, 0.0
-    starts = mapping.map_array(np.array([c.start for c in cues]))
-    idx = np.searchsorted(onsets, starts)
-    lo = onsets[np.clip(idx - 1, 0, onsets.size - 1)]
-    hi = onsets[np.clip(idx, 0, onsets.size - 1)]
-    nearest = np.where(np.abs(lo - starts) <= np.abs(hi - starts), lo, hi)
-    delta = nearest - starts
-    ok = np.abs(delta) <= search
-    n = int(ok.sum())
-    if n < max(8, int(0.25 * len(cues))):
+    delta, ok = _onset_deltas(mapping, np.array([c.start for c in cues]), onsets, search)
+    if int(ok.sum()) < max(8, int(0.25 * len(cues))):
         return mapping, 0.0
-    d = delta[ok]
-    shift = float(np.median(d))
-    mad = float(np.median(np.abs(d - shift)))
-    if mad > 0.12 or abs(shift) > max_shift or abs(shift) < 0.02:
+    shift, mad, se = _median_se(delta[ok])
+    if mad > 0.25 or se > max_se or abs(shift) > max_shift or abs(shift) < 0.02:
         return mapping, 0.0
-    segs = [Segment(s.start, s.scale, s.offset + shift, s.anchors) for s in mapping.segments]
-    return Mapping(segs), shift
+    return _shift_mapping(mapping, shift), shift
+
+
+# --------------------------------------------------------------------------------------
+# Local refinement
+# --------------------------------------------------------------------------------------
+
+LOCAL_MAX_SHIFT = 0.5  # s, bound of each local correction
+WOBBLE_PRIOR = 0.2  # s, prior std-dev of slow local wobble (shrinkage)
+WOBBLE_STEP = 120.0  # s (subtitle clock) between correction knots
+WOBBLE_HALF_WIDTH = 120.0  # s, neighbourhood of a knot
+
+
+def _wmedian(v: np.ndarray, w: np.ndarray) -> float:
+    o = np.argsort(v)
+    c = np.cumsum(w[o])
+    return float(v[o][min(int(np.searchsorted(c, 0.5 * c[-1])), v.size - 1)])
+
+
+def _best_per_group(r: np.ndarray, grp: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Within ``mask``, keep only the candidate with the smallest |r| of each group."""
+    idx = np.flatnonzero(mask)
+    out = np.zeros(mask.shape, dtype=bool)
+    if idx.size == 0:
+        return out
+    order = idx[np.lexsort((np.abs(r[idx]), grp[idx]))]
+    first = np.ones(order.size, dtype=bool)
+    first[1:] = grp[order][1:] != grp[order][:-1]
+    out[order[first]] = True
+    return out
+
+
+def refine_local(
+    mapping: Mapping,
+    anchors: Sequence[Anchor],
+    cues: Sequence[Cue],
+    speech: np.ndarray | None = None,
+    resolution: float = 0.01,
+    max_shift: float = LOCAL_MAX_SHIFT,
+    wobble: bool = True,
+) -> tuple[Mapping, dict]:
+    """Local refinement of a fitted mapping, in three consistent steps:
+
+    1. per segment: shift by the robust (weighted) median residual of its inlier
+       anchors (Whisper word time - mapped subtitle token time), bounded ±``max_shift``;
+    2. global: :func:`refine_with_speech` measures what is *left* against speech
+       onsets (independent of Whisper's timestamp bias) and removes it if precise;
+    3. per segment, if ``wobble``: smooth correction knots every ``WOBBLE_STEP`` s
+       from neighbourhood medians of the remaining anchor residuals (per window, with
+       ``WINDOW_BIAS`` allowed for a window's shared timestamp bias) and of speech-onset
+       deltas, combined by precision and shrunk towards 0; linearly interpolated, so
+       slow wobble is followed without per-cue jitter.
+
+    Each step works on the residual of the previous one, so they cannot fight: the
+    anchors decide differences *between* parts of the file, speech onsets the common
+    absolute bias. The result is one continuous correction relative to the fitted
+    lines, bounded by ±``max_shift`` in *total* (see :func:`_assemble_correction`).
+    Returns ``(mapping, info)``.
+    """
+    info: dict = {"segment_shifts": [], "onset_shift": 0.0, "knots": 0}
+    if not anchors or len(anchors) < 3:
+        return mapping, info
+    fitted = mapping
+    arr = _AnchorArrays.build(anchors)
+    cue_starts = np.array([c.start for c in cues]) if cues else np.zeros(0)
+    first = float(cue_starts.min()) if cue_starts.size else -math.inf
+    last = float(max(c.end for c in cues)) if cues else math.inf
+    segs = mapping.segments
+
+    def seg_range(i: int) -> tuple[float, float]:
+        lo = -math.inf if i == 0 else segs[i].start
+        hi = math.inf if i + 1 == len(segs) else segs[i + 1].start
+        return lo, hi
+
+    def residuals(seg: Segment, lo: float, hi: float) -> tuple[np.ndarray, np.ndarray]:
+        x = arr.x(seg.scale)
+        r = arr.y - seg.map(x)
+        m = (arr.x0 >= lo) & (arr.x0 < hi) & (np.abs(r) < INLIER_THRESHOLD)
+        return r, _best_per_group(r, arr.grp, m)
+
+    # 1. per-segment median residual
+    shifts = []
+    for i, seg in enumerate(segs):
+        r, b = residuals(seg, *seg_range(i))
+        d = 0.0
+        if b.sum() >= 8:
+            med0 = _wmedian(r[b], arr.w[b])
+            core = b & (np.abs(r - med0) < 0.5)
+            if core.sum() >= 8:
+                d = max(-max_shift, min(max_shift, _wmedian(r[core], arr.w[core])))
+        shifts.append(d)
+    mapping = _shift_mapping(mapping, shifts)
+    info["segment_shifts"] = shifts
+
+    # 2. global bias against speech onsets
+    onsets = np.zeros(0)
+    if speech is not None and speech.size and cues:
+        mapping, info["onset_shift"] = refine_with_speech(mapping, cues, speech, resolution)
+        onsets = speech_onsets(speech, resolution)
+    # 3. smooth neighbourhood corrections (relative knots per segment)
+    segs = mapping.segments
+    rel_knots: list[tuple[np.ndarray, np.ndarray] | None] = [None] * len(segs)
+    if not wobble:
+        return _assemble_correction(fitted, mapping, rel_knots, first, last, max_shift, info)
+    delta, ok = (
+        _onset_deltas(mapping, cue_starts, onsets, 0.5) if onsets.size >= 5 else (None, None)
+    )
+    for i, seg in enumerate(segs):
+        lo, hi = seg_range(i)
+        lo_c, hi_c = max(lo, first), min(hi, last)
+        r, b = residuals(seg, lo, hi)
+        # Both sources only contribute variation around their own baseline in this
+        # segment (the absolute level was settled by steps 1-2).
+        base_a = _wmedian(r[b], arr.w[b]) if b.sum() >= 8 else 0.0
+        wins = []  # per window: (position, median, variance)
+        for k in np.unique(arr.win[b]):
+            mk = b & (arr.win == k)
+            if mk.sum() >= 5:
+                med, _mad, se = _median_se(r[mk])
+                wins.append((float(np.median(arr.x0[mk])), med - base_a, se**2 + WINDOW_BIAS**2))
+        in_seg = None
+        base_o = 0.0
+        if delta is not None:
+            in_seg = ok & (cue_starts >= lo) & (cue_starts < hi)
+            base_o = float(np.median(delta[in_seg])) if in_seg.sum() >= 8 else 0.0
+        n_knots = int((hi_c - lo_c) // WOBBLE_STEP)
+        if n_knots < 2:
+            continue
+        kx = lo_c + (np.arange(n_knots) + 0.5) * (hi_c - lo_c) / n_knots
+        ky = np.zeros(n_knots)
+        has = np.zeros(n_knots, dtype=bool)
+        for j, t in enumerate(kx):
+            est, prec = [], []
+            for pos, med, var in wins:
+                if abs(pos - t) <= WOBBLE_HALF_WIDTH:
+                    est.append(med)
+                    prec.append(1.0 / var)
+            if in_seg is not None:
+                m = in_seg & (np.abs(cue_starts - t) <= WOBBLE_HALF_WIDTH)
+                if m.sum() >= 8:
+                    med, mad, se = _median_se(delta[m])
+                    if mad <= 0.3:
+                        est.append(med - base_o)
+                        prec.append(1.0 / se**2)
+            if not est:
+                continue
+            p = np.array(prec)
+            v = 1.0 / p.sum()
+            e = float((np.array(est) * p).sum() * v)
+            ky[j] = e * WOBBLE_PRIOR**2 / (WOBBLE_PRIOR**2 + v)  # shrink towards 0
+            has[j] = True
+        if has.sum() < 2:
+            continue
+        kx, ky = kx[has], ky[has]
+        if ky.size >= 3:  # smooth: [1/4, 1/2, 1/4]
+            ky = np.concatenate(
+                [
+                    [(2 * ky[0] + ky[1]) / 3],
+                    0.25 * ky[:-2] + 0.5 * ky[1:-1] + 0.25 * ky[2:],
+                    [(ky[-2] + 2 * ky[-1]) / 3],
+                ]
+            )
+        if np.abs(ky).max() >= 0.02:
+            rel_knots[i] = (kx, ky)
+    return _assemble_correction(fitted, mapping, rel_knots, first, last, max_shift, info)
+
+
+def _assemble_correction(
+    fitted: Mapping,
+    shifted: Mapping,
+    rel_knots: list[tuple[np.ndarray, np.ndarray] | None],
+    first: float,
+    last: float,
+    max_shift: float,
+    info: dict,
+) -> tuple[Mapping, dict]:
+    """Turn the refinement steps into one correction curve c(t) relative to the fitted
+    lines: per segment its shift (steps 1-2) plus its wobble knots (step 3), a shared
+    knot at every segment boundary (the mean of the two sides) so c is continuous
+    there, and every value clipped to ±``max_shift``. Since c is linear between knots
+    and flat outside them, the *total* correction is bounded by ``max_shift`` and the
+    mapping jumps at a boundary exactly as much as the fitted lines do: refinement
+    alone never creates a backward jump (which ``retime`` would resolve by squeezing
+    cues), only a genuine cut does."""
+    segs0, segs1 = fitted.segments, shifted.segments
+    n = len(segs0)
+    base = [b.offset - a.offset for a, b in zip(segs0, segs1, strict=True)]
+    pts: list[list[tuple[float, float]]] = []
+    for i in range(n):
+        lo = max(segs0[i].start, first) if i else first
+        hi = min(segs0[i + 1].start, last) if i + 1 < n else last
+        if rel_knots[i] is not None:
+            kx, ky = rel_knots[i]
+            pts.append([(float(x), base[i] + float(y)) for x, y in zip(kx, ky, strict=True)])
+        elif math.isfinite(lo) and math.isfinite(hi) and hi > lo:
+            pts.append([(0.5 * (lo + hi), base[i])])
+        else:
+            pts.append([])
+    for i in range(1, n):  # shared boundary knots
+        t = segs0[i].start
+        left = pts[i - 1][-1][1] if pts[i - 1] else base[i - 1]
+        right = pts[i][0][1] if pts[i] else base[i]
+        v = 0.5 * (left + right)
+        pts[i - 1] = [q for q in pts[i - 1] if q[0] < t - 1e-6] + [(t, v)]
+        pts[i] = [(t, v)] + [q for q in pts[i] if q[0] > t + 1e-6]
+    out: list[Segment] = []
+    total = 0.0
+    for i, (s0, s1) in enumerate(zip(segs0, segs1, strict=True)):
+        b = max(-max_shift, min(max_shift, base[i]))
+        rel = tuple((float(t), round(max(-max_shift, min(max_shift, v)) - b, 4)) for t, v in pts[i])
+        if not rel or max(abs(c) for _t, c in rel) < 1e-3:
+            rel = ()
+        total = max([total, abs(b)] + [abs(b + c) for _t, c in rel])
+        out.append(Segment(s1.start, s0.scale, s0.offset + b, s1.anchors, rel))
+        info["knots"] += len(rel)
+    info["max_correction"] = total
+    return Mapping(out), info
 
 
 # --------------------------------------------------------------------------------------

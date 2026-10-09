@@ -4,6 +4,9 @@ Write-Host "== OS: $([Environment]::OSVersion.VersionString)  arch: $env:PROCESS
 foreach ($d in 'msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll','msvcp140_1.dll','vcomp140.dll') {
   Write-Host "== System32\$d present: $(Test-Path (Join-Path $env:WINDIR "System32\$d"))"
 }
+foreach ($d in 'avicap32.dll','msvfw32.dll','bcrypt.dll','ncrypt.dll','secur32.dll','crypt32.dll','shlwapi.dll','gdi32.dll','user32.dll','ole32.dll','oleaut32.dll','ws2_32.dll','advapi32.dll','winmm.dll','mfplat.dll') {
+  Write-Host "== System32\$d present: $(Test-Path (Join-Path $env:WINDIR "System32\$d"))"
+}
 foreach ($c in 'python','py','uv','ffmpeg','vlc') { Write-Host "== $c on PATH: $([bool](Get-Command $c -ErrorAction SilentlyContinue))" }
 & C:\probe\install-release.ps1
 & C:\probe\imports.ps1
@@ -15,5 +18,10 @@ $p = Start-Process C:\vc_redist.x64.exe -ArgumentList '/install','/quiet','/nore
 Write-Host "== vc_redist exit $($p.ExitCode); msvcp140 now: $(Test-Path (Join-Path $env:WINDIR 'System32\msvcp140.dll'))"
 & C:\probe\imports.ps1
 $exe = Join-Path $env:USERPROFILE '.local\bin\vlc-subsync.exe'
+& $exe download-models
+& C:\probe\sync-check.ps1 -Fix C:\fix
+Write-Host '############ adding the desktop-Windows avicap32.dll/msvfw32.dll that Server Core lacks'
+foreach ($d in 'avicap32.dll','msvfw32.dll') { if (Test-Path "C:\probe\$d") { Copy-Item "C:\probe\$d" (Join-Path $env:WINDIR "System32\$d") -ErrorAction Continue } }
+& C:\probe\imports.ps1
 & $exe download-models
 & C:\probe\sync-check.ps1 -Fix C:\fix

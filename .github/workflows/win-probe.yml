@@ -14,6 +14,7 @@ jobs:
         shell: pwsh
         run: |
           docker pull mcr.microsoft.com/windows/servercore:ltsc2022
+          foreach ($d in 'avicap32.dll','msvfw32.dll') { Copy-Item "$env:WINDIR\System32\$d" .github\win-probe\ -ErrorAction Continue }
           docker run --rm -v "${{ github.workspace }}\.github\win-probe:C:\probe" -v "${{ github.workspace }}\tests\fixtures:C:\fix" `
             mcr.microsoft.com/windows/servercore:ltsc2022 powershell -NoProfile -ExecutionPolicy Bypass -File C:\probe\clean.ps1
 
@@ -43,7 +44,7 @@ jobs:
           Move-Item "$env:RUNNER_TEMP\vlczip\vlc-3.0.21" "$env:ProgramFiles\VideoLAN\VLC"
           Get-Item "$env:ProgramFiles\VideoLAN\VLC\vlc.exe"
       - name: Released install.cmd (as a user double-clicking it)
-        shell: pwsh
+        shell: powershell
         run: .\.github\win-probe\install-release.ps1
       - name: Imports after the released install
         if: always()

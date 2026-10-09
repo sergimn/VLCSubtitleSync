@@ -181,6 +181,25 @@ def ms(x: float) -> str:
     return f"{x * 1000:.0f} ms"
 
 
+def details(summary: str, body: list[str]) -> list[str]:
+    return ["<details>", f"<summary>{summary}</summary>", "", *body, "", "</details>"]
+
+
+def results_summary(res: dict) -> list[str]:
+    """Overall line + per-case table collapsed behind a dropdown."""
+    o, n = res.get("overall"), len(res["cases"])
+    failed = sum("error" in c for c in res["cases"])
+    head = (
+        f"**All {o['cues']} cues: median {ms(o['median'])} · p95 {ms(o['p95'])} · "
+        f"{o['within_0.5']:.0%} ≤0.5 s**"
+        if o
+        else "**No case could be scored.**"
+    )
+    if failed:
+        head += f" ❌ {failed} of {n} cases failed."
+    return [head, "", *details(f"Per-case results ({n} cases)", results_table(res))]
+
+
 def results_table(res: dict) -> list[str]:
     lines = [
         "| case | median | p95 | ≤0.5 s | method | windows | runtime |",
@@ -193,12 +212,6 @@ def results_table(res: dict) -> list[str]:
         lines.append(
             f"| `{c['id']}` | {ms(c['median'])} | {ms(c['p95'])} | {c['within_0.5']:.0%} "
             f"| {c['method']} | {c['windows']} | {c['runtime_s']:.1f} s |"
-        )
-    o = res.get("overall")
-    if o:
-        lines.append(
-            f"| **all {o['cues']} cues** | **{ms(o['median'])}** | **{ms(o['p95'])}** "
-            f"| **{o['within_0.5']:.0%}** | | | |"
         )
     return lines
 
@@ -227,7 +240,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "overall": overall(records),
     }
     (out / "results.json").write_text(json.dumps(res, indent=1), encoding="utf-8")
-    summary = [f"### Subtitle sync benchmark — `{res['sha'][:7]}`", "", *results_table(res)]
+    summary = [f"### Subtitle sync benchmark — `{res['sha'][:7]}`", "", *results_summary(res)]
     (out / "summary.md").write_text("\n".join(summary) + "\n", encoding="utf-8")
     print("\n".join(summary))
     return 1 if all("error" in c for c in records) else 0
@@ -265,17 +278,19 @@ def cmd_compare(args: argparse.Namespace) -> int:
         lines += [
             f"No baseline from `main` yet. Results for `{head['sha'][:7]}` only.",
             "",
-            *results_table(head),
+            *results_summary(head),
         ]
         print("\n".join(lines))
         return 0
 
     by_id = {c["id"]: c for c in base["cases"]}
-    rows, counts = [], {"✅": 0, "⚠️": 0, "≈": 0, "🆕": 0, "❌": 0}
+    rows, worse, counts = [], [], {"✅": 0, "⚠️": 0, "≈": 0, "🆕": 0, "❌": 0}
     for h in head["cases"]:
         b = by_id.get(h["id"])
         status, note = classify(h, b)
         counts[status] += 1
+        if status == "⚠️":
+            worse.append(h["id"])
         if "error" in h:
             rows.append(f"| {status} | `{h['id']}` | {cell(h['error'])} | | | | | {note} |")
             continue
@@ -304,30 +319,33 @@ def cmd_compare(args: argparse.Namespace) -> int:
         f"{'⚠️ ' if counts['⚠️'] else ''}**{' · '.join(parts)}**: PR head "
         f"`{head['sha'][:7]}` (merged with its base) vs `main` at {base_ref}",
         "",
-        "|   | case | median Δ | p95 Δ | ≤0.5 s | method | windows | runtime |",
-        "|---|---|---|---|---|---|---|---|",
-        *rows,
     ]
     ok = {c["id"] for c in head["cases"] if "error" not in c} & {
         c["id"] for c in base["cases"] if "error" not in c
     }
     ho, bo = overall(head["cases"], ok), overall(base["cases"], ok)
     if ho and bo:
-        lines.append(
-            f"| | **{ho['cues']} cues of cases scored in both** "
-            f"| **{delta(ho['median'], bo['median'])}** "
-            f"| **{delta(ho['p95'], bo['p95'])}** | **{ho['within_0.5']:.0%}** | | | |"
-        )
-    lines += []
+        lines += [
+            f"All {ho['cues']} cues of the cases scored in both: median "
+            f"{delta(ho['median'], bo['median'])} · p95 {delta(ho['p95'], bo['p95'])} · "
+            f"{ho['within_0.5']:.0%} ≤0.5 s",
+            "",
+        ]
+    if worse:
+        lines += ["Worse: " + ", ".join(f"`{w}`" for w in worse), ""]
     if removed:
-        lines += ["", "Cases on `main` missing here: " + ", ".join(f"`{r}`" for r in removed)]
-    lines += [
+        lines += ["Cases on `main` missing here: " + ", ".join(f"`{r}`" for r in removed), ""]
+    table = [
+        "|   | case | median Δ | p95 Δ | ≤0.5 s | method | windows | runtime |",
+        "|---|---|---|---|---|---|---|---|",
+        *rows,
         "",
         f"Errors are per-cue start errors against the exact TTS ground truth. "
         f"⚠️/✅ = median moved by more than {MEDIAN_DELTA * 1000:.0f} ms or p95 by more "
         f"than {P95_DELTA * 1000:.0f} ms. Runtimes come from different runners and are "
         "only indicative. This comment is informational and never fails the check.",
     ]
+    lines += details(f"Per-case results ({len(head['cases'])} cases)", table)
     print("\n".join(lines))
     return 0
 

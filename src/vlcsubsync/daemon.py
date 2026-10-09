@@ -25,7 +25,14 @@ from typing import Any, Literal, Protocol
 
 from . import __version__
 from . import protocol as P
-from .config import DEFAULT_MODE, MODES, mode_rank, normalize_mode
+from .config import (
+    DEFAULT_MODE,
+    DEFAULT_SYNC_MODE,
+    MODES,
+    mode_rank,
+    normalize_mode,
+    normalize_sync_mode,
+)
 
 log = logging.getLogger("vlcsubsync.daemon")
 
@@ -809,6 +816,11 @@ class Daemon:
             if m != own and not P._to_bool(hit[1].get("applied")):
                 log.debug("ignoring unapplied cached %s result for a %s job", m, own)
                 continue
+            if P._to_bool(hit[1].get("applied")) and not hit[1].get("segments"):
+                # cached before results carried their mapping: delay mode cannot
+                # use it, so re-sync once (the new result replaces it)
+                log.info("cached %s result has no mapping; re-syncing", m)
+                continue
             return hit
         return None
 
@@ -900,6 +912,7 @@ class Daemon:
                 done.progress = 1.0
                 done.output = str(dest)
                 done.time = None
+                done.sync_mode = _sync_mode(config)  # the current setting, not the cached one
                 log.info("job %s: cache hit (mode %s)", r.id, mode)
                 writer.write(done, force=True)
                 return done
@@ -946,6 +959,8 @@ class Daemon:
                 offset=_float_or_none(getattr(result, "offset", None)),
                 scale=_float_or_none(getattr(result, "scale", None)),
                 confidence=_float_or_none(getattr(result, "confidence", None)),
+                segments=_segments_or_none(result),
+                sync_mode=_sync_mode(config),
             )
             writer.write(done, force=True)
             self._cache_store(key, output, done)
@@ -1079,6 +1094,21 @@ class Daemon:
                     P.Status(id=job.request.id, state="error", message="Daemon stopped"),
                 )
         self.remove_heartbeats()
+
+
+def _sync_mode(config: Any) -> str:
+    """The configured sync_mode (``track`` unless the config says ``delay``)."""
+    return normalize_sync_mode(getattr(config, "sync_mode", None)) or DEFAULT_SYNC_MODE
+
+
+def _segments_or_none(result: Any) -> list[P.MapSegment] | None:
+    """The result's mapping (``SyncResult.mapping_segments``) when it was applied."""
+    if not getattr(result, "applied", True):
+        return None
+    segs = getattr(result, "mapping_segments", None)
+    if not segs:
+        return None
+    return [s for s in segs if isinstance(s, P.MapSegment)] or None
 
 
 def _float_or_none(value: Any) -> float | None:

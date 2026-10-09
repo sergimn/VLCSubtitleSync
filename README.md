@@ -42,6 +42,9 @@ powershell -c "irm https://github.com/sergimn/VLCSubtitleSync/releases/latest/do
 Then **restart VLC**. The first install downloads about 200 MB (Python runtime,
 speech-recognition libraries and the English model).
 
+SubSync is also listed on [VLC's add-ons site](https://www.opendesktop.org/p/2377843/),
+where the download is the same installers in a zip.
+
 The installer finds VLC wherever it is installed: the regular system package, the
 Linux **snap** and **flatpak**, the macOS app and the Windows installer. Your existing
 VLC settings are kept. Before it changes `vlcrc` it saves a backup copy next to it.

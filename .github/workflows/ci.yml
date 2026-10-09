@@ -274,7 +274,7 @@ jobs:
     name: All green
     if: always()
     needs: [lint, unit, integration, e2e-vlc, installer, installer-clean-windows, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check that every job passed
         env:

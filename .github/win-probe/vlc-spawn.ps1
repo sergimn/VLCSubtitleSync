@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$u = 'https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip'
+$u = 'https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.zip'
 Invoke-WebRequest -UseBasicParsing $u -OutFile vlc.zip
 Expand-Archive vlc.zip "$env:RUNNER_TEMP\vlczip"
 New-Item -ItemType Directory -Force "$env:ProgramFiles\VideoLAN" | Out-Null

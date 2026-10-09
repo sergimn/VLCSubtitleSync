@@ -366,7 +366,7 @@ class Status:
     # Done + applied: the full mapping (track and delay mode), see MapSegment.
     segments: list[MapSegment] | None = None
     # The helper's configured sync_mode ("track" | "delay"); the VLC side uses it
-    # unless the user picked another one in VLC (delay mode's toggle, next PR).
+    # unless the extension's toggle wrote its own choice into <q>/control.
     sync_mode: str | None = None
     time: float | None = None
 

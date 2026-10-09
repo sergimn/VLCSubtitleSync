@@ -164,7 +164,7 @@ class Harness:
         data = {"id": req_id, **kv}
         write_kv(self.q / "jobs" / f"{req_id}.status", data)
 
-    def finish(self, req_id: str, message="offset +2.35s, drift +4.1%", applied=1):
+    def finish(self, req_id: str, message="offset +2.35s, drift +4.1%", applied=1, **extra):
         out = self.q / "out" / f"{req_id}.srt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("1\n00:00:01,000 --> 00:00:02,000\nHi\n", encoding="utf-8")
@@ -179,6 +179,7 @@ class Harness:
             offset="2.350",
             scale="1.0417",
             confidence="0.93",
+            **extra,
         )
         # the daemon deletes the request once picked up
         req = self.q / "requests" / f"{req_id}.req"
@@ -649,6 +650,502 @@ def test_tick_errors_are_caught_and_logged(h):
     assert any("[subsync] tick failed" in line and "kaboom" in line for line in h.logs())
 
 
+# ======================================================================= delay mode
+# Experimental "no extra track" mode: the original track stays selected and is
+# corrected live through the input's "spu-delay" (µs; positive = later).
+
+
+def seg_status(*segs, knots=None):
+    """Status keys for mapping segments (sub_start, sub_end, scale, offset)."""
+    out = {"segments": len(segs)}
+    for i, (lo, hi, scale, offset) in enumerate(segs):
+        lo_s = "" if lo is None else f"{lo:.3f}"
+        hi_s = "" if hi is None else f"{hi:.3f}"
+        out[f"seg{i}"] = f"{lo_s},{hi_s},{scale:.7f},{offset:.4f}"
+    for i, k in (knots or {}).items():
+        out[f"seg{i}_knots"] = ";".join(f"{t:.3f}:{c:.4f}" for t, c in k)
+    return out
+
+
+def spu_delay(hh) -> int:
+    return int(hh.selected("spu-delay"))
+
+
+def delay_sets(hh) -> list[int]:
+    return [int(v.value) for v in hh.mock.var_sets.values() if v.name == "spu-delay"]
+
+
+def expected_us(T, scale, offset, lookahead=0.0):
+    """spu-delay the intf aims at for playback time T (one linear segment): the
+    mapping's delay at T + lead, lead = lookahead + the negative part of the delay
+    (VLC decodes subtitles that much earlier)."""
+
+    def d(t):
+        return t - (t - offset) / scale
+
+    lead = lookahead + max(0.0, -d(T))
+    return round(d(T + lead) * 1e6)
+
+
+def start_delay(
+    hh, *segs, knots=None, t0=10.0, via="control", message="offset +2.50s", lookahead=0.0
+):
+    """Play, sync with the given mapping in delay mode; returns the request id.
+
+    The lookahead (subtitles take their delay when decoded, ahead of display) is
+    off by default so the expected values are the mapping at "time" itself."""
+    hh.S.LOOKAHEAD_S = lookahead
+    if via == "control":
+        hh.control(auto=1, sync_now=0, sync_mode="delay")
+    hh.set_input()
+    hh.mock.set_time(t0)
+    hh.settle()
+    req = hh.requests()[0]
+    extra = seg_status(*segs, knots=knots)
+    if via == "status":
+        extra["sync_mode"] = "delay"
+    hh.finish(req["id"], message=message, **extra)
+    hh.tick()
+    return req["id"]
+
+
+def test_delay_constant_offset(h):
+    start_delay(h, (None, None, 1.0, 2.5))
+    assert spu_delay(h) == 2_500_000
+    assert h.selected("spu-es") == 20  # the original track stays selected
+    assert h.added() == []
+    assert "Subtitles synced (live delay, experimental): offset +2.50s" in h.osd()
+    st = h.intf_state()
+    assert st["sync_mode"] == "delay" and st["delay_active"] == "1"
+    # a constant mapping never needs another set, however time moves
+    n = len(delay_sets(h))
+    for T in (20, 60, 61.5, 300):
+        h.mock.set_time(T)
+        h.tick()
+    assert len(delay_sets(h)) == n
+    assert any("[subsync] spu-delay=2500000 us" in line for line in h.logs())
+
+
+def test_delay_negative_offset_sign(h):
+    """Subtitles 7 s late: audio = sub - 7 -> spu-delay -7 s (earlier)."""
+    start_delay(h, (None, None, 1.0, -7.0), t0=30)
+    assert spu_delay(h) == -7_000_000
+    # VLC pauses playback for every new low of a negative delay: say so
+    assert any(o.endswith("may pause playback up to 7 s in total") for o in h.osd())
+    assert any("needs spu-delay down to -7.0 s" in line for line in h.logs())
+
+
+def test_delay_positive_needs_no_pause_warning(h):
+    start_delay(h, (None, None, 1.0, 2.5))
+    assert not any("may pause" in o for o in h.osd())
+
+
+def test_min_delay_over_the_file(h):
+    segs = h.S.parse_segments(h.lua.table_from(seg_status((None, None, 23.976 / 25, 1.44))))
+    # d(T) = T - (T - 1.44) / 0.959: +1.44 at 0, about -6.3 s at 182 s
+    assert h.S.min_delay(segs, 182.0) == pytest.approx(182 - (182 - 1.44) * 25 / 23.976)
+    cut = h.S.parse_segments(
+        h.lua.table_from(seg_status((None, 100.0, 1.0, 2.0), (100.0, None, 1.0, -10.0)))
+    )
+    assert h.S.min_delay(cut, 0) == pytest.approx(-10.0)
+
+
+def test_delay_follows_drift(h):
+    scale, offset = 23.976 / 25, 1.44  # sidecar timed for 25 fps on 23.976 audio
+    start_delay(h, (None, None, scale, offset), t0=10)
+    assert abs(spu_delay(h) - expected_us(10, scale, offset)) <= 1
+    values = [spu_delay(h)]
+    for k in range(21, 361):  # 10 s .. 180 s, one tick per 0.5 s of playback
+        T = k / 2
+        h.mock.set_time(T)
+        h.tick()
+        target = expected_us(T, scale, offset)
+        # within the tolerance plus one tick's change (~21 ms)
+        assert abs(spu_delay(h) - target) <= 40_000 + 21_000
+        values.append(spu_delay(h))
+    # the delay grows (more negative) over time: -0.4 s at 10 s, -6.3 s at 180 s
+    assert values[0] > -500_000 and values[-1] < -6_000_000
+    assert values == sorted(values, reverse=True)
+    sets = delay_sets(h)
+    # updated in steps of just over the 40 ms tolerance, not on every tick
+    assert 100 < len(sets) < 180
+    assert all(abs(b - a) > 40_000 for a, b in zip(sets, sets[1:], strict=False))
+    assert h.added() == []
+
+
+def test_delay_small_changes_are_not_applied(h):
+    scale = 1.001  # +1 ms per second
+    start_delay(h, (None, None, scale, 0.0), t0=100)
+    n = len(delay_sets(h))
+    T = 100.0
+    for _ in range(60):  # 30 s of normal playback, one tick per 0.5 s
+        T += 0.5
+        h.mock.set_time(T)
+        h.tick()
+    assert len(delay_sets(h)) == n  # 30 ms of change: below the tolerance
+    for _ in range(30):
+        T += 0.5
+        h.mock.set_time(T)
+        h.tick()
+    assert len(delay_sets(h)) == n + 1
+
+
+def test_delay_piecewise_cut(h):
+    # ad-break style: audio = sub + 2 before sub 100 s, audio = sub + 10 after
+    # (audio 102..110 s is not in the subtitles: a forward gap)
+    start_delay(h, (None, 100.0, 1.0, 2.0), (100.0, None, 1.0, 10.0), t0=50)
+    assert spu_delay(h) == 2_000_000
+    for T, want in ((80, 2_000_000), (101.5, 2_000_000), (105, 10_000_000), (200, 10_000_000)):
+        h.mock.set_time(T)
+        h.tick()
+        assert spu_delay(h) == want, T
+    # backwards seek into the first part
+    h.mock.set_time(40)
+    h.tick()
+    assert spu_delay(h) == 2_000_000
+
+
+def test_delay_overlapping_cut_prefers_later_segment(h):
+    # backward cut: sub 0..100 -> audio 0..100, sub 100.. -> audio 90..
+    start_delay(h, (None, 100.0, 1.0, 0.0), (100.0, None, 1.0, -10.0), t0=50)
+    assert spu_delay(h) == 0
+    h.mock.set_time(95)  # inside both audio spans
+    h.tick()
+    assert spu_delay(h) == -10_000_000
+
+
+def test_delay_knots_are_followed(h):
+    knots = {0: [(0.0, 0.0), (100.0, 0.3), (200.0, 0.3)]}
+    start_delay(h, (None, None, 1.0, 1.0), knots=knots, t0=0.5)
+    assert abs(spu_delay(h) - 1_000_000) < 5_000
+    h.mock.set_time(150)
+    h.tick()
+    assert abs(spu_delay(h) - 1_300_000) < 2_000
+
+
+def test_delay_seek_applies_immediately(h):
+    scale = 1.0005  # 0.5 ms/s: a 60 s seek moves the target by only 30 ms
+    start_delay(h, (None, None, scale, 0.0), t0=100)
+    n = len(delay_sets(h))
+    h.mock.set_time(160)
+    h.tick()
+    sets = delay_sets(h)
+    assert len(sets) == n + 1  # below the tolerance, but a seek re-sets at once
+    assert sets[-1] == expected_us(160, scale, 0.0)
+    assert any("seek" in line and "spu-delay=" in line for line in h.logs())
+    # normal playback afterwards does not count as a seek
+    h.mock.set_time(160.5)
+    h.tick()
+    assert len(delay_sets(h)) == n + 1
+
+
+def test_delay_keeps_manual_user_bias(h):
+    start_delay(h, (None, None, 1.0, 2.5), t0=10)
+    assert spu_delay(h) == 2_500_000
+    # the user presses "h"/"g" (50 ms steps) or uses Track Synchronization
+    h.select("spu-delay", 2_600_000)
+    h.tick()
+    assert spu_delay(h) == 2_600_000  # left alone: it is the user's choice
+    assert any("bias now 100000 us" in line for line in h.logs())
+    # the bias stays on top of later corrections
+    h.mock.set_time(400)
+    h.tick()
+    assert spu_delay(h) == 2_600_000
+    # switching the track away gives back only the user's own part
+    h.select("spu-es", 21)
+    h.tick()
+    assert spu_delay(h) == 100_000
+    assert h.intf_state()["delay_active"] == "0"
+
+
+def test_delay_existing_user_delay_is_the_initial_bias(h):
+    h.control(auto=1, sync_now=0, sync_mode="delay")
+    h.set_input()
+    h.select("spu-delay", -300_000)  # set by the user before the sync finished
+    h.mock.set_time(10)
+    h.settle()
+    req = h.requests()[0]
+    h.finish(req["id"], **seg_status((None, None, 1.0, 2.0)))
+    h.tick()
+    assert spu_delay(h) == 1_700_000
+    h.select("spu-es", -1)
+    h.tick()
+    assert spu_delay(h) == -300_000
+
+
+def test_delay_track_switch_resets_and_reselect_reapplies(h):
+    start_delay(h, (None, None, 1.0, 3.0), t0=10)
+    assert spu_delay(h) == 3_000_000
+    h.select("spu-es", 21)  # another subtitle track: not corrected
+    h.tick()
+    assert spu_delay(h) == 0
+    h.settle()
+    other = [r for r in h.requests() if r["sub_index"] == "1"]
+    assert len(other) == 1  # the other track gets its own sync
+    # back to the synced original: the remembered mapping is applied again
+    h.select("spu-es", 20)
+    h.settle()
+    assert spu_delay(h) == 3_000_000
+    assert [r for r in h.requests() if r["sub_index"] == "0"] == []
+    # audio change: reset, and a new sync for the new combination
+    h.select("audio-es", 11)
+    h.tick()
+    assert spu_delay(h) == 0
+    assert h.added() == []
+
+
+def test_delay_input_change_and_stop_forget_mapping(h):
+    start_delay(h, (None, None, 1.0, 3.0), t0=10)
+    h.mock.stop()
+    h.tick()
+    assert h.S.state.delay is None
+    h.set_input(uri="file:///other.mkv")
+    h.tick()
+    assert h.S.state.delay is None
+    assert spu_delay(h) == 0  # a new input starts from its own spu-delay
+
+
+def test_delay_mode_from_helper_config(h):
+    """No toggle used: the helper's configured sync_mode (in the status) decides."""
+    start_delay(h, (None, None, 1.0, 2.0), via="status")
+    assert spu_delay(h) == 2_000_000
+    assert h.added() == []
+    assert h.intf_state()["sync_mode"] == "delay"
+
+
+def test_delay_toggle_overrides_helper_config(h):
+    h.control(auto=1, sync_now=0, sync_mode="track")
+    h.set_input()
+    h.settle()
+    req = h.requests()[0]
+    out = h.finish(req["id"], sync_mode="delay", **seg_status((None, None, 1.0, 2.0)))
+    h.tick(2)
+    assert h.added() == [(out, True)]
+    assert delay_sets(h) == []
+
+
+def test_delay_mode_without_segments_resyncs_once_then_gives_up(h):
+    """A result without mapping (cached before mappings were sent, or an old
+    helper): re-sync once with force; never add a track; never remember it as
+    "not applied" (a later selection asks again)."""
+    h.control(auto=1, sync_now=0, sync_mode="delay")
+    h.set_input()
+    h.mock.set_time(10)
+    h.settle()
+    req = h.requests()[0]
+    assert req["force"] == "0"
+    h.finish(req["id"])  # no segments
+    h.tick()
+    retry = h.requests()
+    assert len(retry) == 1 and retry[0]["force"] == "1" and retry[0]["id"] != req["id"]
+    assert retry[0]["sub_index"] == req["sub_index"]
+    assert retry[0]["audio_label"] == req["audio_label"]
+    assert not any("needs a newer helper" in o for o in h.osd())
+    # the fresh sync has the mapping: applied live
+    h.finish(retry[0]["id"], **seg_status((None, None, 1.0, 2.0)))
+    h.tick()
+    assert spu_delay(h) == 2_000_000 and h.added() == []
+
+
+def test_delay_mode_old_helper_gives_up_without_memoizing(h):
+    h.control(auto=1, sync_now=0, sync_mode="delay")
+    h.set_input()
+    h.settle()
+    h.finish(h.requests()[0]["id"])
+    h.tick()
+    h.finish(h.requests()[0]["id"])  # the forced retry has no mapping either
+    h.tick(3)
+    assert h.added() == [] and delay_sets(h) == []
+    assert any("live delay needs a newer helper" in o for o in h.osd())
+    assert h.requests() == []  # no loop
+    # nothing memoized as "not applied": re-selecting the track asks again
+    h.select("spu-es", 21)
+    h.settle()
+    h.select("spu-es", 20)
+    h.settle()
+    assert [r["sub_index"] for r in h.requests()][-1] == "0"
+
+
+def test_default_track_mode_ignores_segments(h):
+    """Default: the synced file is added as a track even though segments are sent."""
+    h.set_input()
+    h.mock.set_time(10)
+    h.settle()
+    req = h.requests()[0]
+    out = h.finish(req["id"], **seg_status((None, None, 1.0, 2.0)))
+    h.tick(2)
+    assert h.added() == [(out, True)]
+    assert delay_sets(h) == []
+    assert h.intf_state()["sync_mode"] == "track"
+    assert h.intf_state()["delay_active"] == "0"
+
+
+def test_delay_toggle_while_playing_moves_result(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    assert h.added() == []
+    # off: the user's delay comes back and the synced file is loaded as a track
+    h.control(auto=1, sync_now=0, sync_mode="track")
+    h.tick(2)
+    assert spu_delay(h) == 0
+    assert len(h.added()) == 1
+    ours = h.spu_ids()[-1]
+    assert h.selected("spu-es") == ours
+    # on again: back to the original track, corrected live
+    h.control(auto=1, sync_now=0, sync_mode="delay")
+    h.tick(2)
+    assert h.selected("spu-es") == 20
+    assert spu_delay(h) == 2_000_000
+    assert len(h.added()) == 1
+
+
+def test_delay_sync_now_forces_resync(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    h.control(auto=1, sync_now=1, sync_mode="delay")
+    h.tick(2)
+    reqs = h.requests()
+    assert len(reqs) == 1 and reqs[0]["force"] == "1"
+
+
+def test_delay_lookahead_aims_at_subtitles_decoded_now(h):
+    """With the lookahead, the delay is the mapping's at time + lead, where lead is
+    LOOKAHEAD_S plus the negative part of the delay (VLC decodes that much earlier)."""
+    scale, offset = 23.976 / 25, 1.44
+    start_delay(h, (None, None, scale, offset), t0=100, lookahead=1.0)
+    assert spu_delay(h) == expected_us(100, scale, offset, lookahead=1.0)
+    plain = 100 - (100 - offset) / scale  # about -2.8 s at 100 s
+    assert spu_delay(h) < round(plain * 1e6) - 150_000  # aimed ~3.8 s ahead
+    assert h.S.LOOKAHEAD_S == 1.0
+
+
+def test_delay_default_lookahead():
+    src = INTF.read_text(encoding="utf-8")
+    assert "M.LOOKAHEAD_S = 1.0" in src
+
+
+def test_parse_segments_rejects_bad_input(h):
+    assert h.S.parse_segments(h.lua.table_from({"segments": "1", "seg0": ",,1.0,2.0"})) is not None
+    for bad in (
+        {"segments": "2", "seg0": ",,1.0,2.0"},  # missing seg1
+        {"segments": "1", "seg0": ",,0,2.0"},  # scale <= 0
+        {"segments": "1", "seg0": ",,abc,2.0"},
+        {"segments": "1", "seg0": "x,,1.0,2.0"},
+        {"segments": "1", "seg0": ",,1.0,2.0", "seg0_knots": "1:2;bad"},
+        {"segments": "0"},
+    ):
+        assert h.S.parse_segments(h.lua.table_from(bad)) is None, bad
+
+
+def test_delay_same_uri_replay_is_a_new_input(h):
+    """Repeat-one / loop / replay: a new input object with the same URI and a fresh
+    spu-delay. Its 0 must not become a +5.36 s "user bias"; the mapping is applied
+    again from memory, without a new request."""
+    start_delay(h, (None, None, 23.976 / 25, 1.44), t0=170)
+    assert spu_delay(h) < -5_000_000
+    assert h.selected("subsync-delay").split("|")[1:] == ["0", str(spu_delay(h))]
+    # the same file starts again inside one tick: new input, spu-delay from sub-delay
+    h.set_input()
+    h.mock.set_time(0.5)
+    h.tick()
+    assert h.S.state.delay is None
+    assert not any("bias now" in line for line in h.logs())
+    assert any("new input object for the same media" in line for line in h.logs())
+    h.settle()
+    assert spu_delay(h) == expected_us(0.5, 23.976 / 25, 1.44)
+    assert h.S.state.delay.bias == 0
+    assert h.requests() == []  # remembered, no new sync
+
+
+def test_delay_restarted_intf_does_not_take_its_old_correction_as_bias(h, runtime, tmp_path):
+    start_delay(h, (None, None, 1.0, 3.0), t0=10)
+    h.select("spu-delay", 3_200_000)  # the user adds 0.2 s
+    h.tick()
+    assert h.S.state.delay.bias == 200_000
+    # the intf restarts (VLC keeps playing the same input and its variables)
+    h.S.reset()
+    h.tick()
+    h.settle()
+    h.finish(h.requests()[0]["id"], **seg_status((None, None, 1.0, 3.0)))
+    h.tick()
+    assert h.S.state.delay.bias == 200_000  # the user's part, not 3.2 s
+    assert spu_delay(h) == 3_200_000
+    assert any("found an earlier correction" in line for line in h.logs())
+
+
+def test_delay_intf_exit_restores_user_delay(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    h.select("spu-delay", 2_100_000)  # pressed H twice just before closing
+    h.S.shutdown()  # what run() does when VLC interrupts mwait()
+    assert spu_delay(h) == 100_000
+    assert h.selected("subsync-delay") == ""
+    assert any("stop (exit)" in line for line in h.logs())
+    assert h.intf_state()["state"] == "stopped"
+
+
+def test_run_calls_shutdown(runtime, tmp_path):
+    src = INTF.read_text(encoding="utf-8")
+    run = src[src.index("function M.run()") :]
+    assert "M.shutdown()" in run[: run.index("\nend\n")]
+
+
+def test_delay_stop_keeps_last_user_change_of_the_tick(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    # G pressed (-50 ms) and the track switched within the same tick
+    h.select("spu-delay", 1_950_000)
+    h.select("spu-es", 21)
+    h.tick()
+    assert spu_delay(h) == -50_000
+
+
+def test_delay_replace_keeps_last_user_change(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    h.select("spu-delay", 2_050_000)
+    # a forced re-sync of the same combination finishes before the next tick
+    h.control(auto=1, sync_now=1, sync_mode="delay")
+    h.tick(2)
+    req = h.requests()[0]
+    h.select("spu-delay", 2_100_000)
+    h.finish(req["id"], **seg_status((None, None, 1.0, 4.0)))
+    h.tick()
+    assert h.S.state.delay.bias == 100_000
+    assert spu_delay(h) == 4_100_000
+
+
+def test_delay_ignores_sub_millisecond_differences(h):
+    start_delay(h, (None, None, 1.0, 2.0), t0=10)
+    h.select("spu-delay", 2_000_400)  # rounding somewhere, not the user
+    h.tick()
+    assert h.S.state.delay.bias == 0
+    assert not any("bias now" in line for line in h.logs())
+
+
+def test_delay_many_segments_and_knots_are_fast(h):
+    import time as _time
+
+    n, per = 256, 16  # 4096 knots: the cap
+    segs, knots = [], {}
+    for i in range(n):
+        lo = None if i == 0 else i * 30.0
+        hi = None if i == n - 1 else (i + 1) * 30.0
+        segs.append((lo, hi, 1.0 + (i % 3) * 0.001, 0.5 * i))
+        knots[i] = [(i * 30.0 + j * 2.0, 0.01 * ((j % 5) - 2)) for j in range(per)]
+    st = seg_status(*segs, knots=knots)
+    parsed = h.S.parse_segments(h.lua.table_from(st))
+    assert parsed is not None and len(parsed) == n
+    t0 = _time.perf_counter()
+    for k in range(2000):
+        h.S.delay_at(parsed, (k * 3.7) % (n * 30.0))
+    h.S.min_delay(parsed, n * 30.0)
+    assert _time.perf_counter() - t0 < 2.0
+    # more than the knot cap: the extra knots are ignored, the segments kept
+    st["seg5_knots"] = ";".join(f"{150 + j * 0.01:.3f}:0.0100" for j in range(50))
+    parsed = h.S.parse_segments(h.lua.table_from(st))
+    assert parsed is not None and len(parsed) == n
+    total = sum(len(parsed[i].knots) for i in range(1, n + 1))
+    assert total <= 4096 and len(parsed[6].knots) == 50
+    assert len(parsed[n].knots) == 0
+    assert any("more than 4096 knots" in line for line in h.logs())
+
+
 # ========================================================================== extension
 
 
@@ -684,6 +1181,7 @@ def test_ext_descriptor_and_menu(ext):
         2: "Sync now (exhaustive)",
         3: "Auto-sync: ON",
         4: "Status…",
+        6: "Experimental: no extra track (live delay): OFF",
     }
 
 
@@ -809,6 +1307,54 @@ def test_ext_status_dialog_hints(ext):
     assert "restart VLC" not in html
     # previous dialog was deleted when a new one opened
     assert ext.mock.dialogs[1].deleted
+
+
+def test_ext_toggle_delay_mode_writes_control(ext):
+    write_intf_state(ext)
+    with open(ext.q / "intf_state", "a", encoding="utf-8") as fh:
+        fh.write("sync_modes=track,delay\n")
+    ext.control(auto=0, sync_now=5)
+    assert dict(ext.lua.eval("menu()").items())[6].endswith("live delay): OFF")
+    ext.lua.eval("trigger_menu(6)")
+    assert parse_kv(ext.q / "control") == {"auto": "0", "sync_now": "5", "sync_mode": "delay"}
+    assert dict(ext.lua.eval("menu()").items())[6] == (
+        "Experimental: no extra track (live delay): ON"
+    )
+    assert "SubSync live delay (experimental) ON" in ext.osd()
+    # other control writes keep the choice
+    ext.lua.eval("trigger_menu(1)")
+    assert parse_kv(ext.q / "control")["sync_mode"] == "delay"
+    ext.lua.eval("trigger_menu(3)")
+    assert parse_kv(ext.q / "control")["sync_mode"] == "delay"
+    ext.lua.eval("trigger_menu(6)")
+    assert parse_kv(ext.q / "control")["sync_mode"] == "track"
+    assert dict(ext.lua.eval("menu()").items())[6].endswith("live delay): OFF")
+
+
+def test_ext_delay_menu_reflects_helper_config(ext):
+    write_intf_state(ext)
+    with open(ext.q / "intf_state", "a", encoding="utf-8") as fh:
+        fh.write("sync_mode=delay\nsync_modes=track,delay\n")
+    assert dict(ext.lua.eval("menu()").items())[6].endswith("live delay): ON")
+    ext.lua.eval("trigger_menu(6)")  # toggling turns it off explicitly
+    assert parse_kv(ext.q / "control")["sync_mode"] == "track"
+
+
+def test_ext_delay_toggle_with_old_intf_asks_for_restart(ext):
+    write_intf_state(ext)  # no sync_modes key: an intf from before delay mode
+    ext.control(auto=1, sync_now=2)
+    ext.lua.eval("trigger_menu(6)")
+    assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "2"}
+    assert "Restart VLC" in ext.mock.last_dialog.widgets[1].text
+
+
+def test_intf_state_reports_sync_mode(h):
+    h.tick()
+    st = h.intf_state()
+    assert st["sync_mode"] == "track" and st["sync_modes"] == "track,delay"
+    h.control(auto=1, sync_now=0, sync_mode="delay")
+    h.tick()
+    assert h.intf_state()["sync_mode"] == "delay"
 
 
 def test_luacheck():

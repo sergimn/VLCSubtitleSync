@@ -2,7 +2,10 @@
  subsync_ext.lua -- VLC SubSync companion extension (View > SubSync)
 
  Menu: "Sync subtitles now", "Sync now (exhaustive)", "Auto-sync: ON/OFF"
- (toggle), "Status…", "Load synced result" (only while a fallback job exists).
+ (toggle), "Status…", "Load synced result" (only while a fallback job exists),
+ "Experimental: no extra track (live delay): ON/OFF" (toggle, writes
+ sync_mode=delay|track; the intf then corrects the original track through
+ spu-delay instead of adding a synced track, see DESIGN.md "Delay mode").
 
  It talks to the interface script (lua/intf/subsync.lua) only through
  <q>/control (written here: auto=1|0, sync_now=<counter>, plus
@@ -41,6 +44,8 @@ E.HEARTBEAT_MAX_AGE = 10
 
 -- VLC lists menu entries in id order.
 local MENU_SYNC, MENU_SYNC_EXH, MENU_AUTO, MENU_STATUS, MENU_LOAD = 1, 2, 3, 4, 5
+local MENU_DELAY = 6
+E.DELAY_LABEL = "Experimental: no extra track (live delay)"
 E.EXHAUSTIVE = "exhaustive"
 
 local ST = {
@@ -174,14 +179,33 @@ function E.auto_enabled()
     return not (a == "0" or a == "off" or a == "false")
 end
 
+-- "delay" / "track" if the toggle was used, else nil (the helper's config decides)
+function E.control_sync_mode(c)
+    local m = ((c or E.read_control()).sync_mode or ""):lower()
+    if m == "delay" or m == "track" then return m end
+    return nil
+end
+
+-- Live delay mode in effect: the toggle's choice, else what the intf reports
+-- (it knows the helper's configured sync_mode from the last result).
+function E.delay_enabled()
+    local m = E.control_sync_mode()
+    if m then return m == "delay" end
+    local st = E.read_kv(join(E.queue_dir(), "intf_state"))
+    return st ~= nil and st.sync_mode == "delay"
+end
+
 -- `mode` (optional) applies to this sync_now increment ("" / nil = default mode).
-function E.write_control(auto, sync_now, mode)
+-- `sync_mode` "delay"/"track" sets the toggle; nil keeps the current value.
+function E.write_control(auto, sync_now, mode, sync_mode)
     E.ensure_dirs()
     local kv = {
         { "auto", auto and 1 or 0 },
         { "sync_now", sync_now },
     }
     if mode and mode ~= "" then kv[#kv + 1] = { "sync_now_mode", mode } end
+    sync_mode = sync_mode or E.control_sync_mode()
+    if sync_mode then kv[#kv + 1] = { "sync_mode", sync_mode } end
     return E.write_kv(join(E.queue_dir(), "control"), kv)
 end
 
@@ -369,6 +393,9 @@ function E.status_html()
         end
     end
     parts[#parts + 1] = "<b>Auto-sync:</b> " .. (E.auto_enabled() and "ON" or "OFF")
+    if E.delay_enabled() then
+        parts[#parts + 1] = "<b>Mode:</b> live delay (experimental, no extra track)"
+    end
     if ST.job then
         parts[#parts + 1] = "<b>Manual job:</b> " .. html_escape(E.check_job(false))
     end
@@ -466,6 +493,30 @@ function E.toggle_auto()
     end
 end
 
+-- Experimental live delay mode on/off (sync_mode=delay|track in <q>/control).
+function E.toggle_delay()
+    local c = E.read_control()
+    local on = not E.delay_enabled()
+    local st, i_alive = E.intf_status()
+    if on and i_alive and not (st and st.sync_modes and st.sync_modes:find("delay", 1, true)) then
+        E.show_status("The running SubSync interface script is from an older version"
+            .. " and has no live delay mode. Restart VLC, then try again.")
+        return
+    end
+    local ok, err = E.write_control(c.auto ~= "0", tonumber(c.sync_now) or 0, nil,
+        on and "delay" or "track")
+    if not ok then
+        E.show_status("Cannot write control file: " .. tostring(err))
+        return
+    end
+    if i_alive then
+        osd("SubSync live delay (experimental) " .. (on and "ON" or "OFF"))
+    else
+        E.show_status("Live delay mode is now " .. (on and "ON" or "OFF")
+            .. ", but the interface script is not running.")
+    end
+end
+
 ---------------------------------------------------------------- VLC hooks
 
 function descriptor()
@@ -501,6 +552,8 @@ function menu()
     m[MENU_AUTO] = "Auto-sync: " .. ((not ok or auto) and "ON" or "OFF")
     if ST.job and not ST.job.loaded then m[MENU_LOAD] = "Load synced result" end
     m[MENU_STATUS] = "Status…"
+    local okd, delay = pcall(E.delay_enabled)
+    m[MENU_DELAY] = E.DELAY_LABEL .. ": " .. ((okd and delay) and "ON" or "OFF")
     return m
 end
 
@@ -514,6 +567,8 @@ function trigger_menu(id)
             E.toggle_auto()
         elseif id == MENU_LOAD then
             E.show_status(E.check_job(true))
+        elseif id == MENU_DELAY then
+            E.toggle_delay()
         elseif id == MENU_STATUS then
             E.collect_ours()
             E.show_status()

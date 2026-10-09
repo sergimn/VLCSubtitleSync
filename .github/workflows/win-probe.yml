@@ -35,15 +35,34 @@ jobs:
       - name: Install VLC 3.0.21 (win64)
         shell: pwsh
         run: |
-          Invoke-WebRequest -UseBasicParsing https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.exe -OutFile vlc.exe
-          Start-Process .\vlc.exe -ArgumentList '/L=1033','/S' -Wait
+          $u = 'https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.zip'
+          Invoke-WebRequest -UseBasicParsing $u -OutFile vlc.zip
+          (Get-Item vlc.zip).Length
+          Expand-Archive vlc.zip "$env:RUNNER_TEMP\vlczip"
+          New-Item -ItemType Directory -Force "$env:ProgramFiles\VideoLAN" | Out-Null
+          Move-Item "$env:RUNNER_TEMP\vlczip\vlc-3.0.21" "$env:ProgramFiles\VideoLAN\VLC"
           Get-Item "$env:ProgramFiles\VideoLAN\VLC\vlc.exe"
       - name: Released install.cmd (as a user double-clicking it)
         shell: pwsh
         run: .\.github\win-probe\install-release.ps1
+      - name: Imports after the released install
+        if: always()
+        shell: pwsh
+        run: .\.github\win-probe\imports.ps1
+      - name: Retry with x64 Python (ARM only)
+        if: always() && matrix.os == 'windows-11-arm'
+        shell: pwsh
+        env:
+          VLC_SUBSYNC_PYTHON: cpython-3.12-windows-x86_64-none
+        run: |
+          Invoke-WebRequest -UseBasicParsing https://github.com/sergimn/VLCSubtitleSync/releases/download/v1.0.0/install.ps1 -OutFile "$env:RUNNER_TEMP\install.ps1"
+          powershell -NoProfile -ExecutionPolicy Bypass -File "$env:RUNNER_TEMP\install.ps1"
+          .\.github\win-probe\imports.ps1
       - name: CLI sync on a fixture
+        if: always()
         shell: pwsh
         run: .\.github\win-probe\sync-check.ps1 -Fix "$env:GITHUB_WORKSPACE\tests\fixtures"
       - name: VLC end-to-end
+        if: always()
         shell: pwsh
         run: .\.github\win-probe\e2e.ps1 -Fix "$env:GITHUB_WORKSPACE\tests\fixtures"

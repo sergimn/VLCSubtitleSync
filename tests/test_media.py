@@ -167,3 +167,130 @@ def test_image_subtitles_rejected(mkv, monkeypatch):
 )
 def test_text_codec_classification(codec, text):
     assert media._is_text_codec(codec) is text
+
+
+# --- audio timeline follows the media timestamps -------------------------------------
+
+
+def _rms(a, t0, t1):
+    seg = a[int(t0 * 16000) : int(t1 * 16000)]
+    return float(np.sqrt(np.mean(seg.astype(np.float64) ** 2)))
+
+
+def _shifted_tone(tmp_path, synth, shift):
+    """2 s, 440 Hz tone whose second half (from the first frame at t >= 1 s) is muxed
+    ``shift`` seconds later (gap) or earlier (overlap). FLAC frames are 72 ms here."""
+    out = tmp_path / f"shift{shift}.mkv"
+    _ffmpeg(
+        synth,
+        "-f", "lavfi", "-i", "sine=f=440:d=2:sample_rate=16000",
+        "-af", f"asetpts='if(gte(T,1),PTS+({shift})/TB,PTS)'",
+        "-c:a", "flac", str(out),
+    )  # fmt: skip
+    return out
+
+
+def test_decode_audio_fills_mid_stream_pts_gap_with_silence(tmp_path, synth):
+    a = media.decode_audio(str(_shifted_tone(tmp_path, synth, 2.0)))
+    # 1.008 s tone, 2 s gap, 0.992 s tone
+    assert a.shape[0] / 16000 == pytest.approx(4.0, abs=0.02)
+    assert _rms(a, 0.1, 0.9) > 0.05
+    assert _rms(a, 1.1, 2.9) < 1e-3
+    assert _rms(a, 3.1, 3.9) > 0.05
+
+
+def test_decode_audio_drops_overlapping_samples(tmp_path, synth):
+    a = media.decode_audio(str(_shifted_tone(tmp_path, synth, -0.5)))
+    # the second half starts 0.5 s before the first one ends: 0.5 s is dropped
+    assert a.shape[0] / 16000 == pytest.approx(1.5, abs=0.02)
+    assert _rms(a, 0.0, 1.5) > 0.05
+
+
+def _frame(x, sr=16000):
+    import av
+
+    f = av.AudioFrame.from_ndarray(x.reshape(1, -1).astype(np.float32), format="flt", layout="mono")
+    f.sample_rate = sr
+    return f
+
+
+def test_audio_assembler_trims_before_zero_and_pads_after():
+    ramp = np.arange(16000, dtype=np.float32) / 16000  # 1 s, value == time
+    asm = media._AudioAssembler(16000)
+    asm.feed(_frame(ramp[:8000]), -0.25)  # first frame starts before t=0
+    asm.feed(_frame(ramp[8000:]), 0.25)
+    a = asm.result()
+    assert a.shape[0] == 12000  # 0.25 s trimmed
+    assert a[0] == pytest.approx(0.25, abs=1e-3)
+    assert a[8000] == pytest.approx(0.75, abs=1e-3)
+
+    asm = media._AudioAssembler(16000)
+    asm.feed(_frame(ramp[:8000]), 0.5)  # leading silence
+    asm.feed(_frame(ramp[8000:]), 1.0 + 0.03)  # jitter below the tolerance is ignored
+    a = asm.result()
+    assert a.shape[0] == 24000
+    assert not a[:8000].any()
+    assert a[8000] == pytest.approx(0.0, abs=1e-3) and a[16000] == pytest.approx(0.5, abs=1e-3)
+
+
+def test_audio_assembler_ignores_huge_pts_jumps(caplog):
+    one = np.full(16000, 0.5, dtype=np.float32)  # 1 s
+    asm = media._AudioAssembler(16000)
+    asm.feed(_frame(one), 0.0)
+    asm.feed(_frame(one), 1.0 + 3600.0)  # e.g. MPEG-TS rollover: no hour of zeros
+    asm.feed(_frame(one), 2.0)  # back to the original clock
+    asm.feed(_frame(one), 3.0 - 7200.0)  # huge backwards jump: audio is not dropped
+    asm.feed(_frame(one), 4.0)
+    a = asm.result()
+    assert a.shape[0] == 5 * 16000
+    assert np.all(np.abs(a - 0.5) < 1e-3)
+    assert sum("timestamp jump" in r.getMessage() for r in caplog.records) >= 2
+
+
+def test_audio_assembler_rebases_on_a_persistent_clock_jump(caplog):
+    """After a discontinuity the new clock stays (e.g. concatenated recordings): one
+    warning, and a real gap later on is still filled with silence."""
+    one = np.full(16000, 0.5, dtype=np.float32)  # 1 s
+    asm = media._AudioAssembler(16000)
+    asm.feed(_frame(one), 0.0)
+    for k in range(1, 5):
+        asm.feed(_frame(one), 3600.0 + k)  # new clock from here on
+    asm.feed(_frame(one), 3600.0 + 7.0)  # a real 2 s gap on the new clock
+    a = asm.result()
+    assert a.shape[0] == 8 * 16000
+    assert np.all(np.abs(a[: 5 * 16000] - 0.5) < 1e-3)
+    assert np.all(np.abs(a[5 * 16000 + 100 : 7 * 16000 - 100]) < 1e-6)
+    assert sum("timestamp jump" in r.getMessage() for r in caplog.records) == 1
+
+
+# --- subtitle text cleanup -------------------------------------------------------------
+
+
+def test_extract_subtitles_strips_control_characters(tmp_path, synth):
+    srt = (
+        "1\n00:00:01,000 --> 00:00:02,000\nRaymond. Sup?@@NUL@@\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nA@@CTL@@b\nnext line\n"
+    )
+    (tmp_path / "p.srt").write_text(srt, encoding="utf-8")
+    src = tmp_path / "p.mkv"
+    _ffmpeg(
+        synth,
+        "-f", "lavfi", "-i", "sine=d=5", "-i", str(tmp_path / "p.srt"),
+        "-map", "0", "-map", "1", "-c:a", "flac", "-c:s", "srt",
+        "-write_crc32", "0", str(src),
+    )  # fmt: skip
+    # Patch control bytes into the stored text (same length; no CRCs to fix up).
+    data = src.read_bytes()
+    assert data.count(b"@@NUL@@") == 1 and data.count(b"@@CTL@@") == 1
+    data = data.replace(b"@@NUL@@", b"\x00" * 7).replace(b"@@CTL@@", b"\x07\x01\x7f\t\x1b\x00\x00")
+    dst = tmp_path / "nul.mkv"
+    dst.write_bytes(data)
+
+    subs = media.extract_subtitles(str(dst), 0)
+    assert [(e.start, e.end) for e in subs] == [(1000, 2000), (3000, 4000)]
+    assert subs[0].plaintext == "Raymond. Sup?"
+    assert subs[1].plaintext == "A b\nnext line"
+
+
+def test_clean_text():
+    assert media._clean_text("a\x00b\r\nc\rd\te\x1b\x85") == "ab\nc\nd e"

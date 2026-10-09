@@ -133,7 +133,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # windows-11-arm: the installer must pick x64 Python (no ARM64 ctranslate2 wheels)
+        os: [ubuntu-latest, macos-latest, windows-latest, windows-11-arm]
     env:
       VLC_SUBSYNC_SOURCE: ${{ github.workspace }}
     steps:
@@ -211,6 +212,22 @@ jobs:
             [ -d "$d" ] && find "$d" -name '*.log' -exec sh -c 'echo "== $1"; tail -n 100 "$1"' _ {} \;
           done
           true
+
+  installer-clean-windows:
+    # Runners come with Python and the Visual C++ runtime; a fresh PC may have neither.
+    name: Installer (fresh Windows container)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: install.cmd in mcr.microsoft.com/windows/servercore:ltsc2022
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\sys" | Out-Null
+          Copy-Item "$env:WINDIR\System32\avicap32.dll", "$env:WINDIR\System32\msvfw32.dll" "$env:RUNNER_TEMP\sys"
+          docker run --rm -v "${{ github.workspace }}:C:\src" -v "$env:RUNNER_TEMP\sys:C:\sys" `
+            mcr.microsoft.com/windows/servercore:ltsc2022 `
+            powershell -NoProfile -ExecutionPolicy Bypass -File C:\src\.github\ci\clean-windows-install.ps1
 
   build:
     name: Build sdist + wheel

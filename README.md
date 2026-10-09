@@ -419,6 +419,23 @@ The ~14-minute performance file is never committed. The test builds it from the
 committed audio (PyAV only), or you can run
 `python scripts/make_fixtures.py long --out /tmp/long --minutes 12`.
 
+### Accuracy benchmark
+
+`scripts/bench_fixtures.py` syncs every fixture case (each `en_dialogue` variant with
+`tiny.en` and `base.en`, the Spanish, language-mismatch and `multi_audio` cases, and the
+12-minute file) and scores each cue start against the exact ground truth. The
+`Benchmark` workflow runs it on every push to `main`. The results go to the run's step
+summary and to the `benchmark-results` artifact. It also runs on every PR and posts or
+updates a comment comparing the PR with the latest `main` run (informational only;
+it never fails the check).
+
+```sh
+.venv/bin/python scripts/bench_fixtures.py run --out /tmp/bench [--models tiny.en] [--no-long]
+.venv/bin/python scripts/bench_fixtures.py compare /tmp/bench/results.json --base other/results.json
+```
+
+For real media (with a Whisper transcript as ground truth), use `scripts/measure_real.py`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE). Speech recognition by

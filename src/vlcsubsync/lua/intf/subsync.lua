@@ -52,7 +52,7 @@
 
 local M = {}
 
-M.VERSION = "1.0.1"
+M.VERSION = "1.0.2"
 M.TICK_US = 500000            -- main loop period
 M.DEBOUNCE_US = 1500000       -- wait this long after a track change
 M.ADD_TIMEOUT_US = 10000000   -- wait at most this long for an added track to appear

@@ -801,14 +801,19 @@ class Daemon:
             )
             return False
         log.info(
-            "request %s: media=%s audio=%s sub=%s%s",
+            "request %s: media=%s audio=%s sub=%s%s%s",
             request.id,
             request.media,
             request.audio_index,
             request.sub_index,
             f" sub_path={request.sub_path}" if request.sub_path else "",
+            " (cache only)" if request.cache_only else "",
         )
-        self.enqueue(_Job(request=request, queue_dir=queue_dir))
+        job = _Job(request=request, queue_dir=queue_dir)
+        if request.cache_only:
+            self.answer_from_cache(job)
+        else:
+            self.enqueue(job)
         return True
 
     def _config_for_enqueue(self) -> Any:
@@ -1001,6 +1006,64 @@ class Daemon:
             return hit
         return None
 
+    def _from_cache(
+        self,
+        job: _Job,
+        source: ResolvedSource,
+        config: Any,
+        out_dir: Path,
+        applied_only: bool = False,
+    ) -> P.Status | None:
+        """Done status for ``job`` from the result cache (its file copied to
+        ``out_dir``), or None. ``applied_only`` ignores an unapplied cached result."""
+        r = job.request
+        cached = self._cached_result(job, source, config)
+        if cached is None:
+            return None
+        cached_file, meta = cached
+        if applied_only and not P._to_bool(meta.get("applied")):
+            return None
+        dest = out_dir / f"{r.id}{cached_file.suffix}"
+        try:
+            shutil.copyfile(cached_file, dest)
+        except OSError as exc:  # e.g. `clear-cache` ran meanwhile: sync again
+            log.info("job %s: cached result unreadable (%s); re-syncing", r.id, exc)
+            return None
+        done = P.Status.from_dict(meta)
+        done.id = r.id
+        done.state = "done"
+        done.progress = 1.0
+        done.output = str(dest)
+        done.time = None
+        done.sync_mode = _sync_mode(config)  # the current setting, not the cached one
+        return done
+
+    def answer_from_cache(self, job: _Job) -> P.Status:
+        """Answer a ``cache_only`` request at once, without queueing it: the done
+        status of an *applied* cached result, else state ``miss``. An unapplied result
+        is a miss too: the intf then waits as usual, and its normal request gets that
+        result from the cache anyway."""
+        r = job.request
+        status: P.Status | None = None
+        try:
+            if os.path.isfile(r.media):
+                config = self.config_loader()
+                if self.cache_enabled(job.queue_dir, config):
+                    if r.mode and hasattr(config, "with_mode"):
+                        config = config.with_mode(r.mode)
+                    source = self.resolver(r)
+                    out_dir = job.queue_dir / P.OUT_DIR
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    status = self._from_cache(job, source, config, out_dir, applied_only=True)
+        except Exception as exc:  # noqa: BLE001 - a miss: the real request reports it
+            log.debug("cache probe %s failed: %s", r.id, exc)
+            status = None
+        if status is None:
+            status = P.Status(id=r.id, state="miss", message="Not cached")
+        log.info("request %s: cache %s", r.id, "hit" if status.state == "done" else "miss")
+        self._safe_status(job.queue_dir, status)
+        return status
+
     def _cache_drop_other_modes(
         self, job: _Job, source: ResolvedSource, config: Any, keep: str
     ) -> None:
@@ -1080,23 +1143,10 @@ class Daemon:
             out_dir.mkdir(parents=True, exist_ok=True)
 
             use_cache = self.cache_enabled(job.queue_dir, config)
-            cached = self._cached_result(job, source, config) if use_cache and not r.force else None
-            if cached is not None:
-                cached_file, meta = cached
-                dest = out_dir / f"{r.id}{cached_file.suffix}"
-                try:
-                    shutil.copyfile(cached_file, dest)
-                except OSError as exc:  # e.g. `clear-cache` ran meanwhile: sync again
-                    log.info("job %s: cached result unreadable (%s); re-syncing", r.id, exc)
-                    cached = None
-            if cached is not None:
-                done = P.Status.from_dict(meta)
-                done.id = r.id
-                done.state = "done"
-                done.progress = 1.0
-                done.output = str(dest)
-                done.time = None
-                done.sync_mode = _sync_mode(config)  # the current setting, not the cached one
+            done = None
+            if use_cache and not r.force:
+                done = self._from_cache(job, source, config, out_dir)
+            if done is not None:
                 log.info("job %s: cache hit (mode %s)", r.id, mode)
                 writer.write(done, force=True)
                 return done

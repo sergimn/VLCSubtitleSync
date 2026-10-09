@@ -55,6 +55,11 @@ local M = {}
 M.VERSION = "1.0.2"
 M.TICK_US = 500000            -- main loop period
 M.DEBOUNCE_US = 1500000       -- wait this long after a track change
+-- After a file opens, VLC (and the user) may still be picking tracks: automatic
+-- syncs wait this long before transcribing, unless the user changes a track (that
+-- ends the wait) or the helper has a synced result cached (used at once).
+M.START_HOLD_US = 10000000
+M.START_SETTLE_US = 2000000   -- track changes this soon after audio shows up are VLC's
 M.ADD_TIMEOUT_US = 10000000   -- wait at most this long for an added track to appear
 M.OSD_PROGRESS_US = 3000000   -- min interval between progress OSD updates
 M.HEARTBEAT_CHECK_US = 2000000
@@ -867,6 +872,7 @@ function M.reset_input()
     S.job = nil
     S.adding = nil
     S.non_file_logged = nil
+    S.hold_until, S.settle_until, S.cache_missed = nil, nil, {}
     -- the old input (and its spu-delay variable) is gone; a new input starts
     -- from the sub-delay option again, so there is nothing to restore
     if S.delay then log_dbg("delay mode: input gone") end
@@ -896,7 +902,8 @@ function M.ensure_dirs()
     mkdir(join(S.q, "out"))
 end
 
-function M.submit(sel, force, mode)
+-- `probe`: only ask the helper for a cached result (cache_only=1), see M.request.
+function M.submit(sel, force, mode, probe)
     mode = M.valid_mode(mode)
     -- one job in flight per input: a newer request supersedes the old one
     if S.job then
@@ -919,6 +926,7 @@ function M.submit(sel, force, mode)
         { "force", force and 1 or 0 },
     }
     if mode ~= "" then kv[#kv + 1] = { "mode", mode } end
+    if probe then kv[#kv + 1] = { "cache_only", 1 } end
     local ok, err = M.write_kv(path, kv)
     if not ok then
         log_err(err)
@@ -926,18 +934,24 @@ function M.submit(sel, force, mode)
         M.set_state("error", "cannot write request", nil)
         return nil
     end
-    log_info(string.format("request %s: audio=%d sub=%d mode=%s media=%s",
-        id, sel.audio, sel.sub, mode ~= "" and mode or "default", S.media_path))
+    log_info(string.format("request %s: audio=%d sub=%d mode=%s%s media=%s",
+        id, sel.audio, sel.sub, mode ~= "" and mode or "default",
+        probe and " (cache only)" or "", S.media_path))
     S.job = {
         id = id, key = sel.key, audio = sel.audio, sub = sel.sub,
         audio_label = sel.audio_label, sub_label = sel.sub_label, force = force,
-        req_path = path, started = now_us(), mode = mode,
+        req_path = path, started = now_us(), mode = mode, probe = probe,
         status_path = join(join(S.q, "jobs"), id .. ".status"),
     }
-    local text = M.syncing_text(mode)
-    M.osd_info(text)
-    S.last_progress_osd = now_us()
-    M.set_state("syncing", text, nil)
+    if probe then
+        -- quiet: nothing is transcribed, and a hit shows "Subtitles synced"
+        M.set_state("waiting", "checking for a cached result", nil)
+    else
+        local text = M.syncing_text(mode)
+        M.osd_info(text)
+        S.last_progress_osd = now_us()
+        M.set_state("syncing", text, nil)
+    end
     if not M.daemon_alive(true) then
         M.warn_daemon()
     end
@@ -1026,6 +1040,32 @@ function M.check_adding(input, snap)
     return false
 end
 
+-- True while automatic syncs of the current input wait after it opened.
+function M.holding(t)
+    return S.hold_until ~= nil and t < S.hold_until
+end
+
+-- An automatic (unforced) sync request for `sel`. While holding, only ask the helper
+-- for a cached result (once per tracks); on a miss the trigger waits for the hold to
+-- end (M.handle_status), then this sends the real request.
+function M.request(sel)
+    local t = now_us()
+    if not M.holding(t) then
+        M.submit(sel, false)
+    elseif S.cache_missed[sel.key] then
+        M.wait_hold(sel.key)
+    else
+        M.submit(sel, false, nil, true)
+    end
+end
+
+function M.wait_hold(key)
+    S.pending = { due = S.hold_until, key = key, force = false, hold = true }
+    log_dbg(string.format("waiting %.1f s before syncing %s (file just opened)",
+        (S.hold_until - now_us()) / 1000000, key))
+    M.set_state("waiting", "waiting a few seconds after opening the file", nil)
+end
+
 -- Handle a sync trigger for selection `sel`.
 function M.fire(input, snap, sel, force)
     local memo = memo_for(S.input_uri)
@@ -1044,7 +1084,7 @@ function M.fire(input, snap, sel, force)
             end
             -- no mapping remembered (synced in track mode by an older helper):
             -- ask the helper again; it re-syncs cached results without one
-            M.submit(sel, false)
+            M.request(sel)
             return
         end
         if m.es and snap.spu_set[m.es] and S.ours[m.es] then
@@ -1061,7 +1101,11 @@ function M.fire(input, snap, sel, force)
             return
         end
     end
-    M.submit(sel, force)
+    if force then
+        M.submit(sel, true)
+    else
+        M.request(sel)
+    end
 end
 
 function M.handle_status(input, snap)
@@ -1076,6 +1120,20 @@ function M.handle_status(input, snap)
     end
     job.req_path = nil -- picked up by the daemon
     local state = st.state or "queued"
+    if job.probe and (state == "miss" or state == "error") then
+        -- nothing cached (an error is reported again by the real request)
+        S.job = nil
+        S.cache_missed[job.key] = true
+        log_dbg("no cached result for " .. job.key .. " (" .. tostring(st.message) .. ")")
+        if not S.pending and M.selection(snap).key == job.key then
+            if M.holding(t) then
+                M.wait_hold(job.key)
+            else
+                S.pending = { due = t, key = job.key, force = false }
+            end
+        end
+        return
+    end
     if state == "queued" or state == "running" then
         local p = tonumber(st.progress) or 0
         local msg = st.message or ""
@@ -1220,6 +1278,7 @@ function M.tick()
         S.input_uri = uri
         S.media_path = M.uri_to_path(uri)
         if S.media_path then log_dbg("new input: " .. S.media_path) end
+        if M.START_HOLD_US > 0 then S.hold_until = t + M.START_HOLD_US end
     end
     if not S.media_path then
         if not S.non_file_logged then
@@ -1287,6 +1346,19 @@ function M.tick()
         return
     end
 
+    if S.hold_until then
+        if t >= S.hold_until then
+            S.hold_until = nil
+        elseif not S.settle_until then
+            -- VLC picks its default tracks as the streams show up
+            if snap.audio ~= -1 then S.settle_until = t + M.START_SETTLE_US end
+        elseif (audio_changed or spu_changed) and t >= S.settle_until then
+            -- the user picked a track: sync it without waiting
+            S.hold_until = nil
+            log_dbg("track changed by the user; not waiting any longer")
+        end
+    end
+
     if (audio_changed or spu_changed) and S.auto then
         if not sel.key then
             S.pending = nil -- subtitles disabled (or no audio): nothing to do
@@ -1299,6 +1371,7 @@ function M.tick()
     end
 
     if sync_now then
+        S.hold_until = nil
         if sel.key then
             -- re-syncing an already synced track: bypass the daemon's cache
             local resync = sel.is_ours or (S.delay ~= nil and S.delay.key == sel.key)
@@ -1332,7 +1405,8 @@ function M.tick()
     end
 
     -- "done"/"error" stay visible until the next job starts
-    if not S.job and not S.adding and S.state ~= "error" and S.state ~= "done" then
+    if not S.job and not S.adding and S.state ~= "error" and S.state ~= "done"
+        and not (S.pending and S.pending.hold) then
         M.set_state(S.auto and "idle" or "disabled", "", nil)
     end
     M.write_state()
@@ -1342,7 +1416,7 @@ end
 
 function M.reset()
     S = {
-        counter = 0, auto = true, ours = {}, memo = {}, spawn_count = 0,
+        counter = 0, auto = true, ours = {}, memo = {}, spawn_count = 0, cache_missed = {},
         state = "idle", message = "", last_result = "",
     }
     S.q = M.queue_dir()

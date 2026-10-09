@@ -69,6 +69,10 @@ A sync runs again when you pick a different subtitle track or a different audio
 track (for example after switching to another language's dub). Results are cached, so
 reopening the same file is instant.
 
+Right after you open a file, SubSync waits 10 seconds before it starts listening, so
+you have time to switch to the audio and subtitle tracks you actually want. Switching
+a track ends the wait at once, and a cached result is used straight away.
+
 From the menu **View → SubSync** you can:
 
 | Menu item | What it does |

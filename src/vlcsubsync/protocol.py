@@ -36,7 +36,8 @@ CONTROL_FILE = "control"
 CLEAR_CACHE_FILE = "clear_cache"  # extension → daemon: delete the stored results
 INTF_STATE_FILE = "intf_state"
 
-STATES = ("queued", "running", "done", "error")
+# "miss": answer to a cache_only request that has no applied cached result.
+STATES = ("queued", "running", "done", "error", "miss")
 
 # Mapping segments in a done status (see DESIGN.md "Mapping segments").
 MAX_SEGMENTS = 256
@@ -295,6 +296,10 @@ class Request:
     force: bool = False
     # Optional sync mode override ("fast" | "thorough" | "exhaustive"); "" = config's.
     mode: str = ""
+    # Only answer from the result cache: a done status for an applied cached result,
+    # else state "miss" (the intf asks this while it holds off right after a file
+    # opens). Never queued, never syncs.
+    cache_only: bool = False
     version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, object]:
@@ -312,6 +317,8 @@ class Request:
         mode = normalize_mode(self.mode)
         if mode:
             out["mode"] = mode
+        if self.cache_only:
+            out["cache_only"] = True
         return out
 
     @classmethod
@@ -346,6 +353,7 @@ class Request:
             sub_label=data.get("sub_label") or "",
             force=_to_bool(data.get("force")),
             mode=normalize_mode(data.get("mode")) or "",  # unknown modes are ignored
+            cache_only=_to_bool(data.get("cache_only")),
             version=_to_int(data.get("version"), PROTOCOL_VERSION) or PROTOCOL_VERSION,
         )
 

@@ -59,7 +59,7 @@ jobs:
           fi
           echo "TAG=v$VERSION" >> "$GITHUB_ENV"
           echo "BRANCH=release/v$VERSION" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check the version is new
         run: |
           current="$(python3 scripts/version.py)"
@@ -133,10 +133,10 @@ jobs:
       MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
       PR_URL: ${{ github.event.pull_request.html_url }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Check the tag and version
         run: |

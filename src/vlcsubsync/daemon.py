@@ -1012,7 +1012,12 @@ class Daemon:
             if cached is not None:
                 cached_file, meta = cached
                 dest = out_dir / f"{r.id}{cached_file.suffix}"
-                shutil.copyfile(cached_file, dest)
+                try:
+                    shutil.copyfile(cached_file, dest)
+                except OSError as exc:  # e.g. `clear-cache` ran meanwhile: sync again
+                    log.info("job %s: cached result unreadable (%s); re-syncing", r.id, exc)
+                    cached = None
+            if cached is not None:
                 done = P.Status.from_dict(meta)
                 done.id = r.id
                 done.state = "done"

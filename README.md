@@ -200,7 +200,8 @@ Set the default with `mode=` in `config.ini`. You can also choose a mode for one
 the command line. A cached exhaustive result is reused when the file is opened again,
 including by later fast syncs, but only if it was applied. A forced re-sync ("Sync
 subtitles now" on an already synced track) replaces the cached results of the other
-modes, so the newest result is what you get next time.
+modes, so the newest result is what you get next time (with `cache=off` it leaves the
+cache alone).
 
 After upgrading SubSync, **restart VLC** before using "Sync now (exhaustive)". Until
 then the old interface script keeps running and can't do it. The menu says so instead

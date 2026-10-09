@@ -143,8 +143,11 @@ def test_cache_switch(tmp_path):
     for off in ("off", "0", "false", "No"):
         p.write_text(f"cache = {off}\n", encoding="utf-8")
         assert Config.load(p).cache is False
-    p.write_text("cache=maybe\n", encoding="utf-8")
-    assert Config.load(p).cache is True  # invalid: default kept
+    for on in ("on", "1", "TRUE", "yes"):
+        p.write_text(f"cache=off\ncache={on}\n", encoding="utf-8")
+        assert Config.load(p).cache is True  # the last line wins
+    p.write_text("cache=off\ncache=maybe\n", encoding="utf-8")
+    assert Config.load(p).cache is False  # invalid: ignored
     Config(cache=False).save(p)
     assert "cache=off" in p.read_text(encoding="utf-8")
     assert Config.load(p).cache is False

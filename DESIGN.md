@@ -525,8 +525,8 @@ triggering the path unit, and hitting it fails the path unit until `reset-failed
 **Models**: 60 s after the last job that ran the engine, the *worker thread* calls
 `transcribe.clear_cache()` (drops each model under its transcriber lock), drops the
 Silero VAD, runs `gc.collect()` and `malloc_trim(0)`, and logs the RSS before/after.
-Running on the worker means it can never overlap a job. The 7-day result cache is
-unchanged.
+Running on the worker means it can never overlap a job. The result cache (kept 7
+days after last use) is unchanged.
 
 **Priority** (`lifecycle.lower_priority`, at `serve` start before any thread, since
 Linux nice/ioprio are per thread and inherited): nice ≥ 10 (never lowered), Linux

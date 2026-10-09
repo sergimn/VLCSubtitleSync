@@ -330,6 +330,7 @@ def test_cache_off_neither_reuses_nor_stores(env):
         h.submit("n_1", media, sub_index=0)
         h.wait_state("n_1", "done")
         wait_for(lambda: len(list(cache.glob("*.meta"))) == 1)
+        stored = {f: f.stat().st_mtime_ns for f in cache.iterdir()}
         cfg["c"] = Config(cache=False)  # the user edited config.ini
         h.submit("n_2", media, sub_index=0)
         h.wait_state("n_2", "done")
@@ -339,9 +340,23 @@ def test_cache_off_neither_reuses_nor_stores(env):
         assert len(runner.calls) == 3
         assert len(list(cache.glob("*.meta"))) == 1  # ...and nothing new was stored
         # a forced sync with the cache off leaves the stored results alone too
-        h.submit("n_4", media, sub_index=0, mode="exhaustive", force=True)
+        h.submit("n_4", media, sub_index=0, mode="thorough", force=True)
         h.wait_state("n_4", "done")
-        assert len(list(cache.glob("*.meta"))) == 1
+        assert {f: f.stat().st_mtime_ns for f in cache.iterdir()} == stored  # untouched
+
+
+def test_cache_entry_deleted_before_copy_resyncs(env, monkeypatch):
+    """`clear-cache` between the lookup and the copy: the job syncs again."""
+    media = make_media(env)
+    runner = FakeRunner()
+    gone = env.tmp / "gone.srt"
+    monkeypatch.setattr(
+        D.Daemon, "_cached_result", lambda self, *a: (gone, {"applied": "1", "file": "x"})
+    )
+    with Harness(env, runner) as h:
+        h.submit("g_1", media, sub_index=0)
+        st = h.wait_state("g_1", "done", "error")
+        assert st.state == "done" and len(runner.calls) == 1
 
 
 def test_clear_results_cache(env):

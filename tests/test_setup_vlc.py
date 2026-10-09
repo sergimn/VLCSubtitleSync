@@ -770,7 +770,7 @@ def test_setup_vlc_dir_systemd_keeps_default_and_watches_custom(tmp_path):
     units = fs.home / ".config/systemd/user"
     service = (units / "vlc-subsync.service").read_text()
     [exec_start] = [ln for ln in service.splitlines() if ln.startswith("ExecStart=")]
-    assert exec_start.endswith(f" serve --queue-dir {custom_q}")
+    assert exec_start.endswith(f" serve --queue-dir {S._systemd_quote(str(custom_q))}")
     path_unit = (units / "vlc-subsync.path").read_text().splitlines()
     for q in (native_q, custom_q):
         assert f"PathModified={q / 'intf_state'}" in path_unit

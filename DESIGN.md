@@ -341,7 +341,11 @@ OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job w
       moved individually.
 8. VAD fallback (language mismatch / too few anchors): cross-correlate the speech mask
    with the subtitle-on mask at 10 ms resolution over the same candidate scales
-   (FFT), pick best.
+   (FFT). Each scale's peak height above its own baseline is divided by the same
+   prior as `_best_candidate_scale` (1.0: ×1/0.98, others: 1 + 2·|s − 1|), and the
+   winner must stand out against the best rival scale that maps the file > 3 s
+   differently (`cross_scale`): more candidates must not mean more chances for a
+   noise maximum to win.
 9. Confidence: (1 − e^(−inliers/12)) · (0.35 + 0.65·inlier weight ratio) ·
    (0.4 + 0.6·window coverage) · e^(−max(0, residual − 0.25)/0.4) · 0.95^(segments−1).
    The residual is the median |inlier residual| after removing up to 0.2 s of each

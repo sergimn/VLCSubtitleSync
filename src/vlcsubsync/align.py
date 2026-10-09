@@ -1728,8 +1728,8 @@ def vad_align(
     if max_offset is None:
         max_offset = min(1200.0, max(60.0, 0.5 * audio_dur))
     sp = speech.astype(np.float32) * 2.0 - 1.0  # +1 speech, -1 non-speech
-    best = None
     sub_end = max(c.end for c in cues)
+    per_scale = []  # (score, peak, scale, lag, vals, lags)
     for s in scales:
         m_len = int(math.ceil(sub_end * s / resolution)) + 1
         sub = _cue_mask(cues, s, resolution, m_len)
@@ -1745,20 +1745,29 @@ def vad_align(
         )
         vals = corr[lags % size] / on
         k = int(np.argmax(vals))
-        if best is None or vals[k] > best[0]:
-            best = (float(vals[k]), s, int(lags[k]), vals, lags)
-    if best is None:
+        # Height above this scale's own baseline, with the same prior towards no drift
+        # as _best_candidate_scale: more candidates must not mean more chances for a
+        # noise maximum to win.
+        height = float(vals[k] - np.median(vals))
+        score = height / (0.98 if s == 1.0 else 1.0 + 2.0 * abs(s - 1.0))
+        per_scale.append((score, float(vals[k]), s, int(lags[k]), vals, lags))
+    if not per_scale:
         return AlignResult(Mapping.identity(), "none", 0.0, 0)
-    peak, s, lag, vals, lags = best
+    per_scale.sort(key=lambda t: t[0], reverse=True)
+    score, peak, s, lag, vals, lags = per_scale[0]
     away = np.abs(lags - lag) * resolution > 3.0
     second = float(vals[away].max()) if away.any() else -1.0
     base = float(np.median(vals))
     spread = float(np.median(np.abs(vals - base))) * 1.4826 + 1e-6
     z = (peak - base) / spread
     prominence = (peak - second) / max(peak - base, 1e-6)
+    # Across scales: the runner-up among scales that map the file distinguishably
+    # differently (> 3 s apart at its end) must be clearly lower.
+    rivals = [t[0] for t in per_scale[1:] if abs(t[2] - s) * sub_end > 3.0]
+    cross = (score - rivals[0]) / max(score, 1e-6) if rivals else 1.0
     conf = (
         min(1.0, max(0.0, (peak - 0.05) / 0.3))
-        * min(1.0, max(0.0, prominence / 0.3))
+        * min(1.0, max(0.0, min(prominence, 2.0 * cross) / 0.3))
         * min(1.0, max(0.0, (z - 3.0) / 4.0))
     )
     offset = lag * resolution
@@ -1767,7 +1776,13 @@ def vad_align(
         "vad",
         float(conf),
         0,
-        details={"peak": peak, "second": second, "z": z, "prominence": prominence},
+        details={
+            "peak": peak,
+            "second": second,
+            "z": z,
+            "prominence": prominence,
+            "cross_scale": cross,
+        },
     )
 
 

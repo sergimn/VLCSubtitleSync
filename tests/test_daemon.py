@@ -25,10 +25,16 @@ def wait_for(cond, timeout=10.0, interval=0.02):
 class FakeRunner:
     """Writes a fake SRT; optionally blocks until released."""
 
-    def __init__(self, fail_for=(), block=False):
+    def __init__(self, fail_for=(), block=False, applied=True, mapping_segments="default"):
+        # the engine always returns its mapping when applied; None = an engine
+        # from before mappings were sent
+        if mapping_segments == "default":
+            mapping_segments = [P.MapSegment(None, None, 1.0417, 2.35)]
+        self.mapping_segments = mapping_segments
         self.calls: list[D.JobSpec] = []
         self.fail_for = set(fail_for)
         self.block = block
+        self.applied = applied
         self.release = threading.Event()
         self.started = threading.Event()
 
@@ -51,8 +57,9 @@ class FakeRunner:
             segments=1,
             confidence=0.93,
             anchors=40,
-            applied=True,
+            applied=self.applied,
             message="offset +2.35s, drift +4.17%",
+            mapping_segments=self.mapping_segments,
         )
 
 
@@ -83,12 +90,15 @@ def external_resolver(req):
 
 class Harness:
     def __init__(self, env, runner, resolver=external_resolver, **kw):
+        config_loader = kw.pop(
+            "config_loader", lambda: SimpleNamespace(model_en="base.en", model_multi="base")
+        )
         self.daemon = D.Daemon(
             [env.queue],
             use_default_queues=False,
             runner=runner,
             resolver=resolver,
-            config_loader=lambda: SimpleNamespace(model_en="base.en", model_multi="base"),
+            config_loader=config_loader,
             cache_dir=env.tmp / "cache" / "results",
             lock_path=env.tmp / "state" / "daemon.lock",
             poll_interval=0.02,
@@ -256,6 +266,32 @@ def test_same_params_does_not_cancel_running(env):
     assert [c.id for c in runner.calls] == ["p_1"]  # p_2 came from the cache
 
 
+@pytest.mark.parametrize(
+    "first,second,cancels",
+    [
+        ({}, {"mode": "exhaustive"}, True),  # "Sync now (exhaustive)" during a fast run
+        ({"mode": "exhaustive"}, {"force": True}, True),  # forced plain "Sync now"
+        ({"mode": "exhaustive"}, {}, False),  # an automatic request waits
+        ({"mode": "exhaustive"}, {"mode": "exhaustive"}, False),
+    ],
+)
+def test_mode_switch_cancels_running(env, first, second, cancels):
+    m1 = make_media(env)
+    runner = FakeRunner(block=True)
+    with Harness(env, runner) as h:
+        h.submit("m_1", m1, sub_index=0, **first)
+        h.wait_state("m_1", "running")
+        h.submit("m_2", m1, sub_index=0, **second)
+        h.wait_state("m_2", "queued", "running", "done")
+        if cancels:
+            assert "Superseded" in h.wait_state("m_1", "error").message
+        else:
+            time.sleep(0.2)
+            assert h.status("m_1").state == "running"
+        runner.release.set()
+        h.wait_state("m_2", "done")
+
+
 def test_cache_hit_and_force(env):
     media = make_media(env)
     runner = FakeRunner()
@@ -281,6 +317,132 @@ def test_cache_hit_and_force(env):
         h.submit("c_5", media, sub_index=0)
         h.wait_state("c_5", "done")
         assert len(runner.calls) == 4
+
+
+def test_cache_key_includes_mode(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    d = D.Daemon(
+        [env.queue], use_default_queues=False, runner=FakeRunner(),
+        resolver=external_resolver, cache_dir=env.tmp / "c",
+        lock_path=env.tmp / "state" / "daemon.lock",
+    )  # fmt: skip
+    src = D.ResolvedSource("embedded", index=0)
+
+    def key(cfg_mode="fast", req_mode=""):
+        job = D._Job(P.Request(id="k", media=media, sub_index=0, mode=req_mode), env.queue)
+        return d.cache_key(job, src, Config(mode=cfg_mode))
+
+    keys = {m: key(m) for m in ("fast", "thorough", "exhaustive")}
+    assert len(set(keys.values())) == 3
+    # the request's mode wins over the config's; an unknown config mode means fast
+    assert key("fast", "exhaustive") == keys["exhaustive"]
+    assert key("bogus") == keys["fast"]
+    # lookup order: most thorough first, never a less thorough result
+    job = D._Job(P.Request(id="k", media=media, sub_index=0, mode="thorough"), env.queue)
+    assert d.cache_lookup_keys(job, src, Config()) == [
+        ("exhaustive", keys["exhaustive"]),
+        ("thorough", keys["thorough"]),
+    ]
+
+
+def test_request_mode_reaches_runner_and_cache(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    runner = FakeRunner()
+    with Harness(env, runner) as h:
+        h.daemon.config_loader = lambda: Config(mode="fast")
+        h.submit("m_1", media, sub_index=0)
+        h.wait_state("m_1", "done")
+        assert runner.calls[-1].config.mode == "fast"
+        # an exhaustive request does not reuse the fast result
+        h.submit("m_2", media, sub_index=0, mode="exhaustive")
+        h.wait_state("m_2", "done")
+        assert len(runner.calls) == 2
+        assert runner.calls[-1].config.mode == "exhaustive"
+        # ... but a later fast or thorough request reuses the exhaustive one
+        h.submit("m_3", media, sub_index=0, mode="thorough")
+        h.wait_state("m_3", "done")
+        h.submit("m_4", media, sub_index=0)
+        h.wait_state("m_4", "done")
+        assert len(runner.calls) == 2
+        # a thorough result does not satisfy an exhaustive request
+        h.submit("m_5", media, sub_index=1, mode="thorough")
+        h.wait_state("m_5", "done")
+        h.submit("m_6", media, sub_index=1, mode="exhaustive")
+        h.wait_state("m_6", "done")
+        assert [c.config.mode for c in runner.calls[2:]] == ["thorough", "exhaustive"]
+
+
+def test_unapplied_result_not_served_across_modes(env):
+    """An unapplied exhaustive result (e.g. Whisper windows lost to CUDA OOM, then the
+    VAD fallback) must not block a fast sync, but still answers exhaustive requests."""
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    runner = FakeRunner(applied=False)
+    with Harness(env, runner) as h:
+        h.daemon.config_loader = lambda: Config(mode="fast")
+        h.submit("u_1", media, sub_index=0, mode="exhaustive")
+        assert h.wait_state("u_1", "done").applied is False
+        # same mode: the cached unapplied result is reused (hopeless work not redone)
+        h.submit("u_2", media, sub_index=0, mode="exhaustive")
+        assert h.wait_state("u_2", "done").applied is False
+        assert len(runner.calls) == 1
+        # fast and thorough: not answered by the unapplied exhaustive result
+        runner.applied = True
+        h.submit("u_3", media, sub_index=0)
+        assert h.wait_state("u_3", "done").applied is True
+        assert [c.config.mode for c in runner.calls] == ["exhaustive", "fast"]
+        h.submit("u_4", media, sub_index=0, mode="thorough")
+        h.wait_state("u_4", "done")
+        assert [c.config.mode for c in runner.calls][-1] == "thorough"
+        assert len(runner.calls) == 3
+        # an applied exhaustive result does answer the cheaper modes
+        h.submit("u_5", media, sub_index=1, mode="exhaustive")
+        h.wait_state("u_5", "done")
+        h.submit("u_6", media, sub_index=1)
+        assert h.wait_state("u_6", "done").applied is True
+        assert len(runner.calls) == 4
+
+
+def test_forced_resync_wins_over_other_modes(env):
+    """A forced fast re-sync replaces an older exhaustive result for later opens."""
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    runner = FakeRunner()
+    cache = env.tmp / "cache" / "results"
+    with Harness(env, runner) as h:
+        h.daemon.config_loader = lambda: Config(mode="fast")
+        h.submit("f_1", media, sub_index=0, mode="exhaustive")
+        h.wait_state("f_1", "done")
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 1)  # stored after "done"
+        # user clicks "Sync now" (force=1) in fast mode with a different result
+        runner.applied = False
+        h.submit("f_2", media, sub_index=0, force=True)
+        assert h.wait_state("f_2", "done").applied is False
+        assert len(runner.calls) == 2
+
+        # only the forced fast result is left; the next (fast) open gets it
+        # (the cache is updated right after "done" is written)
+        def only_forced_entry_left():
+            metas = [P.read_kv(m) for m in cache.glob("*.meta")]
+            return len(metas) == 1 and metas[0].get("applied") == "0"
+
+        wait_for(only_forced_entry_left)
+        assert len(list(cache.glob("*.srt"))) == 1
+        h.submit("f_3", media, sub_index=0)
+        assert h.wait_state("f_3", "done").applied is False
+        assert len(runner.calls) == 2
+        # an exhaustive request now runs again (its old entry is gone)
+        h.submit("f_4", media, sub_index=0, mode="exhaustive")
+        h.wait_state("f_4", "done")
+        assert len(runner.calls) == 3
+        # a non-forced run does not drop other modes' entries
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 2)  # stored after "done"
 
 
 def test_stale_lock_is_taken_over(env):
@@ -421,3 +583,105 @@ def test_external_output_keeps_format(env):
         h.submit("f_1", media, sub_index=0)
         st = h.wait_state("f_1", "done")
     assert st.output.endswith("f_1.ass")
+
+
+SEGS = [
+    P.MapSegment(None, 83.71, 1.0, 2.0, ((10.0, 0.05), (60.0, -0.02))),
+    P.MapSegment(83.71, None, 0.959041, 12.0),
+]
+
+
+def test_done_status_carries_mapping_segments_and_cache_returns_them(env):
+    media = make_media(env)
+    runner = FakeRunner(mapping_segments=SEGS)
+    with Harness(env, runner) as h:
+        h.submit("m_1", media, sub_index=0)
+        st = h.wait_state("m_1", "done")
+        raw = P.read_kv(P.status_path(env.queue, "m_1"))
+        assert raw["segments"] == "2"
+        assert raw["seg0"] == ",83.710,1.0000000,2.0000"
+        assert raw["seg0_knots"] == "10.000:0.0500;60.000:-0.0200"
+        assert raw["seg1"] == "83.710,,0.9590410,12.0000"
+        assert "seg1_knots" not in raw
+        assert raw["sync_mode"] == "track"  # config without sync_mode: the default
+        assert st.segments == SEGS
+        # cache hit: same mapping, without running the engine again
+        h.submit("m_2", media, sub_index=0)
+        st2 = h.wait_state("m_2", "done")
+        assert len(runner.calls) == 1
+        assert st2.segments == SEGS
+        meta = [P.read_kv(m) for m in (env.tmp / "cache" / "results").glob("*.meta")]
+        assert meta and meta[0]["segments"] == "2" and "seg1" in meta[0]
+
+
+def test_unapplied_result_has_no_segments(env):
+    media = make_media(env)
+    runner = FakeRunner(applied=False, mapping_segments=SEGS)
+    with Harness(env, runner) as h:
+        h.submit("u_1", media, sub_index=0)
+        st = h.wait_state("u_1", "done")
+        assert st.segments is None
+        assert "segments" not in P.read_kv(P.status_path(env.queue, "u_1"))
+
+
+def test_status_reports_configured_sync_mode_also_on_cache_hit(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    cfg = {"c": Config(sync_mode="delay")}
+    runner = FakeRunner(mapping_segments=SEGS)
+    with Harness(env, runner, config_loader=lambda: cfg["c"]) as h:
+        h.submit("s_1", media, sub_index=0)
+        assert h.wait_state("s_1", "done").sync_mode == "delay"
+        cfg["c"] = Config(sync_mode="track")  # the user edited config.ini
+        h.submit("s_2", media, sub_index=0)
+        st = h.wait_state("s_2", "done")
+        assert len(runner.calls) == 1  # cache hit...
+        assert st.sync_mode == "track"  # ...with today's setting
+        assert st.segments == SEGS
+
+
+def test_applied_cache_entry_without_mapping_is_resynced(env):
+    """Results cached before this change have no seg* keys: delay mode could not
+    use them, so they are a miss (once: the new result replaces them)."""
+    media = make_media(env)
+    runner = FakeRunner(mapping_segments=None)  # like the engine before mappings
+    with Harness(env, runner) as h:
+        h.submit("o_1", media, sub_index=0)
+        h.wait_state("o_1", "done")
+        runner.mapping_segments = SEGS
+        h.submit("o_2", media, sub_index=0)
+        st = h.wait_state("o_2", "done")
+        assert len(runner.calls) == 2  # re-synced, not served from the old entry
+        assert st.segments == SEGS
+        h.submit("o_3", media, sub_index=0)
+        st = h.wait_state("o_3", "done")
+        assert len(runner.calls) == 2  # the new entry is a normal hit
+        assert st.segments == SEGS
+
+
+def test_unapplied_cache_entry_without_mapping_is_still_a_hit(env):
+    media = make_media(env)
+    runner = FakeRunner(applied=False)
+    with Harness(env, runner) as h:
+        h.submit("n_1", media, sub_index=0)
+        h.wait_state("n_1", "done")
+        h.submit("n_2", media, sub_index=0)
+        h.wait_state("n_2", "done")
+        assert len(runner.calls) == 1  # hopeless work is not redone
+
+
+def test_cache_key_includes_configured_mode(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    d = D.Daemon(
+        [env.queue], use_default_queues=False, runner=FakeRunner(),
+        resolver=external_resolver, cache_dir=env.tmp / "c",
+        lock_path=env.tmp / "state" / "daemon.lock",
+    )  # fmt: skip
+    src = D.ResolvedSource("embedded", index=0)
+    job = D._Job(P.Request(id="k", media=media, sub_index=0), env.queue)
+    keys = {m: d.cache_key(job, src, Config(mode=m)) for m in ("fast", "thorough", "exhaustive")}
+    assert len(set(keys.values())) == 3
+    assert d.cache_key(job, src, Config(mode="bogus")) == keys["fast"]

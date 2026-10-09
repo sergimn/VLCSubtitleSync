@@ -19,6 +19,8 @@ from vlcsubsync.sync import (
     SubtitleSource,
     SyncError,
     SyncResult,
+    exhaustive_windows,
+    plan_windows,
     resolve_subtitle_source,
     sync_subtitles,
 )
@@ -114,6 +116,96 @@ def test_sync_cut_piecewise(tmp_path, synth, energy_vad):
     _check(err)
     # adaptive windows were added around the cut
     assert len(fake.calls) > Config().window_count(25 * 60)
+    # the mapping itself is exposed (delay mode applies it live in VLC)
+    m = r.mapping_segments
+    assert len(m) == 2
+    assert m[0].sub_start is None and m[1].sub_end is None
+    assert m[0].sub_end == m[1].sub_start and 1150 < m[0].sub_end < 1250
+    assert m[0].audio(600.0) - 600.0 == pytest.approx(3.0, abs=0.15)
+    assert m[1].audio(1800.0) - 1800.0 == pytest.approx(33.0, abs=0.15)
+
+
+@pytest.mark.parametrize("verify_windows", ["auto", "0"])
+def test_sync_small_offset_steps_verified(tmp_path, synth, energy_vad, verify_windows):
+    """Sections 0.6-0.8 s apart (below the inlier threshold): the bisection
+    verification separates them, within its window budget."""
+
+    def f(t):
+        return t + 2.0 if t < 900 else (t + 2.6 if t < 1800 else t + 1.8)
+
+    duration = 45 * 60
+    script, wav, srt, fake = _case(tmp_path, synth, f, duration, seed=1, drop=0.1)
+    cfg = Config(verify_windows=verify_windows)
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(srt)), str(tmp_path / "o.srt"),
+        cfg, transcriber=fake,
+    )  # fmt: skip
+    assert r.applied
+    err = _errors(synth, r.output_path, script, f)
+    _check(err)
+    k = cfg.window_count(duration)
+    budget = cfg.verify_budget(duration)
+    adaptive = max(4, k // 2)
+    assert len(fake.calls) <= 1 + k + adaptive + budget  # +1: language detection window
+    if verify_windows == "auto":
+        assert r.segments == 3 and np.percentile(err, 95) < 0.2
+
+
+def test_exhaustive_windows_cover_file_and_skip_silence():
+    duration = 305.0  # 11 windows, the last one 5 s long
+    speech = np.ones(305)
+    speech[60:120] = 0.0  # windows 2 and 3 silent
+    speech[125] = 0.0
+    speech[150:180] = 0.0
+    speech[170] = 1.0  # window 5: 1 s of speech is enough
+    starts = exhaustive_windows(speech, duration)
+    assert starts == [0, 30, 120, 150, 180, 210, 240, 270, 300]
+    # without silence: consecutive 30 s steps covering [0, duration)
+    full = exhaustive_windows(np.ones(305), duration)
+    assert full == [30.0 * i for i in range(11)]
+    assert full[-1] < duration <= full[-1] + 30
+    assert exhaustive_windows(np.zeros(305), duration) == []
+    assert exhaustive_windows(np.ones(0), 0.0) == []
+
+
+def test_plan_windows_per_mode():
+    duration = 28.7 * 60
+    speech = np.ones(int(duration))
+    speech[300:400] = 0.0
+    fast = plan_windows(speech, duration, Config(mode="fast"))
+    thorough = plan_windows(speech, duration, Config(mode="thorough"))
+    exhaustive = plan_windows(speech, duration, Config(mode="exhaustive"))
+    assert len(fast) == 8 and len(thorough) == 20
+    assert all(b - a >= 30 for a, b in zip(thorough, thorough[1:], strict=False))
+    assert exhaustive == [30.0 * i for i in range(58) if not 300 <= 30 * i < 390]
+    # explicit windows= keeps working in fast and thorough
+    assert len(plan_windows(speech, duration, Config(mode="thorough", windows="6"))) == 6
+
+
+def test_sync_exhaustive_mode(tmp_path, synth, energy_vad):
+    """Exhaustive mode transcribes consecutive 30 s windows (not the silent ones) and
+    nothing else, and fits the same piecewise mapping."""
+
+    def f(t):
+        return t + 2.0 if t < 300 else t + 2.7
+
+    duration = 10 * 60
+    script, wav, srt, fake = _case(tmp_path, synth, f, duration, drop=0.2, noise=0.1)
+    progress = []
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(srt)), str(tmp_path / "o.srt"),
+        Config(mode="exhaustive"), lambda p, m: progress.append(m), fake,
+    )  # fmt: skip
+    assert r.applied and r.method == "whisper"
+    starts = [a for a, _b in fake.calls]
+    assert starts == sorted(starts) and len(starts) == len(set(starts))
+    assert all(s % 30 == 0 for s in starts)
+    # the synthetic script leaves the last ~40 s silent: those windows are skipped
+    assert 0.0 in starts and duration - 30 not in starts
+    assert len(starts) >= 15
+    assert any(m.endswith("(exhaustive)") for m in progress)
+    err = _errors(synth, r.output_path, script, f)
+    _check(err)
 
 
 def test_language_mismatch_uses_vad(tmp_path, synth, energy_vad):
@@ -171,6 +263,7 @@ def test_too_few_anchors_not_applied(tmp_path, synth, energy_vad):
     assert not r.applied
     assert r.method == "none" and r.offset == 0.0 and r.scale == 1.0
     assert r.message.startswith("not synced")
+    assert r.mapping_segments == []
     out = pysubs2.load(r.output_path)
     orig = pysubs2.load(str(srt))
     assert [(e.start, e.end, e.text) for e in out] == [(e.start, e.end, e.text) for e in orig]
@@ -426,3 +519,27 @@ def test_real_whisper_on_fixtures(tmp_path, media, variant, truth, method):
     err = np.abs(np.array([e.start for e in out]) - np.array([e.start for e in ref])) / 1000
     assert np.median(err) < 0.15, np.median(err)
     assert np.percentile(err, 95) < 0.4, np.percentile(err, 95)
+
+
+def test_mapping_segments_from_align_mapping():
+    import math
+
+    from vlcsubsync.align import Mapping, Segment
+    from vlcsubsync.protocol import MapSegment
+    from vlcsubsync.sync import mapping_segments
+
+    m = Mapping(
+        [
+            Segment(-math.inf, 1.0, 2.0, 10, ((0.0, 0.1), (100.0, -0.1))),
+            Segment(500.0, 0.959, 12.0, 5),
+        ]
+    )
+    segs = mapping_segments(m)
+    assert segs == [
+        MapSegment(None, 500.0, 1.0, 2.0, ((0.0, 0.1), (100.0, -0.1))),
+        MapSegment(500.0, None, 0.959, 12.0),
+    ]
+    for t in (-5.0, 0.0, 50.0, 100.0, 499.0, 500.0, 900.0):
+        seg = segs[0] if t < 500 else segs[1]
+        assert seg.audio(t) == pytest.approx(m(t))
+    assert mapping_segments(Mapping.identity()) == [MapSegment(None, None, 1.0, 0.0)]

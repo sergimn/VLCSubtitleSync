@@ -7,14 +7,51 @@ headers are ignored).  Unknown keys are preserved on save so that other componen
 
 from __future__ import annotations
 
+import math
 import os
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 APP_NAME = "vlc-subsync"
 CONFIG_FILENAME = "config.ini"
 
 _VALID_DEVICES = ("auto", "cpu", "cuda")
+
+# Sync modes, cheapest first (see DESIGN.md "Sync modes"):
+#   fast        sampled 30 s windows (default ~1 per 4 min, at least 8) plus a small
+#               bisection-verification budget (2 + 1 per 30 min).
+#   thorough    ~2.5x more sampled windows (~1 per 96 s, at least 20) and a 3x larger
+#               verification budget.
+#   exhaustive  consecutive 30 s windows over the whole file ([0, 30), [30, 60), ...),
+#               skipping windows without detected speech; every anchor feeds the fit,
+#               subdivision and local refinement.  Costs roughly one Whisper pass over
+#               all dialogue (minutes on CPU for an episode).
+MODES = ("fast", "thorough", "exhaustive")
+DEFAULT_MODE = "fast"
+
+# How VLC applies a result (the VLC side of "delay" follows in the delay-mode PR):
+#   track   load the re-timed file as an extra subtitle track (default)
+#   delay   EXPERIMENTAL: keep the original track and correct it live through the
+#           input's "spu-delay" variable, following the piecewise mapping
+SYNC_MODES = ("track", "delay")
+DEFAULT_SYNC_MODE = "track"
+
+
+def normalize_mode(value: object) -> str | None:
+    """``value`` as one of :data:`MODES` (case-insensitive), or None if invalid/empty."""
+    v = str(value or "").strip().lower()
+    return v if v in MODES else None
+
+
+def normalize_sync_mode(value: object) -> str | None:
+    """``value`` as one of :data:`SYNC_MODES` (case-insensitive), or None."""
+    v = str(value or "").strip().lower()
+    return v if v in SYNC_MODES else None
+
+
+def mode_rank(mode: str) -> int:
+    """0 for fast, 1 for thorough, 2 for exhaustive (unknown → fast)."""
+    return MODES.index(mode) if mode in MODES else 0
 
 
 def config_dir() -> Path:
@@ -33,25 +70,76 @@ def default_config_path() -> Path:
 
 @dataclass
 class Config:
+    mode: str = DEFAULT_MODE  # fast | thorough | exhaustive (see MODES)
+    # track | delay (see SYNC_MODES); "delay" is experimental and off by default
+    sync_mode: str = DEFAULT_SYNC_MODE
     model_en: str = "base.en"
     model_multi: str = "base"
     device: str = "auto"  # auto | cpu | cuda
     compute_type: str = "int8"
-    windows: str = "auto"  # "auto" or a positive integer (number of 30 s windows)
+    # Sampled 30 s windows: "auto" (per mode) or a positive integer, which overrides the
+    # mode's count in fast/thorough. Exhaustive mode ignores it (it covers everything).
+    windows: str = "auto"
+    # Extra 30 s windows the bisection verification may transcribe: "auto" (per mode) or
+    # an integer >= 0 (0 = verify with the windows already transcribed only).
+    verify_windows: str = "auto"
     min_confidence: float = 0.5
     threads: int = 0  # 0 = let CTranslate2 decide
     extra: dict[str, str] = field(default_factory=dict)  # unknown keys, preserved on save
 
     # -- derived helpers -------------------------------------------------------------
+    @property
+    def effective_mode(self) -> str:
+        return normalize_mode(self.mode) or DEFAULT_MODE
+
+    @property
+    def effective_sync_mode(self) -> str:
+        return normalize_sync_mode(self.sync_mode) or DEFAULT_SYNC_MODE
+
+    def with_mode(self, mode: str | None) -> Config:
+        """Copy of this config with ``mode`` replaced (None/invalid → unchanged copy)."""
+        m = normalize_mode(mode)
+        return replace(self, mode=m or self.effective_mode, extra=dict(self.extra))
+
     def window_count(self, duration: float) -> int:
-        """Number of transcription windows for a file of ``duration`` seconds."""
+        """Number of sampled transcription windows for a file of ``duration`` seconds.
+
+        Exhaustive mode does not sample (see ``sync.plan_windows``); this returns the
+        number of consecutive 30 s windows covering the file, before silent ones are
+        skipped.
+        """
+        mode = self.effective_mode
+        if mode == "exhaustive":
+            return max(1, math.ceil(max(0.0, duration) / 30.0))
         w = str(self.windows).strip().lower()
         if w and w != "auto":
             try:
                 return max(1, int(float(w)))
             except (ValueError, OverflowError):
                 pass
+        if mode == "thorough":
+            return max(20, round(duration / 96.0))
         return max(8, round(duration / 240.0))
+
+    def verify_budget(self, duration: float) -> int:
+        """Window budget of the bisection verification for a ``duration`` s file.
+
+        Exhaustive mode defaults to 0: every window with speech is already transcribed,
+        so a probe could only add a silent one.
+        """
+        v = str(self.verify_windows).strip().lower()
+        if v and v != "auto":
+            try:
+                return max(0, int(float(v)))
+            except (ValueError, OverflowError):
+                pass
+        mode = self.effective_mode
+        base = 2 + int(duration // 1800)
+        if mode == "thorough":
+            return 3 * base
+        if mode == "exhaustive":
+            return 0
+        return base
 
     # -- persistence -----------------------------------------------------------------
     @classmethod
@@ -109,9 +197,21 @@ class Config:
                     self.min_confidence = v
             elif key == "threads":
                 self.threads = max(0, int(float(value)))
+            elif key == "mode":
+                m = normalize_mode(value)
+                if m:
+                    self.mode = m
+            elif key == "sync_mode":
+                sm = normalize_sync_mode(value)
+                if sm:
+                    self.sync_mode = sm
             elif key == "device":
                 if value.lower() in _VALID_DEVICES:
                     self.device = value.lower()
+            elif key == "verify_windows":
+                v = value.lower()
+                if v == "auto" or int(float(v)) >= 0:
+                    self.verify_windows = v if v == "auto" else str(int(float(v)))
             elif key == "windows":
                 w = value.lower()
                 if w == "auto" or int(float(w)) > 0:

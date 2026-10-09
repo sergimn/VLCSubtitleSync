@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import plistlib
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -196,6 +198,98 @@ def test_packaged_scripts_present():
 def test_packaged_icons_present():
     assert S.asset_path("icon.ico") is not None
     assert S.asset_path("icon-256.png") is not None
+
+
+VLC_CATALOG = """<?xml version="1.0" encoding="UTF-8"?>
+<videolan xmlns="http://videolan.org/ns/vlc/addons/1.0">
+\t<addons>
+\t\t<addon source="" type="extension" id="0123456789abcdef0123456789abcdef"
+\t\t\tdownloads="3" score="5" version="1.2">
+\t\t\t<name>Other</name>
+\t\t\t<description><![CDATA[Someone else's <b>add-on</b>]]></description>
+\t\t\t<authorship>
+\t\t\t</authorship>
+\t\t\t<resource type="extension">other.lua</resource>
+\t\t</addon>
+\t\t<addon source="" type="extension" id="{our_id}" downloads="0" score="0" version="0.0.1">
+\t\t\t<name>SubSync</name>
+\t\t\t<resource type="extension">subsync_ext.lua</resource>
+\t\t</addon>
+\t</addons>
+</videolan>
+"""
+
+
+def _vlc_style_id(uid):
+    # how VLC writes an id back (vlc_addons.h addons_uuid_to_psz)
+    h = uid.replace("-", "")
+    return f"{h[:8]}-{h[8:14]}-{h[14:18]}-{h[18:22]}-{h[22:]}"
+
+
+def _catalog_addons(path):
+    ns = {"v": S.ADDONS_NS}
+    root = ET.parse(path).getroot()
+    return {a.findtext("v:name", namespaces=ns): a for a in root.iterfind("v:addons/v:addon", ns)}
+
+
+def test_setup_lists_addon_in_vlc_catalog(tmp_path):
+    fs = FakeSystem(tmp_path, "linux", systemd=False)
+    assert S.run_setup(fs.ctx(), model=False, autostart=False) == 0
+    path = fs.home / ".local/share/vlc/catalog.xml"
+    text = path.read_text(encoding="utf-8")
+    # VLC compares element names with their prefix: the namespace must be the default one
+    assert '<videolan xmlns="http://videolan.org/ns/vlc/addons/1.0">' in text
+    ns = {"v": S.ADDONS_NS}
+    [addon] = _catalog_addons(path).values()
+    assert addon.get("id") == S.ADDON_ID and addon.get("type") == "extension"
+    assert addon.get("version") == S.__version__
+    assert addon.findtext("v:summary", namespaces=ns) == S.ADDON_SUMMARY
+    assert addon.findtext("v:description", namespaces=ns) == S.ADDON_DESCRIPTION
+    image = base64.b64decode(addon.findtext("v:image", namespaces=ns))
+    assert image.startswith(b"\x89PNG")
+    resources = [(r.get("type"), r.text) for r in addon.iterfind("v:resource", ns)]
+    assert resources == [("interface", "subsync.lua"), ("extension", "subsync_ext.lua")]
+
+    lines = []
+    ctx = fs.ctx()
+    ctx.out = lines.append
+    S.run_setup(ctx, model=False, autostart=False)
+    assert path.read_text(encoding="utf-8") == text
+    assert any("lists SubSync" in line for line in lines)
+
+    assert S.run_uninstall(fs.ctx()) == 0
+    assert not path.exists()
+
+
+def test_vlc_catalog_keeps_other_addons(tmp_path):
+    fs = FakeSystem(tmp_path, "linux", systemd=False)
+    path = fs.home / ".local/share/vlc/catalog.xml"
+    path.parent.mkdir(parents=True)
+    path.write_text(VLC_CATALOG.format(our_id=_vlc_style_id(S.ADDON_ID)), encoding="utf-8")
+    assert S.run_setup(fs.ctx(), model=False, autostart=False) == 0
+    addons = _catalog_addons(path)
+    assert list(addons) == ["Other", "SubSync"]  # the stale entry was replaced
+    other = addons["Other"]
+    assert other.get("downloads") == "3"
+    assert other.findtext(f"{{{S.ADDONS_NS}}}description") == "Someone else's <b>add-on</b>"
+    assert addons["SubSync"].get("version") == S.__version__
+
+    assert S.run_uninstall(fs.ctx()) == 0
+    assert list(_catalog_addons(path)) == ["Other"]
+
+
+def test_unreadable_vlc_catalog_is_left_alone(tmp_path):
+    fs = FakeSystem(tmp_path, "linux", systemd=False)
+    path = fs.home / ".local/share/vlc/catalog.xml"
+    path.parent.mkdir(parents=True)
+    path.write_text("<videolan><addons>", encoding="utf-8")
+    ctx = fs.ctx()
+    assert S.run_setup(ctx, model=False, autostart=False) == 0
+    assert path.read_text(encoding="utf-8") == "<videolan><addons>"
+    assert any("catalog" in w for w in ctx.warnings)
+    assert scripts_installed(fs.home / ".local/share/vlc")
+    assert S.run_uninstall(fs.ctx()) == 0
+    assert path.read_text(encoding="utf-8") == "<videolan><addons>"
 
 
 def test_linux_detection(tmp_path):

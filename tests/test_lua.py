@@ -1196,6 +1196,17 @@ def test_loads_without_rawget(runtime, script):
         assert lua.eval("type(subsync)") == "table"
 
 
+def test_ext_descriptor_in_vlc_scan_state(runtime):
+    # VLC reads descriptor() (with the icon) in a Lua state with no libraries at all.
+    lua = importlib.import_module(f"lupa.{runtime}").LuaRuntime(encoding=None)
+    lua.execute(b"for k in pairs(_G) do if k ~= '_G' then _G[k] = nil end end")
+    lua.execute(EXT.read_bytes())
+    d = lua.eval(b"descriptor()")
+    assert d[b"shortdesc"] == b"SubSync"  # also the View menu label
+    icon = d[b"icon"]
+    assert icon.startswith(b"\x89PNG\r\n\x1a\n") and icon.endswith(b"IEND\xaeB`\x82")
+
+
 def write_intf_state(
     hh: Harness, age=0, state="idle", last_result="", modes="fast,thorough,exhaustive"
 ):

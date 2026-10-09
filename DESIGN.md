@@ -497,7 +497,9 @@ The daemon loads the config for every job.
 * Windows: double-click `install.cmd` (or `irm …/install.ps1 | iex`).
 Steps: install `uv` if missing → `uv tool install --python 3.12 vlc-subsync@<archive url>`
 → `vlc-subsync setup` which: copies Lua scripts into every detected VLC (native,
-snap, flatpak), edits each `vlcrc` (`extraintf` append `luaintf` preserving existing
+snap, flatpak), lists them as one "SubSync" add-on (icon, summary, description) in
+that VLC's `<userdatadir>/catalog.xml` (without an entry there, VLC's Addons Manager
+shows each script by file name with a broken icon), edits each `vlcrc` (`extraintf` append `luaintf` preserving existing
 entries, `lua-intf=subsync`) with a backup, creates queue dirs, registers the
 start-with-VLC mechanism and the `launcher` files (see "Lifecycle"; nothing is
 started now), removes the login autostart of earlier versions, pre-downloads the

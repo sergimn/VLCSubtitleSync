@@ -702,3 +702,33 @@ def test_service_start_gives_up_on_the_lock_once_vlc_is_gone(denv, queue, clock,
         assert not d._acquire_lock()
     finally:
         other.release()
+
+
+def test_helper_started_for_vlc_dir_watches_it_and_the_defaults(denv, clock, monkeypatch):
+    """`setup --vlc-dir X` starts the helper with `--queue-dir X`: it must watch X
+    (and still the default VLC dirs) and stay up while the VLC at X runs."""
+    from vlcsubsync import cli
+    from vlcsubsync import setup_vlc as S
+
+    default_q = denv.tmp / "default" / "subsync"
+    D.ensure_queue_layout(default_q)
+    monkeypatch.setenv("VLC_SUBSYNC_QUEUE_DIRS", str(default_q))
+    custom_q = denv.tmp / "portable" / "subsync"
+    D.ensure_queue_layout(custom_q)
+    ctx = S.Context(platform="linux", home=denv.tmp, env={}, which=lambda _n: None)
+    cmd = S.daemon_command(ctx, queue_dirs=[custom_q])
+    args = cli.build_parser().parse_args(cmd[cmd.index("serve") :])
+    d = D.Daemon(
+        args.queue_dir,
+        use_default_queues=not args.no_default_queues,
+        runner=GatedRunner(),
+        lock_path=denv.tmp / "state" / "daemon.lock",
+        clock=clock.monotonic,
+        wall_clock=clock.time,
+        idle_exit=True,
+    )
+    assert d.scan_queue_dirs() == [custom_q, default_q]
+    for _ in range(30):  # well past the startup grace: VLC at X keeps it alive
+        intf(custom_q, clock)
+        assert not d.check_idle_exit()
+        clock.advance(5)

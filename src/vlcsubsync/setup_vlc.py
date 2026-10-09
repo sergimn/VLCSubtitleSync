@@ -21,6 +21,7 @@ import dataclasses
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -629,8 +630,20 @@ def _bin_dir() -> Path:
     return Path(sys.executable).parent
 
 
-def daemon_command(ctx: Context, *, gui: bool = False) -> list[str]:
-    """Command line that starts the daemon (absolute paths)."""
+def daemon_command(
+    ctx: Context, *, gui: bool = False, queue_dirs: Sequence[Path | str] = ()
+) -> list[str]:
+    """Command line that starts the daemon (absolute paths).
+
+    ``queue_dirs`` are passed as ``--queue-dir`` (the daemon watches them as well as
+    the default VLC dirs): needed for ``setup --vlc-dir``, whose queue dir the
+    daemon would not find by itself.
+    """
+    extra = [a for q in queue_dirs for a in ("--queue-dir", str(q))]
+    return _daemon_base_command(ctx, gui=gui) + extra
+
+
+def _daemon_base_command(ctx: Context, *, gui: bool = False) -> list[str]:
     bindir = _bin_dir()
     if ctx.platform == "windows":
         if gui:
@@ -754,10 +767,12 @@ def launchd_plist(cmd: Sequence[str], log_dir: Path, queue_dirs: Sequence[Path])
 # --------------------------------------------------------------------------- launcher file
 
 
-def _windows_ascii_path(path: str) -> str:
+def _windows_ascii_path(path: str, *, spaces: bool = False) -> str:
     """8.3 short form of a non-ASCII path (VLC's Lua ``os.execute`` uses the ANSI code
-    page, so a non-ASCII path would be mangled)."""
-    if path.isascii() or os.name != "nt":
+    page, so a non-ASCII path would be mangled). ``spaces``: also shorten a path with
+    whitespace (for launcher ``args``, which are whitespace-separated)."""
+    needed = not path.isascii() or (spaces and any(c.isspace() for c in path))
+    if not needed or os.name != "nt":
         return path
     try:
         import ctypes
@@ -765,7 +780,8 @@ def _windows_ascii_path(path: str) -> str:
         buf = ctypes.create_unicode_buffer(32768)
         n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))  # type: ignore[attr-defined]
         if 0 < n < len(buf) and buf.value.isascii():
-            return buf.value
+            if not (spaces and any(c.isspace() for c in buf.value)):
+                return buf.value
     except (OSError, AttributeError):
         pass
     return path
@@ -780,6 +796,37 @@ def launcher_data(mode: str, cmd: Sequence[str], platform: str) -> dict[str, obj
     """
     exe = _windows_ascii_path(cmd[0]) if platform == "windows" else cmd[0]
     return {"version": 1, "mode": mode, "exe": exe, "args": " ".join(cmd[1:])}
+
+
+def _spawn_queue_dir_args(ctx: Context, queue_dirs: Sequence[Path]) -> dict[Path, Path | None]:
+    """``{queue dir: argument}`` for a launcher's ``args`` (``None``: cannot be passed).
+
+    The Lua side splits ``args`` on whitespace (see :func:`launcher_data`), so a path
+    with whitespace cannot be passed: it is left out with a warning (the systemd unit
+    and the LaunchAgent pass arguments one by one and have no such limit). On Windows
+    a non-ASCII or spaced path is first replaced by its 8.3 short form when there is
+    one.
+    """
+    usable: dict[Path, Path | None] = {}
+    for q in queue_dirs:
+        arg = str(q)
+        if ctx.platform == "windows":
+            arg = _windows_ascii_path(arg, spaces=True)
+            if "%" in arg:
+                ctx.warn(
+                    f"the queue dir {q} contains '%'; cmd.exe may expand it when VLC "
+                    "starts the helper. Use a VLC dir without '%'"
+                )
+        if any(c.isspace() for c in arg):
+            ctx.warn(
+                f"VLC cannot pass a path with spaces to the helper it starts, so {q} "
+                "is not watched by it: use a --vlc-dir without spaces, or run "
+                f'`vlc-subsync serve --persistent --queue-dir "{q}"` yourself'
+            )
+            usable[q] = None
+            continue
+        usable[q] = Path(arg)
+    return usable
 
 
 def write_launchers(
@@ -948,19 +995,68 @@ def remove_legacy_autostart(ctx: Context) -> None:
             ctx.ok(rf"removed HKCU\...\Run\{WINDOWS_RUN_VALUE}")
 
 
-def install_autostart(ctx: Context, installs: Sequence[VlcInstall] = ()) -> str:
+def watched_installs(
+    ctx: Context, installs: Sequence[VlcInstall], *, keep_registered: bool = True
+) -> list[VlcInstall]:
+    """The usable installs the helper must start for.
+
+    The start-with-VLC units are global (one per user), so a ``setup --vlc-dir``
+    adds to them instead of replacing them: with custom installs the detected
+    (usable) VLC installs are kept too, and ``keep_registered`` keeps the
+    ``--vlc-dir`` dirs of an earlier setup whose queue dir still exists (until
+    ``uninstall --vlc-dir`` removes them).
+    """
+    out = [i for i in installs if i.usable]
+    detected = [i for i in detect_vlc_installs(ctx, include_default=False) if i.usable]
+
+    def add(inst: VlcInstall) -> None:
+        if inst.queue_dir not in {i.queue_dir for i in out}:
+            out.append(inst)
+
+    if keep_registered:
+        known = [i.queue_dir for i in out + detected]
+        for q in installed_queue_dir_args(ctx, known):
+            if q.is_dir():
+                add(custom_install(q.parent))
+    if any(i.kind == "custom" for i in out):
+        for det in detected:
+            add(det)
+    return out
+
+
+def install_autostart(
+    ctx: Context, installs: Sequence[VlcInstall] = (), *, keep_registered: bool = True
+) -> str:
     """Make the helper start with VLC, and only then. Returns the mechanism used.
 
     Nothing is started now: the helper comes up when VLC starts and exits after it.
+    For ``--vlc-dir`` (``kind="custom"``) installs the detected VLC installs keep
+    being watched too (the units and LaunchAgent are global, one per user), and the
+    helper is started with ``--queue-dir`` for each custom queue dir.
     """
-    queue_dirs = [i.queue_dir for i in installs if i.usable]
+    watched = watched_installs(ctx, installs, keep_registered=keep_registered)
+    queue_dirs = [i.queue_dir for i in watched]
+    custom_dirs = [i.queue_dir for i in watched if i.kind == "custom"]
     remove_legacy_autostart(ctx)
     if not queue_dirs:
         ctx.warn("no usable VLC installation; nothing to start the helper for")
         return "none"
+    given = {i.queue_dir for i in installs if i.usable}
+    if any(i.queue_dir not in given for i in watched):
+        ctx.info(
+            "the helper also keeps starting for: "
+            + ", ".join(str(i.data_dir) for i in watched if i.queue_dir not in given)
+        )
+
+    def spawn_setup(gui: bool = False) -> tuple[list[str], list[Path]]:
+        """(command, launcher dirs) for mode=spawn. A dir that cannot be passed in
+        ``args`` gets no launcher: its VLC would start a helper that ignores it."""
+        args = _spawn_queue_dir_args(ctx, custom_dirs)
+        cmd = daemon_command(ctx, gui=gui, queue_dirs=[a for a in args.values() if a])
+        return cmd, [q for q in queue_dirs if args.get(q, q) is not None]
 
     if ctx.platform == "linux":
-        cmd = daemon_command(ctx)
+        cmd = daemon_command(ctx, queue_dirs=custom_dirs)
         if _systemd_user_available(ctx):
             service, path_unit = systemd_unit_path(ctx), systemd_path_unit_path(ctx)
             path_text = systemd_path_text(queue_dirs)
@@ -984,7 +1080,8 @@ def install_autostart(ctx: Context, installs: Sequence[VlcInstall] = ()) -> str:
                     ctx.ok(f"{PATH_UNIT_NAME} active: the helper starts when VLC starts")
             write_launchers(ctx, queue_dirs, "service", cmd)
             return "systemd-path"
-        write_launchers(ctx, queue_dirs, "spawn", cmd)
+        cmd, spawn_dirs = spawn_setup()
+        write_launchers(ctx, spawn_dirs, "spawn", cmd)
         for inst in installs:
             if inst.usable and inst.kind in ("snap", "flatpak"):
                 ctx.warn(
@@ -996,7 +1093,7 @@ def install_autostart(ctx: Context, installs: Sequence[VlcInstall] = ()) -> str:
         return "vlc-spawn"
 
     if ctx.platform == "macos":
-        cmd = daemon_command(ctx)
+        cmd = daemon_command(ctx, queue_dirs=custom_dirs)
         plist = launch_agent_path(ctx)
         log_dir = D.user_log_dir()
         if ctx.do(f"write LaunchAgent {plist} (WatchPaths + QueueDirectories, on demand)"):
@@ -1015,13 +1112,13 @@ def install_autostart(ctx: Context, installs: Sequence[VlcInstall] = ()) -> str:
         return "launchd"
 
     # windows: VLC's Lua interface launches the GUI exe itself (see DESIGN.md)
-    cmd = daemon_command(ctx, gui=True)
+    cmd, spawn_dirs = spawn_setup(gui=True)
     if "%" in cmd[0]:
         ctx.warn(
             f"the helper's path contains '%' ({cmd[0]}); cmd.exe may expand it and VLC "
             "then fails to start the helper. Reinstall SubSync to a path without '%'"
         )
-    write_launchers(ctx, queue_dirs, "spawn", cmd)
+    write_launchers(ctx, spawn_dirs, "spawn", cmd)
     ctx.ok(f"VLC starts the helper itself when it opens ({Path(cmd[0]).name})")
     return "vlc-spawn"
 
@@ -1050,6 +1147,32 @@ def remove_autostart(ctx: Context) -> None:
     # windows: only the legacy entries; the launcher files go with the queue dirs
 
 
+def _queue_dir_args(args: Sequence[str]) -> list[Path]:
+    return [Path(args[i + 1]) for i, a in enumerate(args[:-1]) if a == "--queue-dir"]
+
+
+def installed_queue_dir_args(ctx: Context, queue_dirs: Sequence[Path] = ()) -> list[Path]:
+    """The ``--queue-dir`` dirs (``setup --vlc-dir``) the installed helper command
+    passes: from the systemd unit, the LaunchAgent, or the launchers in
+    ``queue_dirs``."""
+    found: list[Path] = []
+    if ctx.platform == "linux" and systemd_unit_path(ctx).exists():
+        with contextlib.suppress(OSError, ValueError):
+            for line in systemd_unit_path(ctx).read_text(encoding="utf-8").splitlines():
+                if line.startswith("ExecStart="):
+                    found += _queue_dir_args(
+                        shlex.split(line[len("ExecStart=") :].replace("%%", "%"))
+                    )
+    elif ctx.platform == "macos" and launch_agent_path(ctx).exists():
+        with contextlib.suppress(OSError, plistlib.InvalidFileException, ValueError):
+            data = plistlib.loads(launch_agent_path(ctx).read_bytes())
+            found += _queue_dir_args([str(a) for a in data.get("ProgramArguments", [])])
+    for q in queue_dirs:
+        data = P.read_kv(Path(q) / LAUNCHER_FILE) or {}
+        found += _queue_dir_args(data.get("args", "").split())
+    return list(dict.fromkeys(found))
+
+
 def lifecycle_status(
     ctx: Context, queue_dirs: Sequence[Path] = ()
 ) -> list[tuple[str, str, bool | None]]:
@@ -1058,6 +1181,14 @@ def lifecycle_status(
     for p in legacy_autostart_artifacts(ctx):
         rows.append(
             ("login autostart (earlier version)", f"{p}: re-run `vlc-subsync setup`", False)
+        )
+    for q in installed_queue_dir_args(ctx, queue_dirs):
+        rows.append(
+            (
+                "--vlc-dir queue dir",
+                f"{q}" + ("" if q.is_dir() else " (missing: re-run setup --vlc-dir)"),
+                q.is_dir(),
+            )
         )
     if ctx.platform == "windows":
         launchers = [(q, P.read_kv(Path(q) / LAUNCHER_FILE)) for q in queue_dirs]
@@ -1282,14 +1413,56 @@ def run_setup(
     return 0
 
 
+def _same_dir(q: Path, others: Sequence[Path] | set[Path]) -> bool:
+    for o in others:
+        if q == o:
+            return True
+        with contextlib.suppress(OSError):
+            if os.path.samefile(q, o):
+                return True
+    return False
+
+
+def _installs_kept(ctx: Context, targets: Sequence[VlcInstall]) -> list[VlcInstall]:
+    """Configured installs not being removed by ``uninstall --vlc-dir``, if the
+    start-with-VLC mechanism is installed for them (else nothing to keep)."""
+    removed = {i.queue_dir for i in targets}
+    detected = [i for i in detect_vlc_installs(ctx, include_default=False) if i.usable]
+    custom = [
+        custom_install(q.parent)
+        for q in installed_queue_dir_args(ctx, [i.queue_dir for i in [*detected, *targets]])
+    ]
+    keep: list[VlcInstall] = []
+    for inst in custom + detected:
+        q = inst.queue_dir
+        if not q.is_dir() or q in {i.queue_dir for i in keep} or _same_dir(q, removed):
+            continue
+        keep.append(inst)
+    installed = (
+        systemd_path_unit_path(ctx).exists()
+        or launch_agent_path(ctx).exists()
+        or any((i.queue_dir / LAUNCHER_FILE).exists() for i in keep)
+    )
+    return keep if installed else []
+
+
 def run_uninstall(
     ctx: Context, *, purge: bool = False, vlc_dirs: Sequence[str] = (), vlcrc: str | None = None
 ) -> int:
     ctx.out(f"{DISPLAY_NAME} {__version__} uninstall" + (" (dry run)" if ctx.dry_run else ""))
+    targets = _target_installs(ctx, vlc_dirs, vlcrc)
     ctx.step("Start with VLC")
-    remove_autostart(ctx)
+    keep = _installs_kept(ctx, targets) if vlc_dirs else []
+    if keep:
+        # only some dirs are removed: the helper keeps starting for the others
+        ctx.info(
+            "other VLC installs keep using the helper: " + ", ".join(str(i.data_dir) for i in keep)
+        )
+        install_autostart(ctx, keep, keep_registered=False)
+    else:
+        remove_autostart(ctx)
     stop_daemon(ctx)
-    for inst in _target_installs(ctx, vlc_dirs, vlcrc):
+    for inst in targets:
         if not inst.usable:
             continue
         ctx.step(f"{inst.label()}: {inst.data_dir}")

@@ -319,6 +319,38 @@ def test_cache_hit_and_force(env):
         assert len(runner.calls) == 4
 
 
+def test_cache_off_neither_reuses_nor_stores(env):
+    from vlcsubsync.config import Config
+
+    media = make_media(env)
+    cfg = {"c": Config()}
+    runner = FakeRunner()
+    cache = env.tmp / "cache" / "results"
+    with Harness(env, runner, config_loader=lambda: cfg["c"]) as h:
+        h.submit("n_1", media, sub_index=0)
+        h.wait_state("n_1", "done")
+        wait_for(lambda: len(list(cache.glob("*.meta"))) == 1)
+        cfg["c"] = Config(cache=False)  # the user edited config.ini
+        h.submit("n_2", media, sub_index=0)
+        h.wait_state("n_2", "done")
+        assert len(runner.calls) == 2  # the stored result was not reused...
+        h.submit("n_3", media, sub_index=0, mode="exhaustive")
+        h.wait_state("n_3", "done")
+        assert len(runner.calls) == 3
+        assert len(list(cache.glob("*.meta"))) == 1  # ...and nothing new was stored
+
+
+def test_clear_results_cache(env):
+    d = env.tmp / "cache" / "results"
+    assert D.clear_results_cache(d) == 0  # no cache yet
+    d.mkdir(parents=True)
+    for k in ("a", "b"):
+        (d / f"{k}.meta").write_text("file=x.srt\n")
+        (d / f"{k}.srt").write_text("1\n")
+    assert D.clear_results_cache(d) == 2
+    assert not d.exists()
+
+
 def test_cache_key_includes_mode(env):
     from vlcsubsync.config import Config
 

@@ -91,6 +91,18 @@ def results_cache_dir() -> Path:
     return user_cache_dir() / "results"
 
 
+def clear_results_cache(cache_dir: Path | None = None) -> int:
+    """Delete every stored result (``cache_dir`` defaults to :func:`results_cache_dir`).
+
+    Returns the number of results removed. Safe while the helper runs: a job that
+    misses the cache simply syncs again.
+    """
+    d = Path(cache_dir) if cache_dir else results_cache_dir()
+    n = sum(1 for _ in d.glob("*.meta")) if d.is_dir() else 0
+    shutil.rmtree(d, ignore_errors=True)
+    return n
+
+
 def platform_key(platform: str | None = None) -> str:
     plat = (platform or sys.platform).lower()
     if plat.startswith(("win", "cygwin")):
@@ -991,7 +1003,8 @@ class Daemon:
             out_dir = job.queue_dir / P.OUT_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            cached = None if r.force else self._cached_result(job, source, config)
+            use_cache = bool(getattr(config, "cache", True))
+            cached = self._cached_result(job, source, config) if use_cache and not r.force else None
             if cached is not None:
                 cached_file, meta = cached
                 dest = out_dir / f"{r.id}{cached_file.suffix}"
@@ -1054,11 +1067,14 @@ class Daemon:
                 sync_mode=_sync_mode(config),
             )
             writer.write(done, force=True)
-            self._cache_store(key, output, done)
-            if r.force:
-                # the user asked for a fresh result: it must not be shadowed by an
-                # older result of another (more thorough) mode on the next open
-                self._cache_drop_other_modes(job, source, config, mode)
+            if not use_cache:
+                log.debug("job %s: result cache disabled (cache=off), not stored", r.id)
+            else:
+                self._cache_store(key, output, done)
+                if r.force:
+                    # the user asked for a fresh result: it must not be shadowed by an
+                    # older result of another (more thorough) mode on the next open
+                    self._cache_drop_other_modes(job, source, config, mode)
             log.info(
                 "job %s done in %.1fs (mode %s): %s (applied=%s)",
                 r.id,

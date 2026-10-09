@@ -145,6 +145,7 @@ vlc-subsync setup             # (re)install the VLC integration
 vlc-subsync download-models --all
 vlc-subsync serve             # run the helper in the foreground (for debugging);
                               # it exits ~15 s after VLC closes, add --persistent to keep it
+vlc-subsync clear-cache       # delete the stored sync results
 vlc-subsync uninstall [--purge]
 ```
 
@@ -177,10 +178,14 @@ verify_windows=auto     # extra samples the section check may transcribe (0 = no
 min_confidence=0.5      # below this the original timing is kept (0..1)
 threads=0               # CPU threads, 0 = automatic (half the cores, at most 8)
 sync_mode=track         # track | delay (EXPERIMENTAL, see below)
+cache=on                # off = always sync again, never reuse or store results
 ```
 
 `vlc-subsync doctor` prints the location it uses. The helper reads the file again for
 every sync, so a change applies to the next one.
+
+Results are cached for 7 days. To debug, set `cache=off` so every sync runs again
+and nothing is stored, or run `vlc-subsync clear-cache` to delete what is stored.
 
 ### Sync modes
 

@@ -85,6 +85,9 @@ class Config:
     verify_windows: str = "auto"
     min_confidence: float = 0.5
     threads: int = 0  # 0 = auto: half the CPU cores, 1..8 (transcribe.default_threads)
+    # Result cache: off = never reuse or store results (every sync runs the engine;
+    # handy for debugging). `vlc-subsync clear-cache` deletes what is stored.
+    cache: bool = True
     extra: dict[str, str] = field(default_factory=dict)  # unknown keys, preserved on save
 
     # -- derived helpers -------------------------------------------------------------
@@ -181,7 +184,10 @@ class Config:
         for f in fields(self):
             if f.name == "extra":
                 continue
-            lines.append(f"{f.name}={getattr(self, f.name)}")
+            value = getattr(self, f.name)
+            if isinstance(value, bool):
+                value = "on" if value else "off"
+            lines.append(f"{f.name}={value}")
         for k, v in sorted(self.extra.items()):
             lines.append(f"{k}={v}")
         tmp = p.with_name(p.name + ".tmp")
@@ -195,6 +201,10 @@ class Config:
                 v = float(value)
                 if 0.0 <= v <= 1.0:
                     self.min_confidence = v
+            elif key == "cache":
+                b = _parse_bool(value)
+                if b is not None:
+                    self.cache = b
             elif key == "threads":
                 self.threads = max(0, int(float(value)))
             elif key == "mode":
@@ -220,6 +230,15 @@ class Config:
                 setattr(self, key, value)
         except (ValueError, OverflowError):
             pass
+
+
+def _parse_bool(value: str) -> bool | None:
+    v = value.strip().lower()
+    if v in ("1", "on", "true", "yes"):
+        return True
+    if v in ("0", "off", "false", "no"):
+        return False
+    return None
 
 
 def _strip_inline_comment(value: str) -> str:

@@ -517,6 +517,100 @@ def test_sandboxed_vlc_does_not_spawn(runtime, tmp_path):
     assert "SubSync helper not running" in hh.osd()
 
 
+# ------------------------------------------------------------------ launcher-file spawning
+
+
+def launcher_harness(runtime, tmp_path, *, windows, mode="spawn", exe=None, args=""):
+    """Harness whose queue dir holds a launcher file (as `vlc-subsync setup` writes)."""
+    hh = Harness(runtime, tmp_path, INTF, windows=windows)
+    sep = "\\" if windows else "/"
+    q = str(hh.userdata) + sep + "subsync"  # what the intf computes (M.queue_dir)
+    os.makedirs(q, exist_ok=True)
+    if exe is None:
+        exe = tmp_path / "Python Scripts" / "vlc-subsync-daemon.exe"
+        exe.parent.mkdir()
+        exe.write_text("")
+    write_kv(Path(q + sep + "launcher"), {"version": 1, "mode": mode, "exe": exe, "args": args})
+    calls = []
+    hh.S.execute = lambda cmd: calls.append(cmd) or 0
+    hh.S.getenv = lambda name: None
+    return hh, calls, q + sep, str(exe)
+
+
+def test_windows_launcher_spawns_gui_exe_when_no_heartbeat(runtime, tmp_path):
+    hh, calls, qp, exe = launcher_harness(runtime, tmp_path, windows=True)
+    hh.init()
+    # started at VLC startup, from the launcher's absolute path, without waiting
+    assert calls == [f'start "" /B "{exe}"']
+    assert any("starting helper" in line for line in hh.logs())
+    hh.tick(20)  # still no heartbeat, but it was started a moment ago
+    hh.set_input()
+    hh.settle()
+    assert len(calls) == 1
+    assert "SubSync helper not running – starting it…" in hh.osd()
+    # a minute without a heartbeat: start it again, at most SPAWN_MAX times per session
+    for _ in range(5):
+        hh.mock.now = hh.mock.now + 61_000_000
+        hh.tick(5)
+    assert calls == [f'start "" /B "{exe}"'] * 3
+
+
+def test_windows_launcher_args_are_quoted(runtime, tmp_path):
+    hh, calls, qp, exe = launcher_harness(
+        runtime, tmp_path, windows=True, args="-m vlcsubsync.cli serve --no-console"
+    )
+    hh.init()
+    assert calls == [f'start "" /B "{exe}" "-m" "vlcsubsync.cli" "serve" "--no-console"']
+
+
+def test_launcher_spawn_is_heartbeat_triggered(runtime, tmp_path):
+    hh, calls, qp, exe = launcher_harness(runtime, tmp_path, windows=False, args="serve")
+    write_kv(Path(qp + "heartbeat"), {"time": int(time.time()), "pid": 1, "version": "0.1.0"})
+    hh.init()
+    hh.set_input()
+    hh.settle()
+    hh.tick(10)
+    assert calls == []  # the helper is alive
+    # the helper went away (crashed / exited): its heartbeat goes stale
+    write_kv(Path(qp + "heartbeat"), {"time": int(time.time()) - 60, "pid": 1, "version": "0"})
+    hh.tick(5)
+    assert calls == [f"'{exe}' 'serve' >/dev/null 2>&1 &"]
+    write_kv(Path(qp + "heartbeat"), {"time": int(time.time()), "pid": 2, "version": "0.1.0"})
+    hh.mock.now = hh.mock.now + 120_000_000
+    hh.tick(5)
+    assert len(calls) == 1  # alive again: nothing more
+
+
+def test_launcher_service_mode_never_spawns(runtime, tmp_path):
+    hh, calls, qp, exe = launcher_harness(runtime, tmp_path, windows=False, mode="service")
+    hh.init()
+    hh.set_input()
+    hh.settle()
+    hh.mock.now = hh.mock.now + 120_000_000
+    hh.tick(10)
+    assert calls == []  # systemd / launchd start the helper
+    assert len(hh.requests()) == 1  # the request waits for it
+    assert "SubSync helper not running" in hh.osd()
+
+
+def test_launcher_missing_exe_logs_and_does_not_spawn(runtime, tmp_path):
+    hh, calls, qp, exe = launcher_harness(
+        runtime, tmp_path, windows=True, exe=tmp_path / "gone" / "vlc-subsync-daemon.exe"
+    )
+    hh.init()
+    hh.tick(10)
+    assert calls == []
+    assert sum("helper not found" in line for line in hh.logs()) == 1
+
+
+def test_launcher_spawn_skipped_in_sandboxed_vlc(runtime, tmp_path):
+    hh, calls, qp, exe = launcher_harness(runtime, tmp_path, windows=False, args="serve")
+    hh.S.getenv = lambda name: "/snap/vlc/x1" if name == "SNAP" else None
+    hh.init()
+    hh.tick(10)
+    assert calls == []
+
+
 def test_input_change_and_stop_reset_state(h):
     h.set_input()
     h.settle()

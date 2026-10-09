@@ -5,8 +5,9 @@
 * edit ``vlcrc`` (``extraintf`` += ``luaintf``, ``lua-intf=subsync``) with a backup and a
   small state file so ``uninstall`` can revert exactly what we changed
 * create the queue dirs
-* register autostart (systemd user unit / XDG autostart / launchd agent / Windows
-  Startup shortcut or HKCU Run key) and start the daemon
+* make the helper start *with VLC*, and only then (systemd user path unit / launchd
+  WatchPaths agent / a ``launcher`` file the Lua interface uses to spawn it), removing
+  the login autostart of earlier versions; the helper exits by itself after VLC
 * pre-download the default Whisper model
 
 Everything takes a :class:`Context` so tests can redirect home, platform, env,
@@ -36,6 +37,8 @@ from . import daemon as D
 from . import protocol as P
 
 SERVICE_NAME = "vlc-subsync.service"
+PATH_UNIT_NAME = "vlc-subsync.path"
+LAUNCHER_FILE = "launcher"
 LAUNCHD_LABEL = "io.github.sergimn.vlc-subsync"
 DISPLAY_NAME = "SubSync"
 WINDOWS_SHORTCUT = "SubSync.lnk"
@@ -657,65 +660,144 @@ def daemon_command(ctx: Context, *, gui: bool = False) -> list[str]:
 
 
 def _systemd_quote(arg: str) -> str:
+    arg = arg.replace("%", "%%")  # systemd specifier escaping
     if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", arg):
         return arg
     return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _desktop_quote(arg: str) -> str:
-    if re.match(r"^[A-Za-z0-9_@%+=:,./-]+$", arg):
-        return arg
-    escaped = arg.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$")
-    return f'"{escaped}"'
+def _systemd_path_value(path: Path | str) -> str:
+    return str(path).replace("%", "%%")
 
 
-def systemd_unit_text(cmd: Sequence[str]) -> str:
+def systemd_service_text(
+    cmd: Sequence[str],
+    *,
+    environment: dict[str, str] | None = None,
+    description: str | None = None,
+    path_unit: str = PATH_UNIT_NAME,
+) -> str:
+    """The on-demand service: started by the .path unit, exits by itself after VLC.
+
+    No ``[Install]`` section (it is never enabled on its own, so nothing starts it at
+    login) and no ``Restart=``: the path unit starts it again on VLC's next write.
+    """
+    env_lines = "".join(
+        f"Environment={_systemd_quote(f'{k}={v}')}\n" for k, v in (environment or {}).items()
+    )
     return (
         "[Unit]\n"
-        f"Description={DISPLAY_NAME} daemon (automatic subtitle synchronisation for VLC)\n"
+        f"Description={description or DISPLAY_NAME + ' helper (subtitle sync for VLC)'}\n"
         "Documentation=https://github.com/sergimn/VLCSubtitleSync\n"
+        f"# Started on demand by {path_unit} when VLC starts or queues a job;\n"
+        "# exits by itself ~15 s after VLC closes. Nothing runs while VLC is closed.\n"
+        "# A crash loop (VLC rewrites intf_state every 5 s) stops after 20 starts in\n"
+        "# 10 min; `vlc-subsync setup` or `systemctl --user reset-failed` clears it.\n"
+        "StartLimitIntervalSec=600\n"
+        "StartLimitBurst=20\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        f"ExecStart={' '.join(_systemd_quote(a) for a in cmd)}\n"
-        "Restart=on-failure\n"
-        "RestartSec=5\n"
-        "Nice=10\n"
+        f"ExecStart={' '.join(_systemd_quote(a) for a in cmd)}\n" + env_lines + "Nice=10\n"
+        "IOSchedulingClass=idle\n"
+        "CPUSchedulingPolicy=batch\n"
+    )
+
+
+def systemd_path_text(
+    queue_dirs: Sequence[Path],
+    *,
+    service: str = SERVICE_NAME,
+    description: str | None = None,
+) -> str:
+    """Path unit watching every queue dir: VLC's ``intf_state`` and ``requests/``.
+
+    systemd resolves symlinks in the watched paths (inotify follows them) and also
+    watches every parent directory, so when the snap's ``~/snap/vlc/current`` symlink
+    is switched to a new revision the event on ``~/snap/vlc`` makes it re-resolve
+    the path (see DESIGN.md "Lifecycle").
+    """
+    watches = []
+    for q in queue_dirs:
+        watches.append(f"PathModified={_systemd_path_value(Path(q) / P.INTF_STATE_FILE)}\n")
+        watches.append(f"DirectoryNotEmpty={_systemd_path_value(Path(q) / P.REQUESTS_DIR)}\n")
+    return (
+        "[Unit]\n"
+        f"Description={description or 'Start the ' + DISPLAY_NAME + ' helper when VLC starts'}\n"
+        "Documentation=https://github.com/sergimn/VLCSubtitleSync\n"
+        "\n"
+        "[Path]\n" + "".join(watches) + f"Unit={service}\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n"
     )
 
 
-def desktop_entry_text(cmd: Sequence[str], icon: Path | None = None) -> str:
-    return (
-        "[Desktop Entry]\n"
-        "Type=Application\n"
-        f"Name={DISPLAY_NAME}\n"
-        + (f"Icon={icon}\n" if icon else "")
-        + "Comment=Automatic subtitle synchronisation for VLC\n"
-        f"Exec={' '.join(_desktop_quote(a) for a in cmd)}\n"
-        "Terminal=false\n"
-        "NoDisplay=true\n"
-        "X-GNOME-Autostart-enabled=true\n"
-    )
-
-
-def launchd_plist(cmd: Sequence[str], log_dir: Path) -> bytes:
+def launchd_plist(cmd: Sequence[str], log_dir: Path, queue_dirs: Sequence[Path]) -> bytes:
+    """LaunchAgent started on demand by launchd: no RunAtLoad, no KeepAlive."""
     return plistlib.dumps(
         {
             "Label": LAUNCHD_LABEL,
             "ProgramArguments": list(cmd),
-            "RunAtLoad": True,
-            "KeepAlive": {"SuccessfulExit": False},
+            # VLC rewrites intf_state when it starts (and every few seconds) ...
+            "WatchPaths": [str(Path(q) / P.INTF_STATE_FILE) for q in queue_dirs],
+            # ... and launchd also starts us while a request is waiting
+            "QueueDirectories": [str(Path(q) / P.REQUESTS_DIR) for q in queue_dirs],
             "ProcessType": "Background",
+            "LowPriorityIO": True,
             "StandardOutPath": str(log_dir / "launchd.out.log"),
             "StandardErrorPath": str(log_dir / "launchd.err.log"),
         }
     )
 
 
-# --------------------------------------------------------------------------- autostart
+# --------------------------------------------------------------------------- launcher file
+
+
+def _windows_ascii_path(path: str) -> str:
+    """8.3 short form of a non-ASCII path (VLC's Lua ``os.execute`` uses the ANSI code
+    page, so a non-ASCII path would be mangled)."""
+    if path.isascii() or os.name != "nt":
+        return path
+    try:
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf))  # type: ignore[attr-defined]
+        if 0 < n < len(buf) and buf.value.isascii():
+            return buf.value
+    except (OSError, AttributeError):
+        pass
+    return path
+
+
+def launcher_data(mode: str, cmd: Sequence[str], platform: str) -> dict[str, object]:
+    """Contents of ``<q>/launcher``, read by the Lua interface (see DESIGN.md).
+
+    ``mode=service``: a service manager starts the helper (systemd path unit /
+    launchd), the Lua side must not. ``mode=spawn``: the Lua side starts ``exe`` with
+    ``args`` (whitespace-separated) itself when it sees no fresh heartbeat.
+    """
+    exe = _windows_ascii_path(cmd[0]) if platform == "windows" else cmd[0]
+    return {"version": 1, "mode": mode, "exe": exe, "args": " ".join(cmd[1:])}
+
+
+def write_launchers(
+    ctx: Context, queue_dirs: Sequence[Path], mode: str, cmd: Sequence[str]
+) -> None:
+    data = launcher_data(mode, cmd, ctx.platform)
+    for q in queue_dirs:
+        path = Path(q) / LAUNCHER_FILE
+        if P.read_kv(path) == {k: P.sanitize_value(v) for k, v in data.items()}:
+            ctx.ok(f"{path} up to date (mode={mode})")
+            continue
+        if ctx.do(f"write {path} (mode={mode}, exe={data['exe']})"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            P.write_kv(path, data)
+            ctx.ok(f"wrote {path} (mode={mode})")
+
+
+# --------------------------------------------------------------------------- start with VLC
 
 
 def _systemd_user_available(ctx: Context) -> bool:
@@ -729,8 +811,21 @@ def _uid() -> int:
     return os.getuid() if hasattr(os, "getuid") else 0
 
 
+def systemd_user_dir(ctx: Context) -> Path:
+    return ctx.config_home / "systemd" / "user"
+
+
 def systemd_unit_path(ctx: Context) -> Path:
-    return ctx.config_home / "systemd" / "user" / SERVICE_NAME
+    return systemd_user_dir(ctx) / SERVICE_NAME
+
+
+def systemd_path_unit_path(ctx: Context) -> Path:
+    return systemd_user_dir(ctx) / PATH_UNIT_NAME
+
+
+def legacy_service_wants_link(ctx: Context) -> Path:
+    """``default.target.wants`` link of the always-on service of earlier versions."""
+    return systemd_user_dir(ctx) / "default.target.wants" / SERVICE_NAME
 
 
 def desktop_autostart_path(ctx: Context) -> Path:
@@ -745,103 +840,59 @@ def windows_startup_dir(ctx: Context) -> Path:
     return ctx.appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
 
-def _ps_quote(s: str) -> str:
-    return "'" + s.replace("'", "''") + "'"
+def _systemctl(ctx: Context, *args: str, warn: bool = True) -> bool:
+    cmd = ["systemctl", "--user", *args]
+    res = ctx.sh(cmd)
+    if res.returncode != 0 and warn:
+        ctx.warn(f"{' '.join(cmd)} failed: {(res.stderr or '').strip()}")
+    return res.returncode == 0
 
 
-def install_autostart(ctx: Context) -> str:
-    """Register autostart and (re)start the daemon.  Returns the mechanism used."""
+def _is_link_or_exists(p: Path) -> bool:
+    return p.is_symlink() or p.exists()
+
+
+def _legacy_service_installed(ctx: Context) -> bool:
+    """The always-on (login) service of earlier versions is installed or enabled."""
+    if _is_link_or_exists(legacy_service_wants_link(ctx)):
+        return True
+    unit = systemd_unit_path(ctx)
+    try:
+        return unit.exists() and "[Install]" in unit.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def _legacy_launch_agent(ctx: Context) -> bool:
+    plist = launch_agent_path(ctx)
+    try:
+        data = plistlib.loads(plist.read_bytes()) if plist.exists() else {}
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return False
+    return bool(data.get("RunAtLoad") or data.get("KeepAlive"))
+
+
+def legacy_autostart_artifacts(ctx: Context) -> list[Path]:
+    """Login autostart entries written by earlier versions that are still present."""
+    found: list[Path] = []
     if ctx.platform == "linux":
-        cmd = daemon_command(ctx)
-        if _systemd_user_available(ctx):
-            unit = systemd_unit_path(ctx)
-            if ctx.do(f"write systemd user unit {unit} (ExecStart={' '.join(cmd)})"):
-                P.write_text_atomic(unit, systemd_unit_text(cmd))
-                ctx.ok(f"wrote {unit}")
-            if ctx.do(f"systemctl --user enable + restart {SERVICE_NAME}"):
-                for args in (
-                    ["systemctl", "--user", "daemon-reload"],
-                    ["systemctl", "--user", "enable", SERVICE_NAME],
-                    ["systemctl", "--user", "restart", SERVICE_NAME],
-                ):
-                    res = ctx.sh(args)
-                    if res.returncode != 0:
-                        ctx.warn(f"{' '.join(args)} failed: {(res.stderr or '').strip()}")
-                        break
-                else:
-                    ctx.ok(f"daemon enabled and started ({SERVICE_NAME})")
-                    return "systemd"
-                start_daemon_detached(ctx)
-            return "systemd"
-        entry = desktop_autostart_path(ctx)
-        if ctx.do(f"write XDG autostart entry {entry}"):
-            P.write_text_atomic(entry, desktop_entry_text(cmd, asset_path("icon-256.png")))
-            ctx.ok(f"wrote {entry}")
-        start_daemon_detached(ctx)
-        return "xdg-autostart"
-
-    if ctx.platform == "macos":
-        cmd = daemon_command(ctx)
-        plist = launch_agent_path(ctx)
-        log_dir = D.user_log_dir()
-        if ctx.do(f"write LaunchAgent {plist}"):
-            log_dir.mkdir(parents=True, exist_ok=True)
-            plist.parent.mkdir(parents=True, exist_ok=True)
-            plist.write_bytes(launchd_plist(cmd, log_dir))
-            ctx.ok(f"wrote {plist}")
-        if ctx.do(f"launchctl bootstrap gui/{_uid()} {plist}"):
-            ctx.sh(["launchctl", "bootout", f"gui/{_uid()}/{LAUNCHD_LABEL}"])
-            res = ctx.sh(["launchctl", "bootstrap", f"gui/{_uid()}", str(plist)])
-            if res.returncode != 0:
-                ctx.warn(f"launchctl bootstrap failed: {(res.stderr or '').strip()}")
-                start_daemon_detached(ctx)
-            else:
-                ctx.ok("daemon loaded with launchd")
-        return "launchd"
-
-    # windows
-    cmd = daemon_command(ctx, gui=True)
-    lnk = windows_startup_dir(ctx) / WINDOWS_SHORTCUT
-    if ctx.do(f"create Startup shortcut {lnk} -> {cmd[0]}"):
-        lnk.parent.mkdir(parents=True, exist_ok=True)
-        script = (
-            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
-            + _ps_quote(str(lnk))
-            + ");"
-            + f"$s.TargetPath={_ps_quote(cmd[0])};"
-            + f"$s.Arguments={_ps_quote(subprocess.list2cmdline(cmd[1:]))};"
-            + f"$s.WorkingDirectory={_ps_quote(str(Path(cmd[0]).parent))};"
-            + f"$s.Description='{DISPLAY_NAME} daemon';$s.WindowStyle=7;"
-        )
-        icon = asset_path("icon.ico")
-        if icon is not None:
-            script += f"$s.IconLocation={_ps_quote(str(icon) + ',0')};"
-        script += "$s.Save()"
-        res = ctx.sh(
-            [
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                script,
-            ]
-        )
-        if res.returncode == 0 and lnk.exists():
-            ctx.ok(f"created {lnk}")
-            mechanism = "startup-shortcut"
-        else:
-            ctx.warn(f"shortcut creation failed ({(res.stderr or '').strip()}); using HKCU Run key")
-            mechanism = "run-key"
-            _set_run_key(ctx, subprocess.list2cmdline(cmd))
+        if _legacy_service_installed(ctx):
+            link = legacy_service_wants_link(ctx)
+            found.append(link if _is_link_or_exists(link) else systemd_unit_path(ctx))
+        if desktop_autostart_path(ctx).exists():
+            found.append(desktop_autostart_path(ctx))
+    elif ctx.platform == "macos":
+        if _legacy_launch_agent(ctx):
+            found.append(launch_agent_path(ctx))
     else:
-        mechanism = "startup-shortcut"
-    start_daemon_detached(ctx)
-    return mechanism
+        lnk = windows_startup_dir(ctx) / WINDOWS_SHORTCUT
+        if lnk.exists():
+            found.append(lnk)
+    return found
 
 
-def _set_run_key(ctx: Context, command: str | None) -> bool:
+def _delete_run_key(ctx: Context) -> bool:
+    """Delete the HKCU ``Run`` value of earlier versions. True if one was removed."""
     try:
         import winreg  # type: ignore[import-not-found]
     except ImportError:
@@ -849,31 +900,146 @@ def _set_run_key(ctx: Context, command: str | None) -> bool:
     path = r"Software\Microsoft\Windows\CurrentVersion\Run"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_ALL_ACCESS) as key:
-            if command is None:
-                with contextlib.suppress(FileNotFoundError):
-                    winreg.DeleteValue(key, WINDOWS_RUN_VALUE)
-            else:
-                winreg.SetValueEx(key, WINDOWS_RUN_VALUE, 0, winreg.REG_SZ, command)
+            winreg.DeleteValue(key, WINDOWS_RUN_VALUE)
         return True
+    except FileNotFoundError:
+        return False
     except OSError as exc:
         ctx.warn(f"registry update failed: {exc}")
         return False
 
 
-def remove_autostart(ctx: Context) -> None:
+def remove_legacy_autostart(ctx: Context) -> None:
+    """Remove the login autostart of earlier versions (always-on service, shortcut)."""
     if ctx.platform == "linux":
-        unit = systemd_unit_path(ctx)
-        if unit.exists():
-            if ctx.do(f"systemctl --user disable --now {SERVICE_NAME}"):
-                ctx.sh(["systemctl", "--user", "disable", "--now", SERVICE_NAME])
-            if ctx.do(f"remove {unit}"):
-                unit.unlink()
-                ctx.sh(["systemctl", "--user", "daemon-reload"])
-                ctx.ok(f"removed {unit}")
+        if _legacy_service_installed(ctx) and ctx.do(
+            f"stop and disable the always-on {SERVICE_NAME} of an earlier version"
+        ):
+            if ctx.which("systemctl"):
+                # before the unit file is rewritten: disable needs its [Install] section
+                _systemctl(ctx, "disable", "--now", SERVICE_NAME, warn=False)
+            link = legacy_service_wants_link(ctx)
+            if _is_link_or_exists(link):
+                with contextlib.suppress(OSError):
+                    link.unlink()
+            with contextlib.suppress(OSError):
+                systemd_unit_path(ctx).unlink()
+            if ctx.which("systemctl"):
+                _systemctl(ctx, "daemon-reload", warn=False)
+            ctx.ok(f"removed the always-on {SERVICE_NAME} (started at login)")
         entry = desktop_autostart_path(ctx)
-        if entry.exists() and ctx.do(f"remove {entry}"):
+        if entry.exists() and ctx.do(f"remove login autostart entry {entry}"):
             entry.unlink()
             ctx.ok(f"removed {entry}")
+    elif ctx.platform == "macos":
+        if _legacy_launch_agent(ctx) and ctx.do(
+            f"unload and remove the always-on LaunchAgent {launch_agent_path(ctx)}"
+        ):
+            ctx.sh(["launchctl", "bootout", f"gui/{_uid()}/{LAUNCHD_LABEL}"])
+            with contextlib.suppress(OSError):
+                launch_agent_path(ctx).unlink()
+            ctx.ok("removed the always-on LaunchAgent (KeepAlive/RunAtLoad)")
+    else:
+        lnk = windows_startup_dir(ctx) / WINDOWS_SHORTCUT
+        if lnk.exists() and ctx.do(f"remove Startup shortcut {lnk}"):
+            lnk.unlink()
+            ctx.ok(f"removed {lnk}")
+        if ctx.do(rf"remove HKCU\...\Run\{WINDOWS_RUN_VALUE} (if any)") and _delete_run_key(ctx):
+            ctx.ok(rf"removed HKCU\...\Run\{WINDOWS_RUN_VALUE}")
+
+
+def install_autostart(ctx: Context, installs: Sequence[VlcInstall] = ()) -> str:
+    """Make the helper start with VLC, and only then. Returns the mechanism used.
+
+    Nothing is started now: the helper comes up when VLC starts and exits after it.
+    """
+    queue_dirs = [i.queue_dir for i in installs if i.usable]
+    remove_legacy_autostart(ctx)
+    if not queue_dirs:
+        ctx.warn("no usable VLC installation; nothing to start the helper for")
+        return "none"
+
+    if ctx.platform == "linux":
+        cmd = daemon_command(ctx)
+        if _systemd_user_available(ctx):
+            service, path_unit = systemd_unit_path(ctx), systemd_path_unit_path(ctx)
+            path_text = systemd_path_text(queue_dirs)
+            try:
+                old_path_text: str | None = path_unit.read_text(encoding="utf-8")
+            except OSError:
+                old_path_text = None
+            # an already running path unit keeps its old watches until restarted
+            watches_changed = old_path_text is not None and old_path_text != path_text
+            if ctx.do(f"write systemd user units {path_unit.name} + {service.name}"):
+                P.write_text_atomic(service, systemd_service_text(cmd))
+                P.write_text_atomic(path_unit, path_text)
+                ctx.ok(f"wrote {path_unit} (watches {len(queue_dirs)} VLC queue dir(s))")
+                ctx.ok(f"wrote {service} (ExecStart={' '.join(cmd)})")
+            if ctx.do(f"systemctl --user enable --now {PATH_UNIT_NAME}"):
+                _systemctl(ctx, "daemon-reload")
+                _systemctl(ctx, "reset-failed", PATH_UNIT_NAME, SERVICE_NAME, warn=False)
+                if _systemctl(ctx, "enable", "--now", PATH_UNIT_NAME):
+                    if watches_changed and _systemctl(ctx, "restart", PATH_UNIT_NAME):
+                        ctx.ok(f"restarted {PATH_UNIT_NAME}: it watches the new paths")
+                    ctx.ok(f"{PATH_UNIT_NAME} active: the helper starts when VLC starts")
+            write_launchers(ctx, queue_dirs, "service", cmd)
+            return "systemd-path"
+        write_launchers(ctx, queue_dirs, "spawn", cmd)
+        for inst in installs:
+            if inst.usable and inst.kind in ("snap", "flatpak"):
+                ctx.warn(
+                    f"{inst.label()} is sandboxed and cannot start the helper itself, and "
+                    "there is no systemd user session: run `vlc-subsync serve --persistent` "
+                    "yourself to use it with this VLC"
+                )
+        ctx.ok("no systemd user session: VLC starts the helper itself when it opens")
+        return "vlc-spawn"
+
+    if ctx.platform == "macos":
+        cmd = daemon_command(ctx)
+        plist = launch_agent_path(ctx)
+        log_dir = D.user_log_dir()
+        if ctx.do(f"write LaunchAgent {plist} (WatchPaths + QueueDirectories, on demand)"):
+            log_dir.mkdir(parents=True, exist_ok=True)
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            plist.write_bytes(launchd_plist(cmd, log_dir, queue_dirs))
+            ctx.ok(f"wrote {plist}")
+        if ctx.do(f"launchctl bootstrap gui/{_uid()} {plist}"):
+            ctx.sh(["launchctl", "bootout", f"gui/{_uid()}/{LAUNCHD_LABEL}"])
+            res = ctx.sh(["launchctl", "bootstrap", f"gui/{_uid()}", str(plist)])
+            if res.returncode != 0:
+                ctx.warn(f"launchctl bootstrap failed: {(res.stderr or '').strip()}")
+            else:
+                ctx.ok("LaunchAgent loaded: the helper starts when VLC starts")
+        write_launchers(ctx, queue_dirs, "service", cmd)
+        return "launchd"
+
+    # windows: VLC's Lua interface launches the GUI exe itself (see DESIGN.md)
+    cmd = daemon_command(ctx, gui=True)
+    if "%" in cmd[0]:
+        ctx.warn(
+            f"the helper's path contains '%' ({cmd[0]}); cmd.exe may expand it and VLC "
+            "then fails to start the helper. Reinstall SubSync to a path without '%'"
+        )
+    write_launchers(ctx, queue_dirs, "spawn", cmd)
+    ctx.ok(f"VLC starts the helper itself when it opens ({Path(cmd[0]).name})")
+    return "vlc-spawn"
+
+
+def remove_autostart(ctx: Context) -> None:
+    remove_legacy_autostart(ctx)
+    if ctx.platform == "linux":
+        path_unit, service = systemd_path_unit_path(ctx), systemd_unit_path(ctx)
+        if path_unit.exists() or service.exists():
+            if ctx.do(f"systemctl --user disable --now {PATH_UNIT_NAME}; stop {SERVICE_NAME}"):
+                _systemctl(ctx, "disable", "--now", PATH_UNIT_NAME, warn=False)
+                _systemctl(ctx, "stop", SERVICE_NAME, warn=False)
+            for unit in (path_unit, service):
+                if unit.exists() and ctx.do(f"remove {unit}"):
+                    unit.unlink()
+                    ctx.ok(f"removed {unit}")
+            if ctx.do("systemctl --user daemon-reload"):
+                _systemctl(ctx, "daemon-reload", warn=False)
     elif ctx.platform == "macos":
         plist = launch_agent_path(ctx)
         if ctx.do(f"launchctl bootout gui/{_uid()}/{LAUNCHD_LABEL}"):
@@ -881,29 +1047,96 @@ def remove_autostart(ctx: Context) -> None:
         if plist.exists() and ctx.do(f"remove {plist}"):
             plist.unlink()
             ctx.ok(f"removed {plist}")
-    else:
-        lnk = windows_startup_dir(ctx) / WINDOWS_SHORTCUT
-        if lnk.exists() and ctx.do(f"remove {lnk}"):
-            lnk.unlink()
-            ctx.ok(f"removed {lnk}")
-        if ctx.do("remove HKCU Run entry (if any)"):
-            _set_run_key(ctx, None)
+    # windows: only the legacy entries; the launcher files go with the queue dirs
 
 
-def autostart_status(ctx: Context) -> str:
-    if ctx.platform == "linux":
-        if systemd_unit_path(ctx).exists():
-            return f"systemd user unit {systemd_unit_path(ctx)}"
-        if desktop_autostart_path(ctx).exists():
-            return f"XDG autostart {desktop_autostart_path(ctx)}"
-    elif ctx.platform == "macos":
-        if launch_agent_path(ctx).exists():
-            return f"LaunchAgent {launch_agent_path(ctx)}"
+def lifecycle_status(
+    ctx: Context, queue_dirs: Sequence[Path] = ()
+) -> list[tuple[str, str, bool | None]]:
+    """``(label, value, ok)`` rows describing how the helper starts (for ``doctor``)."""
+    rows: list[tuple[str, str, bool | None]] = []
+    for p in legacy_autostart_artifacts(ctx):
+        rows.append(
+            ("login autostart (earlier version)", f"{p}: re-run `vlc-subsync setup`", False)
+        )
+    if ctx.platform == "windows":
+        launchers = [(q, P.read_kv(Path(q) / LAUNCHER_FILE)) for q in queue_dirs]
+        for q, data in launchers:
+            if not data:
+                rows.append(
+                    (f"launcher {Path(q) / LAUNCHER_FILE}", "missing (re-run setup)", False)
+                )
+                continue
+            exe = data.get("exe", "")
+            rows.append(
+                (
+                    f"launcher {Path(q) / LAUNCHER_FILE}",
+                    f"VLC starts {exe}" + ("" if Path(exe).exists() else " (not found!)"),
+                    Path(exe).exists(),
+                )
+            )
+        if not launchers:
+            rows.append(("start with VLC", "no queue dir", False))
+        return rows
+    if ctx.platform == "macos":
+        plist = launch_agent_path(ctx)
+        if not plist.exists():
+            rows.append(("LaunchAgent", "missing (re-run setup)", False))
+            return rows
+        res = ctx.sh(["launchctl", "print", f"gui/{_uid()}/{LAUNCHD_LABEL}"], timeout=10)
+        loaded = res.returncode == 0
+        running = loaded and "state = running" in (res.stdout or "")
+        rows.append(
+            (
+                "LaunchAgent",
+                f"{plist}: "
+                + ("not loaded (re-run setup)" if not loaded else "loaded, starts with VLC")
+                + ("; helper running" if running else ""),
+                loaded,
+            )
+        )
+        return rows
+    path_unit = systemd_path_unit_path(ctx)
+    if path_unit.exists():
+
+        def state(*args: str) -> str:
+            res = ctx.sh(["systemctl", "--user", *args], timeout=10)
+            return (res.stdout or "").strip() or (res.stderr or "").strip() or "unknown"
+
+        enabled = state("is-enabled", PATH_UNIT_NAME)
+        active = state("is-active", PATH_UNIT_NAME)
+        rows.append(
+            (
+                PATH_UNIT_NAME,
+                f"{enabled}, {active} (starts the helper when VLC starts)",
+                enabled == "enabled" and active == "active",
+            )
+        )
+        service = state("is-active", SERVICE_NAME)
+        rows.append(
+            (
+                SERVICE_NAME,
+                service
+                + (" (VLC is open)" if service == "active" else " (normal while VLC is closed)"),
+                None,
+            )
+        )
+        return rows
+    spawn = [
+        q for q in queue_dirs if (P.read_kv(Path(q) / LAUNCHER_FILE) or {}).get("mode") == "spawn"
+    ]
+    if spawn:
+        exe = (P.read_kv(Path(spawn[0]) / LAUNCHER_FILE) or {}).get("exe", "?")
+        rows.append(("start with VLC", f"VLC starts {exe} (no systemd user session)", True))
     else:
-        lnk = windows_startup_dir(ctx) / WINDOWS_SHORTCUT
-        if lnk.exists():
-            return f"Startup shortcut {lnk}"
-    return "not configured"
+        rows.append(("start with VLC", "not configured (run `vlc-subsync setup`)", False))
+    return rows
+
+
+def autostart_status(ctx: Context, queue_dirs: Sequence[Path] = ()) -> str:
+    """One-line summary of :func:`lifecycle_status`."""
+    rows = lifecycle_status(ctx, queue_dirs)
+    return "; ".join(f"{label}: {value}" for label, value, _ in rows) or "not configured"
 
 
 # --------------------------------------------------------------------------- daemon control
@@ -932,28 +1165,6 @@ def stop_daemon(ctx: Context, timeout: float = 10.0) -> bool:
         time.sleep(0.2)
     ctx.warn(f"daemon pid {pid} did not exit in {timeout:.0f}s")
     return False
-
-
-def start_daemon_detached(ctx: Context) -> None:
-    cmd = daemon_command(ctx, gui=ctx.platform == "windows")
-    if not ctx.do(f"start daemon: {' '.join(cmd)}"):
-        return
-    popen = ctx.popen or subprocess.Popen
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if ctx.platform == "windows":
-        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED|NEWGROUP|NOWIN
-    else:
-        kwargs["start_new_session"] = True
-    try:
-        popen(cmd, **kwargs)
-        ctx.ok("daemon started")
-    except OSError as exc:
-        ctx.error(f"could not start the daemon: {exc}")
 
 
 def is_vlc_running(ctx: Context) -> bool:
@@ -1034,17 +1245,16 @@ def run_setup(
         except OSError as exc:
             ctx.error(f"could not configure {inst.label()}: {exc}")
 
+    ctx.step("Start with VLC")
     if autostart:
-        ctx.step("Background service")
         try:
-            stop_daemon(ctx)
-            mech = install_autostart(ctx)
-            ctx.info(f"autostart: {mech}")
+            stop_daemon(ctx)  # e.g. the always-on daemon of an earlier version
+            mech = install_autostart(ctx, installs)
+            ctx.info(f"helper lifecycle: {mech} (starts with VLC, exits after it)")
         except OSError as exc:
-            ctx.error(f"autostart setup failed: {exc}")
+            ctx.error(f"start-with-VLC setup failed: {exc}")
     else:
-        ctx.step("Background service")
-        ctx.info("autostart skipped (--no-autostart); run `vlc-subsync serve` manually")
+        ctx.info("skipped (--no-autostart); run `vlc-subsync serve --persistent` yourself")
 
     if model:
         ctx.step("Speech model")
@@ -1076,7 +1286,7 @@ def run_uninstall(
     ctx: Context, *, purge: bool = False, vlc_dirs: Sequence[str] = (), vlcrc: str | None = None
 ) -> int:
     ctx.out(f"{DISPLAY_NAME} {__version__} uninstall" + (" (dry run)" if ctx.dry_run else ""))
-    ctx.step("Background service")
+    ctx.step("Start with VLC")
     remove_autostart(ctx)
     stop_daemon(ctx)
     for inst in _target_installs(ctx, vlc_dirs, vlcrc):

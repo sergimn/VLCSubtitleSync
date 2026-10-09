@@ -34,6 +34,10 @@
    recursive and returns (status, errno).
  * os.rename/os.remove/os.execute/os.getenv are the standard ones (on
    Windows os.rename fails if the target exists -> remove + retry).
+ * os.execute(cmd) is C system(): `/bin/sh -c cmd` on POSIX, `cmd.exe /c cmd` on
+   Windows. From a GUI process like VLC, cmd.exe gets a console window of its
+   own, which may flash briefly; `start "" /B` makes it return at once (see
+   DESIGN.md "Lifecycle" for why this is the least visible option).
  * Input variables "time" and "spu-delay" are VLC_VAR_INTEGER in microseconds
    (src/input/var.c: var_Create(p_input, "time"/"spu-delay", VLC_VAR_INTEGER);
    input.c: spu-delay = sub-delay (1/10 s) * 100000). "time" is the playback
@@ -57,6 +61,8 @@ M.HEARTBEAT_CHECK_US = 2000000
 M.STATE_REFRESH_S = 5         -- rewrite intf_state at least this often
 M.HEARTBEAT_MAX_AGE = 10      -- daemon considered alive if heartbeat age <= this
 M.DAEMON_GRACE_US = 3000000   -- time a job may wait before we complain about the daemon
+M.SPAWN_RETRY_US = 60000000   -- launcher spawn: wait this long before starting it again
+M.SPAWN_MAX = 3               -- launcher spawn: at most this many starts per VLC session
 M.OSD_DURATION = 3000000
 -- delay mode (experimental): see DESIGN.md "Delay mode"
 M.DELAY_TOLERANCE_US = 40000  -- re-set spu-delay when the target moved more than this
@@ -239,9 +245,81 @@ local function shell_quote(s)
     return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
--- Try (once) to start the daemon ourselves. Only on non-Windows, non-sandboxed
--- VLC: os.execute flashes a console on Windows and is denied in snap/flatpak.
+-- <q>/launcher, written by `vlc-subsync setup` (see DESIGN.md "Lifecycle"):
+--   mode=service  a service manager (systemd path unit, launchd) starts the helper
+--   mode=spawn    we start `exe args` ourselves (Windows; Linux without systemd)
+function M.read_launcher()
+    return M.read_kv(join(S.q, "launcher"))
+end
+
+-- Shell command that starts the helper in the background and returns at once.
+function M.spawn_command(exe, args)
+    local parts = {}
+    for a in tostring(args or ""):gmatch("%S+") do parts[#parts + 1] = a end
+    if is_windows() then
+        -- cmd.exe: `start` returns immediately; "" is the (empty) window title.
+        -- The helper is a GUI-subsystem exe, so it opens no console of its own.
+        local cmd = 'start "" /B "' .. exe .. '"'
+        for _, a in ipairs(parts) do cmd = cmd .. ' "' .. a .. '"' end
+        return cmd
+    end
+    local cmd = shell_quote(exe)
+    for _, a in ipairs(parts) do cmd = cmd .. " " .. shell_quote(a) end
+    return cmd .. " >/dev/null 2>&1 &"
+end
+
+-- Start the helper as the launcher file says. Returns true if it was started now
+-- or recently (and may still be coming up).
+function M.spawn_from_launcher(l)
+    if l.mode ~= "spawn" then
+        if not S.service_logged then
+            S.service_logged = true
+            log_dbg("helper is started by a service manager (launcher mode=" ..
+                tostring(l.mode) .. ")")
+        end
+        return false
+    end
+    if not is_windows() and M.is_sandboxed() then
+        log_dbg("sandboxed VLC cannot start the helper")
+        return false
+    end
+    local exe = l.exe or ""
+    if exe == "" or not file_exists(exe) then
+        if not S.launcher_err_logged then
+            S.launcher_err_logged = true
+            log_err("helper not found: '" .. exe .. "' (re-run `vlc-subsync setup`)")
+        end
+        return false
+    end
+    local t = now_us()
+    if S.spawned_at and t - S.spawned_at < M.SPAWN_RETRY_US then
+        return true -- started a moment ago: give it time to write its heartbeat
+    end
+    if S.spawn_count >= M.SPAWN_MAX then return false end
+    S.spawned_at = t
+    S.spawn_count = S.spawn_count + 1
+    local cmd = M.spawn_command(exe, l.args)
+    log_info("starting helper: " .. cmd)
+    pcall(M.execute, cmd)
+    return true
+end
+
+-- Heartbeat-triggered start (launcher mode=spawn only): called at startup and
+-- every HEARTBEAT_CHECK_US; starts the helper when its heartbeat is not fresh.
+function M.check_helper()
+    local t = now_us()
+    if S.helper_checked and t - S.helper_checked < M.HEARTBEAT_CHECK_US then return end
+    S.helper_checked = t
+    if M.daemon_alive(true) then return end
+    local l = M.read_launcher()
+    if l and l.mode == "spawn" then M.spawn_from_launcher(l) end
+end
+
+-- Try to start the daemon ourselves. With a launcher file, as it says; without one
+-- (set up by an earlier version) once, and only on non-Windows, non-sandboxed VLC.
 function M.try_autostart()
+    local l = M.read_launcher()
+    if l then return M.spawn_from_launcher(l) end
     if S.autostart_tried then return false end
     S.autostart_tried = true
     if is_windows() or M.is_sandboxed() then
@@ -1091,6 +1169,7 @@ end
 
 function M.tick()
     local t = now_us()
+    M.check_helper()
     local sync_now, sync_mode = M.read_control()
 
     local get_input = vlc.object and vlc.object.input
@@ -1240,7 +1319,7 @@ end
 
 function M.reset()
     S = {
-        counter = 0, auto = true, ours = {}, memo = {},
+        counter = 0, auto = true, ours = {}, memo = {}, spawn_count = 0,
         state = "idle", message = "", last_result = "",
     }
     S.q = M.queue_dir()
@@ -1253,6 +1332,7 @@ function M.init()
     M.ensure_dirs()
     log_info("started, queue dir " .. S.q)
     M.write_state(true)
+    M.check_helper()
 end
 
 function M.safe_tick()

@@ -125,12 +125,18 @@ sub_label=Track 1 - [English]
 sub_path=                              # optional explicit external subtitle path
 force=0                                # 1 = ignore result cache
 mode=exhaustive                        # optional: fast|thorough|exhaustive, overrides config
+cache_only=1                           # optional: only answer from the result cache
 ```
 `mode` is omitted for the default; unknown values are ignored (config mode used).
+`cache_only=1` (the intf's lookup while it waits after a file opens, see "Lua
+behaviour") is answered at once when picked up, never queued and never synced: the
+cached result's `done` status if it is *applied*, else `state=miss` (no entry, an
+unapplied one, cache off, or any error). A helper from before it ignores the key and
+syncs as usual.
 `<q>/jobs/<id>.status` (daemon → Lua), rewritten on each update:
 ```
 id=...
-state=queued|running|done|error
+state=queued|running|done|error|miss  # miss: only for cache_only requests
 progress=0.42
 message=Transcribing 3/10
 output=/abs/path/<q>/out/<id>.srt      # when done
@@ -227,7 +233,18 @@ job finds no heartbeat, from the usual install paths (non-Windows, non-sandboxed
 Trigger a sync when, for the current input, (a) playback started with a sub track
 selected, (b) `spu-es` changed to a non-disabled track that isn't one we added, or
 (c) `audio-es` changed while a sub track is selected; debounce 1.5 s; only one job in
-flight per input (newer request supersedes). Track ordinals come from
+flight per input (newer request supersedes).
+**Wait after opening.** For 10 s after a file opens (`START_HOLD_US`, wall clock) an
+automatic trigger does not transcribe: VLC, or the user, may still be switching to
+the tracks they want, and syncing a mismatched audio/subtitle pair wastes minutes.
+The trigger sends a quiet `cache_only=1` request instead (once per tracks): a `done`
+answer (an applied cached result) is used at once; on `miss` the trigger waits for the
+10 s, then sends the normal request (which still gets an unapplied cached result from
+the cache). The wait ends early when the user changes the audio or subtitle track:
+changes within 2 s (`START_SETTLE_US`) of the first audio track showing up are VLC's
+own picks and do not count. "Sync subtitles now" never waits, and a result
+remembered from earlier in the session is applied at once as before. `intf_state`
+says `state=waiting` meanwhile. Track ordinals come from
 `vlc.var.get_list(input, "audio-es"/"spu-es")` (skip value -1 "Disable"; skip ES ids we
 added). On `done` + `applied=1`: `vlc.input.add_subtitle(output, true)` (try path, then
 `vlc.strings.make_uri(output)`), remember the new ES id(s) as "ours → source", OSD

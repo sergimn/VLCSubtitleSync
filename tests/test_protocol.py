@@ -55,6 +55,16 @@ def test_request_mode_optional_and_validated(tmp_path):
     assert P.Request.from_dict({**base, "mode": ""}).mode == ""
 
 
+def test_request_cache_only_optional(tmp_path):
+    path = P.write_request(tmp_path, P.Request(id="c1", media="/m.mkv", sub_index=0))
+    assert "cache_only" not in P.read_kv(path)
+    assert P.read_request(path).cache_only is False
+    req = P.Request(id="c2", media="/m.mkv", sub_index=0, cache_only=True)
+    path = P.write_request(tmp_path, req)
+    assert P.read_kv(path)["cache_only"] == "1"
+    assert P.read_request(path).cache_only is True
+
+
 def test_status_roundtrip(tmp_path):
     st = P.Status(
         id="x_1",

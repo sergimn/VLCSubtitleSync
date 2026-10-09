@@ -597,6 +597,47 @@ def test_unapplied_result_not_served_across_modes(env):
         assert len(runner.calls) == 4
 
 
+def test_cache_only_request_answers_hits_and_misses_without_syncing(env):
+    """The intf's probe while it waits after a file opens: an applied cached result
+    is answered at once, anything else is a "miss"; nothing is ever synced or stored."""
+    media = make_media(env)
+    runner = FakeRunner(block=True)
+    with Harness(env, runner) as h:
+        # miss: never queued, so it is answered even while the worker is busy
+        other = make_media(env, "other.mkv")
+        h.submit("p_busy", other, sub_index=0)
+        assert runner.started.wait(5)
+        h.submit("p_1", media, sub_index=0, cache_only=True)
+        st = h.wait_state("p_1", "miss")
+        assert st.output is None
+        runner.release.set()
+        h.wait_state("p_busy", "done")
+        assert len(runner.calls) == 1
+        # an applied result: the probe gets it, with its mapping, like a cache hit
+        h.submit("p_2", media, sub_index=0)
+        h.wait_state("p_2", "done")
+        h.submit("p_3", media, sub_index=0, cache_only=True)
+        st = h.wait_state("p_3", "done")
+        assert st.applied and st.segments
+        assert Path(st.output) == env.queue / "out" / "p_3.srt"
+        assert len(runner.calls) == 2
+        # an unapplied result is a miss (the normal request then reuses it)
+        runner.applied = False
+        h.submit("p_4", media, sub_index=1)
+        assert h.wait_state("p_4", "done").applied is False
+        h.submit("p_5", media, sub_index=1, cache_only=True)
+        h.wait_state("p_5", "miss")
+        # cache off, or a file that is gone: a miss as well
+        h.daemon.config_loader = lambda: SimpleNamespace(
+            model_en="base.en", model_multi="base", cache=False
+        )
+        h.submit("p_6", media, sub_index=0, cache_only=True)
+        h.wait_state("p_6", "miss")
+        h.submit("p_7", str(env.media_dir / "gone.mkv"), sub_index=0, cache_only=True)
+        h.wait_state("p_7", "miss")
+        assert len(runner.calls) == 3
+
+
 def test_forced_resync_wins_over_other_modes(env):
     """A forced fast re-sync replaces an older exhaustive result for later opens."""
     from vlcsubsync.config import Config

@@ -136,7 +136,11 @@ class Harness:
         return [(a.path, a.select) for a in self.mock.added.values()]
 
     # ---- intf driving ---------------------------------------------------------------
-    def init(self):
+    def init(self, hold: bool = False):
+        # Most tests are about what happens once a sync starts: they skip the wait
+        # after a file opens (see the start_hold tests).
+        if not hold:
+            self.S.START_HOLD_US = 0
         self.S.init()
 
     def tick(self, n: int = 1, dt: int = TICK):
@@ -245,6 +249,148 @@ def test_request_written_with_ordinals_labels_and_decoded_path(h):
     assert h.mock.last_osd.position == "top-right"
     assert h.mock.last_osd.duration == 3000000
     assert h.intf_state()["state"] == "syncing"
+
+
+# ---- the wait after a file opens (START_HOLD_US) ------------------------------------
+
+
+@pytest.fixture
+def hold(runtime, tmp_path):
+    hh = Harness(runtime, tmp_path, INTF)
+    hh.heartbeat()
+    hh.init(hold=True)
+    return hh
+
+
+def miss(h, req_id):
+    """The helper's answer to a cache_only request without a cached result."""
+    h.status(req_id, state="miss", progress="0.000", message="Not cached")
+    (h.q / "requests" / f"{req_id}.req").unlink(missing_ok=True)
+
+
+def test_start_hold_asks_cache_then_waits_ten_seconds(hold):
+    h = hold
+    h.set_input(audio_sel=11, spu_sel=21)
+    h.tick(4)  # past the debounce: only a quiet cache lookup
+    reqs = h.requests()
+    assert len(reqs) == 1 and reqs[0]["cache_only"] == "1"
+    assert reqs[0]["audio_index"] == "1" and reqs[0]["sub_index"] == "1"
+    assert reqs[0]["force"] == "0"
+    assert not any(o.startswith("Syncing") for o in h.osd())
+    assert h.intf_state()["state"] == "waiting"
+    miss(h, reqs[0]["id"])
+    h.tick(16)  # up to 9.5 s after the file opened
+    assert h.requests() == []
+    assert h.intf_state()["state"] == "waiting"
+    h.tick()  # 10 s: the real request
+    reqs = h.requests()
+    assert len(reqs) == 1 and "cache_only" not in reqs[0]
+    assert reqs[0]["sub_index"] == "1" and reqs[0]["force"] == "0"
+    assert "Syncing subtitles…" in h.osd()
+    out = h.finish(reqs[0]["id"])
+    h.tick(2)
+    assert h.added() == [(out, True)]
+
+
+def test_start_hold_cache_hit_applies_at_once(hold):
+    h = hold
+    h.set_input()
+    h.tick(4)
+    probe = h.requests()[0]
+    assert probe["cache_only"] == "1"
+    out = h.finish(probe["id"])  # the helper had a synced result
+    h.tick()
+    assert h.added() == [(out, True)]
+    h.tick(2)
+    assert h.selected("spu-es") == h.spu_ids()[-1]
+    assert "Subtitles synced: offset +2.35s, drift +4.1%" in h.osd()
+    h.tick(30)
+    assert h.requests() == []
+
+
+def test_start_hold_user_track_change_syncs_without_waiting(hold):
+    h = hold
+    h.set_input(spu_sel=20)
+    h.tick(6)
+    miss(h, h.requests()[0]["id"])
+    h.tick(2)  # 4 s in: the user picks another subtitle track
+    h.select("spu-es", 21)
+    h.tick(4)  # debounce only
+    reqs = h.requests()
+    assert len(reqs) == 1 and "cache_only" not in reqs[0] and reqs[0]["sub_index"] == "1"
+
+
+def test_start_hold_vlc_initial_picks_do_not_end_it(hold):
+    h = hold
+    # VLC selects the subtitle track a moment after the audio one
+    h.set_input(spu_sel=-1)
+    h.tick(2)
+    h.select("spu-es", 20)
+    h.tick(4)
+    reqs = h.requests()
+    assert len(reqs) == 1 and reqs[0]["cache_only"] == "1"
+    miss(h, reqs[0]["id"])
+    h.tick(8)  # 7 s in
+    assert h.requests() == []
+
+
+def test_start_hold_tracks_already_missed_are_not_asked_again(hold):
+    h = hold
+    h.S.START_SETTLE_US = 5_000_000  # a slow VLC still picking tracks
+    h.set_input(spu_sel=20)
+    h.tick(4)
+    miss(h, h.requests()[0]["id"])
+    h.tick()
+    h.select("spu-es", -1)
+    h.tick()
+    h.select("spu-es", 20)  # 3 s in, back to the tracks that already missed
+    h.tick(14)  # up to 9.5 s
+    assert h.requests() == []
+    h.tick()
+    reqs = h.requests()
+    assert len(reqs) == 1 and "cache_only" not in reqs[0]
+
+
+def test_start_hold_late_cache_answer_syncs_at_once(hold):
+    h = hold
+    h.set_input()
+    h.tick(4)
+    probe = h.requests()[0]
+    h.tick(20)  # the helper is slow to answer; the hold is over
+    assert h.requests() == [probe]
+    miss(h, probe["id"])
+    h.tick()
+    reqs = h.requests()
+    assert len(reqs) == 1 and "cache_only" not in reqs[0]
+
+
+def test_start_hold_sync_now_does_not_wait(hold):
+    h = hold
+    h.control(sync_now=1)  # baseline
+    h.set_input()
+    h.tick()
+    h.control(sync_now=2)
+    h.tick()
+    reqs = h.requests()
+    assert len(reqs) == 1 and "cache_only" not in reqs[0]
+    assert "Syncing subtitles…" in h.osd()
+
+
+def test_start_hold_restarts_for_the_next_file(hold):
+    h = hold
+    h.set_input()
+    h.tick(4)
+    miss(h, h.requests()[0]["id"])
+    h.tick(20)
+    first = h.requests()[0]
+    h.finish(first["id"])
+    h.tick(3)
+    # next playlist item: waits again
+    h.set_input(uri="file:///media/next.mkv")
+    h.tick(4)
+    reqs = h.requests()
+    assert len(reqs) == 1 and reqs[0]["cache_only"] == "1"
+    assert reqs[0]["media"] == "/media/next.mkv"
 
 
 def test_make_path_is_preferred_when_available(runtime, tmp_path):

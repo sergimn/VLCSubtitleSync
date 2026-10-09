@@ -1,0 +1,49 @@
+name: Windows fresh-machine probe (temporary)
+on:
+  push:
+    branches: [claude/project-thread-6leh4b]
+    paths: ['.github/win-probe/**', '.github/workflows/win-probe.yml', 'install.*']
+jobs:
+  clean-container:
+    name: Release installer in a clean Server Core container
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run in mcr.microsoft.com/windows/servercore:ltsc2022
+        shell: pwsh
+        run: |
+          docker pull mcr.microsoft.com/windows/servercore:ltsc2022
+          docker run --rm -v "${{ github.workspace }}\.github\win-probe:C:\probe" -v "${{ github.workspace }}\tests\fixtures:C:\fix" `
+            mcr.microsoft.com/windows/servercore:ltsc2022 powershell -NoProfile -ExecutionPolicy Bypass -File C:\probe\clean.ps1
+
+  vlc-e2e:
+    name: Release installer + real VLC (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        shell: pwsh
+        run: |
+          "arch: $env:PROCESSOR_ARCHITECTURE"
+          foreach ($c in 'python','py','uv','ffmpeg','vlc') { "$c on PATH: $([bool](Get-Command $c -ErrorAction SilentlyContinue))" }
+      - name: Install VLC 3.0.21 (win64)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -UseBasicParsing https://download.videolan.org/pub/videolan/vlc/3.0.21/win64/vlc-3.0.21-win64.exe -OutFile vlc.exe
+          Start-Process .\vlc.exe -ArgumentList '/L=1033','/S' -Wait
+          Get-Item "$env:ProgramFiles\VideoLAN\VLC\vlc.exe"
+      - name: Released install.cmd (as a user double-clicking it)
+        shell: pwsh
+        run: .\.github\win-probe\install-release.ps1
+      - name: CLI sync on a fixture
+        shell: pwsh
+        run: .\.github\win-probe\sync-check.ps1 -Fix "$env:GITHUB_WORKSPACE\tests\fixtures"
+      - name: VLC end-to-end
+        shell: pwsh
+        run: .\.github\win-probe\e2e.ps1 -Fix "$env:GITHUB_WORKSPACE\tests\fixtures"

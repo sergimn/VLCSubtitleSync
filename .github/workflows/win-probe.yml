@@ -1,0 +1,18 @@
+name: Windows probe (temporary)
+on:
+  push:
+    branches: [claude/project-thread-6leh4b]
+    paths: ['.github/win-probe/**', '.github/workflows/win-probe.yml']
+jobs:
+  x86-ps:
+    name: Latest release via 32-bit PowerShell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-2022]
+    steps:
+      - uses: actions/checkout@v7
+      - shell: pwsh
+        run: .\.github\win-probe\x86.ps1

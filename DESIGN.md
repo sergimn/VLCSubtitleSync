@@ -493,7 +493,7 @@ The daemon loads the config for every job.
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
 
 ## Installation UX
-* Linux/macOS: `curl -LsSf https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.sh | sh`
+* Linux/macOS: `curl -LsSf https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.sh | sh`
 * Windows: double-click `install.cmd` (or `irm …/install.ps1 | iex`).
 Steps: install `uv` if missing → `uv tool install --python 3.12 vlc-subsync@<archive url>`
 → `vlc-subsync setup` which: copies Lua scripts into every detected VLC (native,

@@ -1,7 +1,7 @@
 # SubSync (vlc-subsync) installer for Windows.
 #
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Uninstall] [setup options]
-#   irm https://raw.githubusercontent.com/sergimn/VLCSubtitleSync/main/install.ps1 | iex
+#   irm https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.ps1 | iex
 #
 # Environment:
 #   VLC_SUBSYNC_SOURCE     package source (default: GitHub main branch archive);

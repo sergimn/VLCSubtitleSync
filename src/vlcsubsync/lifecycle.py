@@ -1,11 +1,15 @@
-"""Daemon process helpers: run at low priority so VLC playback stays smooth.
+"""Daemon process helpers: free Whisper when idle, run at low priority.
 
-:func:`lower_priority` is called once by ``serve`` before any thread exists (Linux
-nice and I/O priority are per thread and inherited). Every step is best effort.
+:func:`unload_models` is called by the daemon's worker thread a minute after the last
+job, so it never races with a running job. :func:`lower_priority` is called once by
+``serve`` before any thread exists (Linux nice and I/O priority are per thread and
+inherited). Every step is best effort.
 """
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import logging
 import os
 import struct
@@ -13,6 +17,62 @@ import sys
 from typing import Any
 
 log = logging.getLogger("vlcsubsync.lifecycle")
+
+MODEL_IDLE_SECONDS = 60.0  # unload Whisper after this long without a job
+
+
+# --------------------------------------------------------------------------- models
+
+
+def unload_models() -> int:
+    """Free the Whisper (and Silero VAD) models if they were loaded.
+
+    Only touches modules that are already imported, so it never imports
+    faster-whisper. Returns the number of Whisper models released. The daemon calls
+    it on its worker thread, so it never races with a running job.
+    """
+    released = 0
+    tr = sys.modules.get("vlcsubsync.transcribe")
+    if tr is not None:
+        released = int(tr.clear_cache() or 0)
+    vad = sys.modules.get("vlcsubsync.vad")
+    if vad is not None and getattr(vad, "_model", None) is not None:
+        lock = getattr(vad, "_lock", None)
+        with lock if lock is not None else contextlib.nullcontext():
+            vad._model = None
+    # faster-whisper caches the Silero session itself (functools.lru_cache), and its
+    # own vad_filter path uses the same cache: clear it, or nothing is freed.
+    fw_vad = sys.modules.get("faster_whisper.vad")
+    cached = getattr(fw_vad, "get_vad_model", None)
+    if cached is not None and hasattr(cached, "cache_clear"):
+        cached.cache_clear()
+    gc.collect()
+    _malloc_trim()
+    return released
+
+
+def _malloc_trim() -> None:
+    """Give freed heap back to the OS (glibc keeps it otherwise)."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def rss_mb() -> float | None:
+    """Resident memory of this process in MiB (best effort, Linux only, for logs)."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/self/statm", encoding="ascii") as fh:
+                pages = int(fh.read().split()[1])
+            return pages * os.sysconf("SC_PAGE_SIZE") / 2**20
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 # --------------------------------------------------------------------------- priority

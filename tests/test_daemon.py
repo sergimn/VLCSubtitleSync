@@ -292,6 +292,33 @@ def test_mode_switch_cancels_running(env, first, second, cancels):
         h.wait_state("m_2", "done")
 
 
+@pytest.mark.parametrize(
+    "first,second,cancels",
+    [
+        ({}, {"mode": "exhaustive"}, False),  # already exhaustive via the config
+        ({"mode": "exhaustive"}, {"force": True}, False),  # forced, same effective mode
+        ({}, {"mode": "fast"}, True),
+        ({"mode": "fast"}, {"force": True}, True),
+    ],
+)
+def test_mode_switch_compares_effective_modes(env, first, second, cancels):
+    m1 = make_media(env)
+    runner = FakeRunner(block=True)
+    config = SimpleNamespace(model_en="base.en", model_multi="base", mode="exhaustive")
+    with Harness(env, runner, config_loader=lambda: config) as h:
+        h.submit("e_1", m1, sub_index=0, **first)
+        h.wait_state("e_1", "running")
+        h.submit("e_2", m1, sub_index=0, **second)
+        h.wait_state("e_2", "queued", "running", "done")
+        if cancels:
+            assert "Superseded" in h.wait_state("e_1", "error").message
+        else:
+            time.sleep(0.2)
+            assert h.status("e_1").state == "running"
+        runner.release.set()
+        h.wait_state("e_2", "done")
+
+
 def test_cache_hit_and_force(env):
     media = make_media(env)
     runner = FakeRunner()
@@ -685,3 +712,20 @@ def test_cache_key_includes_configured_mode(env):
     keys = {m: d.cache_key(job, src, Config(mode=m)) for m in ("fast", "thorough", "exhaustive")}
     assert len(set(keys.values())) == 3
     assert d.cache_key(job, src, Config(mode="bogus")) == keys["fast"]
+
+
+def test_unlink_retry_survives_a_transient_sharing_violation(tmp_path, monkeypatch):
+    target = tmp_path / "x.meta"
+    target.write_text("applied=1\n")
+    real_unlink = Path.unlink
+    calls = []
+
+    def flaky_unlink(self, *a, **kw):
+        calls.append(self)
+        if len(calls) < 3:
+            raise PermissionError(32, "being used by another process")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    D._unlink_retry(target, delay=0)
+    assert not target.exists() and len(calls) == 3

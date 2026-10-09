@@ -171,9 +171,11 @@ the keys and still loads `output`.
 Lua considers the daemon alive if `os.time() - time <= 10`.
 
 `<q>/control` (extension → intf; `cache=on|off` → daemon, see the result cache below): `sync_now=<counter>`, `auto=1|0`, optionally
-`sync_now_mode=exhaustive`, and `sync_mode=delay|track` once the "Experimental: no extra
+`sync_now_mode=exhaustive`, `sync_mode=delay|track` once the "Experimental: no extra
 track (live delay)" toggle was used (every control write keeps it; absent = the helper's
-config decides, from the `sync_mode=` of the last done status). intf reacts when `sync_now` increases; the
+config decides, from the `sync_mode=` of the last done status), and `messages=all|errors`
+once "Show all messages" was used (kept by every control write; absent = errors, see
+"On-screen messages"). intf reacts when `sync_now` increases; the
 `sync_now_mode` present in that same write becomes the request's `mode=` (absent =
 no `mode` key, i.e. the configured mode). "Sync now (exhaustive)" in the extension
 writes it; "Sync subtitles now" does not. `<q>/intf_state` (intf → extension,
@@ -254,6 +256,28 @@ In delay mode (below) a done result never calls `add_subtitle`.
 OSD messages via `vlc.osd.message(text, channel, "top-right", 3000000)`. A job with
 `mode=exhaustive` (or thorough) says so in its OSD/progress text: "Syncing subtitles
 (exhaustive, may take a while)… 42% – Transcribing 20/58 (exhaustive)".
+
+#### On-screen messages
+
+By default only errors reach the OSD; the rest is logged at debug level ("OSD (hidden,
+messages=errors): …") and still shows in the Status dialog through `intf_state`.
+`messages=all` in `<q>/control` ("Show all messages: ON" in the extension) shows
+everything, as 1.0.2 and earlier did. The intf picks the value up on its next tick.
+
+- Errors (always shown): `SubSync: cannot write request (see log)`, `SubSync helper not
+  running` (it could not be started), `SubSync: could not load synced subtitles`,
+  `SubSync: not synced (<message>) – keeping original timing` (the helper did not trust
+  its result, e.g. too few transcript matches or a language mismatch), `SubSync error:
+  <message>`, `SubSync: live delay needs a newer helper – keeping original timing`,
+  `SubSync: select a subtitle track first` ("Sync now" with subtitles disabled).
+- Informational (only with `messages=all`): `Syncing subtitles…` and its progress
+  updates, `SubSync helper not running – starting it…`, `Subtitles synced: <message>`
+  (also on re-selecting a synced track), `Subtitles synced (live delay, experimental):
+  <message>` with its "may pause playback" note, and the extension's confirmations
+  (`SubSync: sync requested`, the fallback's `Syncing subtitles…` and `Subtitles synced`,
+  the ON/OFF toggles, `SubSync: deleting cached results`, `SubSync: all messages ON`).
+- Extension dialogs are unaffected: they only open from a menu click and either report
+  an error, explain why the click did nothing yet, or are the Status window itself.
 
 ### Delay mode (experimental, off by default)
 

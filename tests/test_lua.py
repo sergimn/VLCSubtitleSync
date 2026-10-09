@@ -107,6 +107,7 @@ class Harness:
         self.lua.execute(f"dofile({str(script)!r})")
         self.S = g.subsync
         self.E = g.subsync_ext
+        self.messages = None  # kept in every control() write once show_all() ran
 
     # ---- mock helpers -------------------------------------------------------------
     def table(self, items):
@@ -193,7 +194,20 @@ class Harness:
         return str(out)
 
     def control(self, **kv):
+        if self.messages and "messages" not in kv:
+            kv["messages"] = self.messages
         write_kv(self.q / "control", kv)
+
+    def show_all(self):
+        """Turn "Show all messages" on (by default only errors reach the OSD)."""
+        self.messages = "all"
+        if self.S:
+            # what read_control() sets from messages=all; writing the control file
+            # here would also set the sync_now baseline
+            self.S.state.messages_all = True
+        else:
+            c = self.q / "control"
+            write_kv(c, {**(parse_kv(c) if c.exists() else {}), "messages": "all"})
 
     def intf_state(self) -> dict[str, str]:
         return parse_kv(self.q / "intf_state")
@@ -230,6 +244,7 @@ def test_windows_uri_decodes_to_drive_path(runtime, tmp_path):
 
 
 def test_request_written_with_ordinals_labels_and_decoded_path(h):
+    h.show_all()
     h.set_input(audio_sel=11, spu_sel=21)
     h.tick()
     assert h.requests() == []  # debounce
@@ -259,6 +274,7 @@ def hold(runtime, tmp_path):
     hh = Harness(runtime, tmp_path, INTF)
     hh.heartbeat()
     hh.init(hold=True)
+    hh.show_all()  # so the tests see which messages would be shown
     return hh
 
 
@@ -433,6 +449,7 @@ def test_non_file_uri_ignored(h):
 
 
 def test_done_adds_selects_and_memoizes(h):
+    h.show_all()
     h.set_input()
     h.settle()
     req = h.requests()[0]
@@ -528,6 +545,49 @@ def test_error_status_shows_osd(h):
     assert st["state"] == "error" and "Cannot decode audio" in st["last_result"]
 
 
+def test_default_osd_shows_only_errors(h):
+    """Progress and "Subtitles synced" stay off screen unless "Show all messages" is on."""
+    h.set_input()
+    h.settle()
+    req = h.requests()[0]
+    h.status(req["id"], state="running", progress="0.42", message="Transcribing 3/10")
+    h.tick(8)
+    out = h.finish(req["id"])
+    h.tick(2)
+    assert h.added() == [(out, True)]
+    assert h.osd() == []
+    assert any("OSD (hidden, messages=errors): Subtitles synced" in line for line in h.logs())
+    assert h.intf_state()["state"] == "done"  # the Status dialog still has it all
+    # a result that does not fit is an error: shown
+    h.select("spu-es", 21)
+    h.settle()
+    req = h.requests()[0]
+    h.finish(req["id"], message="not synced: too few transcript matches (3)", applied=0)
+    h.tick(2)
+    assert h.osd() == [
+        "SubSync: not synced (not synced: too few transcript matches (3)) – keeping original timing"
+    ]
+
+
+def test_show_all_messages_follows_control(h):
+    h.control(auto=1, sync_now=0, messages="all")
+    h.set_input()
+    h.settle()
+    assert "Syncing subtitles…" in h.osd()
+    assert any("on-screen messages: all" in line for line in h.logs())
+    n = len(h.osd())
+    h.control(auto=1, sync_now=0, messages="errors")
+    h.select("spu-es", 21)
+    h.settle()
+    assert h.requests()[0]["sub_index"] == "1"  # superseded the first one
+    assert len(h.osd()) == n
+    h.control(auto=1, sync_now=0, messages="all")
+    h.select("spu-es", 20)
+    h.settle()
+    assert h.requests()[0]["sub_index"] == "0"
+    assert len(h.osd()) == n + 1
+
+
 def test_not_applied_keeps_original(h):
     h.set_input()
     h.settle()
@@ -571,6 +631,7 @@ def test_control_auto_off_and_sync_now(h):
 
 
 def test_default_requests_have_no_mode(h):
+    h.show_all()
     h.set_input()
     h.settle()
     assert "mode" not in h.requests()[0]
@@ -578,6 +639,7 @@ def test_default_requests_have_no_mode(h):
 
 
 def test_sync_now_exhaustive_writes_mode_and_warns(h):
+    h.show_all()
     h.control(auto=0, sync_now=1)  # baseline
     h.set_input()
     h.settle()
@@ -635,6 +697,7 @@ def test_missing_heartbeat_warns_once_and_tries_autostart(runtime, tmp_path):
     hh.S.getenv = lambda name: env.get(name)
     hh.S.execute = lambda cmd: calls.append(cmd) or 0
     hh.init()
+    hh.show_all()
     hh.set_input()
     hh.settle()
     assert len(hh.requests()) == 1  # still queued for when the daemon comes up
@@ -687,6 +750,7 @@ def launcher_harness(runtime, tmp_path, *, windows, mode="spawn", exe=None, args
 def test_windows_launcher_spawns_gui_exe_when_no_heartbeat(runtime, tmp_path):
     hh, calls, qp, exe = launcher_harness(runtime, tmp_path, windows=True)
     hh.init()
+    hh.show_all()
     # started at VLC startup, from the launcher's absolute path, without waiting
     assert calls == [f'start "" /B "{exe}"']
     assert any("starting helper" in line for line in hh.logs())
@@ -857,6 +921,7 @@ def start_delay(
 
 
 def test_delay_constant_offset(h):
+    h.show_all()
     start_delay(h, (None, None, 1.0, 2.5))
     assert spu_delay(h) == 2_500_000
     assert h.selected("spu-es") == 20  # the original track stays selected
@@ -874,6 +939,7 @@ def test_delay_constant_offset(h):
 
 
 def test_delay_negative_offset_sign(h):
+    h.show_all()
     """Subtitles 7 s late: audio = sub - 7 -> spu-delay -7 s (earlier)."""
     start_delay(h, (None, None, 1.0, -7.0), t0=30)
     assert spu_delay(h) == -7_000_000
@@ -1381,8 +1447,9 @@ def test_ext_descriptor_and_menu(ext):
         3: "Auto-sync: ON",
         4: "Status…",
         6: "Experimental: no extra track (live delay): OFF",
-        7: "Use cached results: ON",
-        8: "Delete cached results",
+        7: "Show all messages: OFF",
+        8: "Use cached results: ON",
+        9: "Delete cached results",
     }
 
 
@@ -1432,14 +1499,15 @@ def test_ext_fallback_sync_and_load(ext):
 
 
 def test_ext_sync_now_exhaustive_signals_running_intf(ext):
+    ext.show_all()
     write_intf_state(ext)
     ext.lua.eval("trigger_menu(2)")
     c = parse_kv(ext.q / "control")
-    assert c == {"auto": "1", "sync_now": "1", "sync_now_mode": "exhaustive"}
+    assert c == {"auto": "1", "sync_now": "1", "sync_now_mode": "exhaustive", "messages": "all"}
     assert any("may take a while" in o for o in ext.osd())
     # a plain "Sync subtitles now" afterwards drops the mode again
     ext.lua.eval("trigger_menu(1)")
-    assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "2"}
+    assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "2", "messages": "all"}
     assert ext.requests() == []
 
 
@@ -1463,6 +1531,7 @@ def test_intf_state_advertises_modes(h):
 
 
 def test_ext_fallback_exhaustive_request(ext):
+    ext.show_all()
     ext.heartbeat()
     ext.set_input()
     ext.lua.eval("trigger_menu(2)")
@@ -1511,13 +1580,19 @@ def test_ext_status_dialog_hints(ext):
 
 
 def test_ext_toggle_delay_mode_writes_control(ext):
+    ext.show_all()
     write_intf_state(ext)
     with open(ext.q / "intf_state", "a", encoding="utf-8") as fh:
         fh.write("sync_modes=track,delay\n")
     ext.control(auto=0, sync_now=5)
     assert dict(ext.lua.eval("menu()").items())[6].endswith("live delay): OFF")
     ext.lua.eval("trigger_menu(6)")
-    assert parse_kv(ext.q / "control") == {"auto": "0", "sync_now": "5", "sync_mode": "delay"}
+    assert parse_kv(ext.q / "control") == {
+        "auto": "0",
+        "sync_now": "5",
+        "sync_mode": "delay",
+        "messages": "all",
+    }
     assert dict(ext.lua.eval("menu()").items())[6] == (
         "Experimental: no extra track (live delay): ON"
     )
@@ -1549,57 +1624,89 @@ def test_ext_delay_toggle_with_old_intf_asks_for_restart(ext):
     assert "Restart VLC" in ext.mock.last_dialog.widgets[1].text
 
 
+def test_ext_show_all_messages_toggle(ext):
+    write_intf_state(ext)
+    ext.heartbeat(cache="on")
+    ext.control(auto=1, sync_now=3)
+    # default: the informational OSD of other items stays hidden
+    ext.lua.eval("trigger_menu(3)")
+    ext.lua.eval("trigger_menu(1)")
+    assert ext.osd() == []
+    ext.lua.eval("trigger_menu(4)")
+    assert "On-screen messages:</b> errors only" in ext.mock.last_dialog.widgets[1].text
+    ext.lua.eval("trigger_menu(7)")
+    assert parse_kv(ext.q / "control") == {"auto": "0", "sync_now": "4", "messages": "all"}
+    assert dict(ext.lua.eval("menu()").items())[7] == "Show all messages: ON"
+    assert ext.osd() == ["SubSync: all messages ON"]
+    ext.lua.eval("trigger_menu(4)")
+    assert "On-screen messages:</b> all" in ext.mock.last_dialog.widgets[1].text
+    # other control writes keep the choice
+    for item in (1, 2, 3, 8):
+        ext.lua.eval(f"trigger_menu({item})")
+        assert parse_kv(ext.q / "control")["messages"] == "all"
+    assert "SubSync: sync requested" in ext.osd()
+    ext.lua.eval("trigger_menu(7)")
+    assert parse_kv(ext.q / "control")["messages"] == "errors"
+    assert dict(ext.lua.eval("menu()").items())[7] == "Show all messages: OFF"
+    n = len(ext.osd())
+    ext.lua.eval("trigger_menu(1)")
+    assert len(ext.osd()) == n
+
+
 def test_ext_cache_toggle_writes_control(ext):
+    ext.show_all()
     write_intf_state(ext)
     ext.heartbeat(cache="on")
     ext.control(auto=0, sync_now=5, sync_mode="delay")
-    ext.lua.eval("trigger_menu(7)")
+    ext.lua.eval("trigger_menu(8)")
     assert parse_kv(ext.q / "control") == {
         "auto": "0",
         "sync_now": "5",
         "sync_mode": "delay",
         "cache": "off",
+        "messages": "all",
     }
-    assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: OFF"
+    assert dict(ext.lua.eval("menu()").items())[8] == "Use cached results: OFF"
     assert "SubSync cached results OFF" in ext.osd()
     ext.lua.eval("trigger_menu(4)")
     assert "Cached results:</b> not used" in ext.mock.last_dialog.widgets[1].text
     # other control writes keep the choice
-    for item in (1, 2, 3, 6):
+    for item in (1, 2, 3, 6, 7):
         ext.lua.eval(f"trigger_menu({item})")
         assert parse_kv(ext.q / "control")["cache"] == "off"
-    ext.lua.eval("trigger_menu(7)")
+    ext.lua.eval("trigger_menu(8)")
     assert parse_kv(ext.q / "control")["cache"] == "on"
-    assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: ON"
+    assert dict(ext.lua.eval("menu()").items())[8] == "Use cached results: ON"
 
 
 def test_ext_cache_menu_reflects_helper_config(ext):
     ext.heartbeat(cache="off")  # cache=off in config.ini
-    assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: OFF"
-    ext.lua.eval("trigger_menu(7)")  # toggling turns it on explicitly
+    assert dict(ext.lua.eval("menu()").items())[8] == "Use cached results: OFF"
+    ext.lua.eval("trigger_menu(8)")  # toggling turns it on explicitly
     assert parse_kv(ext.q / "control")["cache"] == "on"
 
 
 def test_ext_cache_toggle_accepts_helper_spellings(ext):
     ext.heartbeat(cache="on")
     ext.control(auto=1, sync_now=0, cache=" 0 ")  # hand-written; the helper reads it as off
-    assert dict(ext.lua.eval("menu()").items())[7] == "Use cached results: OFF"
+    assert dict(ext.lua.eval("menu()").items())[8] == "Use cached results: OFF"
 
 
 def test_ext_cache_toggle_without_helper_explains(ext):
-    ext.lua.eval("trigger_menu(7)")
+    ext.lua.eval("trigger_menu(8)")
     assert parse_kv(ext.q / "control")["cache"] == "off"
     assert "helper is not running" in ext.mock.last_dialog.widgets[1].text
 
 
 def test_ext_delete_cached_results(ext):
+    ext.show_all()
     ext.heartbeat(cache="on")
-    ext.lua.eval("trigger_menu(8)")
+    ext.lua.eval("trigger_menu(9)")
     assert "time" in parse_kv(ext.q / "clear_cache")
     assert "SubSync: deleting cached results" in ext.osd()
     (ext.q / "clear_cache").unlink()
     ext.heartbeat(age=600)  # helper gone: it deletes them once it starts
-    ext.lua.eval("trigger_menu(8)")
+    ext.lua.eval("trigger_menu(9)")
     assert (ext.q / "clear_cache").exists()
     assert "vlc-subsync clear-cache" in ext.mock.last_dialog.widgets[1].text
 
@@ -1607,8 +1714,8 @@ def test_ext_delete_cached_results(ext):
 def test_ext_cache_items_with_old_helper_ask_for_restart(ext):
     ext.heartbeat()  # no cache key: a helper from before these items
     ext.control(auto=1, sync_now=2)
-    ext.lua.eval("trigger_menu(7)")
     ext.lua.eval("trigger_menu(8)")
+    ext.lua.eval("trigger_menu(9)")
     assert parse_kv(ext.q / "control") == {"auto": "1", "sync_now": "2"}
     assert not (ext.q / "clear_cache").exists()
     assert "Restart VLC" in ext.mock.last_dialog.widgets[1].text

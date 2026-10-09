@@ -9,7 +9,10 @@
  "Use cached results: ON/OFF" (toggle, writes cache=on|off, read by the
  helper; absent = its config.ini, reported in <q>/heartbeat) and "Delete
  cached results" (writes <q>/clear_cache; the helper deletes its result
- cache and that file). Both are for debugging.
+ cache and that file). Both are for debugging. "Show all messages: ON/OFF"
+ (toggle, writes messages=all|errors): by default the extension and the
+ intf only show errors on screen; ON brings back progress and "Subtitles
+ synced" messages (see DESIGN.md "On-screen messages").
 
  It talks to the interface script (lua/intf/subsync.lua) only through
  <q>/control (written here: auto=1|0, sync_now=<counter>, plus
@@ -49,7 +52,8 @@ E.HEARTBEAT_MAX_AGE = 10
 -- VLC lists menu entries in id order.
 local MENU_SYNC, MENU_SYNC_EXH, MENU_AUTO, MENU_STATUS, MENU_LOAD = 1, 2, 3, 4, 5
 local MENU_DELAY = 6
-local MENU_CACHE, MENU_CLEAR = 7, 8
+local MENU_MESSAGES = 7
+local MENU_CACHE, MENU_CLEAR = 8, 9
 E.DELAY_LABEL = "Experimental: no extra track (live delay)"
 E.EXHAUSTIVE = "exhaustive"
 
@@ -173,6 +177,15 @@ local function osd(text)
     end
 end
 
+-- Not an error: shown only with "Show all messages" on.
+local function osd_info(text)
+    if E.messages_all() then
+        osd(text)
+    else
+        log_dbg("OSD (hidden, messages=errors): " .. text)
+    end
+end
+
 ---------------------------------------------------------------- shared files
 
 function E.read_control()
@@ -217,10 +230,22 @@ function E.cache_enabled()
     return not (hb and hb.cache == "off")
 end
 
+-- "all" or "errors" if the messages toggle was used, else nil (= errors only).
+function E.control_messages(c)
+    local m = trim((c or E.read_control()).messages or ""):lower()
+    if m == "all" or m == "errors" then return m end
+    return nil
+end
+
+-- "Show all messages" on: informational OSD messages are shown too.
+function E.messages_all()
+    return E.control_messages() == "all"
+end
+
 -- `mode` (optional) applies to this sync_now increment ("" / nil = default mode).
--- `sync_mode` "delay"/"track" and `cache` "on"/"off" set their toggles; nil keeps
--- the current value.
-function E.write_control(auto, sync_now, mode, sync_mode, cache)
+-- `sync_mode` "delay"/"track", `cache` "on"/"off" and `messages` "all"/"errors"
+-- set their toggles; nil keeps the current value.
+function E.write_control(auto, sync_now, mode, sync_mode, cache, messages)
     E.ensure_dirs()
     local kv = {
         { "auto", auto and 1 or 0 },
@@ -231,6 +256,8 @@ function E.write_control(auto, sync_now, mode, sync_mode, cache)
     if sync_mode then kv[#kv + 1] = { "sync_mode", sync_mode } end
     cache = cache or E.control_cache()
     if cache then kv[#kv + 1] = { "cache", cache } end
+    messages = messages or E.control_messages()
+    if messages then kv[#kv + 1] = { "messages", messages } end
     return E.write_kv(join(E.queue_dir(), "control"), kv)
 end
 
@@ -358,7 +385,7 @@ function E.check_job(load)
         local ok, err = pcall(vlc.input.add_subtitle, st.output, true)
         if not ok then return "Could not load subtitles: " .. tostring(err) end
         job.loaded = true
-        osd("Subtitles synced: " .. (st.message or ""))
+        osd_info("Subtitles synced: " .. (st.message or ""))
         return "Synced subtitles loaded: " .. (st.message or "")
     end
     return "Unknown state " .. tostring(state)
@@ -424,6 +451,8 @@ function E.status_html()
     if not E.cache_enabled() then
         parts[#parts + 1] = "<b>Cached results:</b> not used (every sync runs again)"
     end
+    parts[#parts + 1] = "<b>On-screen messages:</b> "
+        .. (E.messages_all() and "all" or "errors only")
     if ST.job then
         parts[#parts + 1] = "<b>Manual job:</b> " .. html_escape(E.check_job(false))
     end
@@ -488,13 +517,13 @@ function E.sync_now(mode)
             E.show_status("Cannot write control file: " .. tostring(err))
             return
         end
-        osd(exhaustive and "SubSync: exhaustive sync requested (may take a while)"
+        osd_info(exhaustive and "SubSync: exhaustive sync requested (may take a while)"
             or "SubSync: sync requested")
         return
     end
     local ok, why = E.fallback_sync(mode)
     if ok then
-        osd(exhaustive and "Syncing subtitles (exhaustive, may take a while)…"
+        osd_info(exhaustive and "Syncing subtitles (exhaustive, may take a while)…"
             or "Syncing subtitles…")
         E.show_status("Sync requested. The SubSync interface script is not running, so"
             .. " click “Load synced result” when the job is done (or reopen this dialog"
@@ -514,7 +543,7 @@ function E.toggle_auto()
     end
     local _, i_alive = E.intf_status()
     if i_alive then
-        osd("SubSync auto-sync " .. ((not auto) and "ON" or "OFF"))
+        osd_info("SubSync auto-sync " .. ((not auto) and "ON" or "OFF"))
     else
         E.show_status("Auto-sync is now " .. ((not auto) and "ON" or "OFF")
             .. ", but the interface script is not running.")
@@ -538,7 +567,7 @@ function E.toggle_delay()
         return
     end
     if i_alive then
-        osd("SubSync live delay (experimental) " .. (on and "ON" or "OFF"))
+        osd_info("SubSync live delay (experimental) " .. (on and "ON" or "OFF"))
     else
         E.show_status("Live delay mode is now " .. (on and "ON" or "OFF")
             .. ", but the interface script is not running.")
@@ -570,7 +599,7 @@ function E.toggle_cache()
         return
     end
     if d_alive then
-        osd("SubSync cached results " .. (on and "ON" or "OFF"))
+        osd_info("SubSync cached results " .. (on and "ON" or "OFF"))
     else
         E.show_status("Cached results are now " .. (on and "ON" or "OFF")
             .. ". The helper is not running; it uses this setting once it starts.")
@@ -591,11 +620,26 @@ function E.clear_cache()
         return
     end
     if d_alive then
-        osd("SubSync: deleting cached results")
+        osd_info("SubSync: deleting cached results")
     else
         E.show_status("The helper is not running. It deletes the cached results when"
             .. " it starts, or run vlc-subsync clear-cache.")
     end
+end
+
+-- Show all messages on/off (messages=all|errors in <q>/control). Read by the
+-- intf on its next tick and by this extension; an older intf ignores it and
+-- keeps showing everything.
+function E.toggle_messages()
+    local c = E.read_control()
+    local on = not E.messages_all()
+    local ok, err = E.write_control(c.auto ~= "0", tonumber(c.sync_now) or 0, nil, nil, nil,
+        on and "all" or "errors")
+    if not ok then
+        E.show_status("Cannot write control file: " .. tostring(err))
+        return
+    end
+    osd_info("SubSync: all messages ON")
 end
 
 ---------------------------------------------------------------- VLC hooks
@@ -728,6 +772,8 @@ function menu()
     m[MENU_STATUS] = "Status…"
     local okd, delay = pcall(E.delay_enabled)
     m[MENU_DELAY] = E.DELAY_LABEL .. ": " .. ((okd and delay) and "ON" or "OFF")
+    local okm, all = pcall(E.messages_all)
+    m[MENU_MESSAGES] = "Show all messages: " .. ((okm and all) and "ON" or "OFF")
     local okc, cache = pcall(E.cache_enabled)
     m[MENU_CACHE] = "Use cached results: " .. ((not okc or cache) and "ON" or "OFF")
     m[MENU_CLEAR] = "Delete cached results"
@@ -746,6 +792,8 @@ function trigger_menu(id)
             E.show_status(E.check_job(true))
         elseif id == MENU_DELAY then
             E.toggle_delay()
+        elseif id == MENU_MESSAGES then
+            E.toggle_messages()
         elseif id == MENU_CACHE then
             E.toggle_cache()
         elseif id == MENU_CLEAR then

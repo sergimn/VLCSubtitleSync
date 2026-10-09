@@ -357,6 +357,9 @@ end
 
 ---------------------------------------------------------------- OSD
 
+-- Errors are always shown; everything else (progress, "Subtitles synced", the
+-- helper being started) only with "Show all messages" on (messages=all in
+-- <q>/control), see DESIGN.md "On-screen messages".
 function M.osd(text)
     log_dbg("OSD: " .. text)
     if not (vlc.osd and type(vlc.osd.message) == "function") then return end
@@ -365,6 +368,14 @@ function M.osd(text)
         if ok and type(ch) == "number" then S.osd_channel = ch end
     end
     pcall(vlc.osd.message, text, S.osd_channel or 1, "top-right", M.OSD_DURATION)
+end
+
+function M.osd_info(text)
+    if S.messages_all then
+        M.osd(text)
+    else
+        log_dbg("OSD (hidden, messages=errors): " .. text)
+    end
 end
 
 ---------------------------------------------------------------- intf_state
@@ -447,6 +458,11 @@ function M.read_control()
             log_info("auto-sync " .. (auto and "enabled" or "disabled"))
             if not auto then S.pending = nil end
         end
+    end
+    local all = trim(tostring(c.messages or "")):lower() == "all"
+    if all ~= (S.messages_all or false) then
+        S.messages_all = all
+        log_info("on-screen messages: " .. (all and "all" or "errors only"))
     end
     local sm = trim(tostring(c.sync_mode or "")):lower()
     if not M.SYNC_MODES[sm] then sm = nil end
@@ -697,7 +713,7 @@ function M.delay_start(input, snap, entry, key)
             .. " VLC pauses playback that long in total while it gets there", dmin))
         text = text .. string.format(" – may pause playback up to %.0f s in total", -dmin)
     end
-    M.osd(text)
+    M.osd_info(text)
     S.state_dirty = true
 end
 
@@ -932,7 +948,7 @@ function M.submit(sel, force, mode, probe)
         M.set_state("waiting", "checking for a cached result", nil)
     else
         local text = M.syncing_text(mode)
-        M.osd(text)
+        M.osd_info(text)
         S.last_progress_osd = now_us()
         M.set_state("syncing", text, nil)
     end
@@ -947,7 +963,7 @@ function M.warn_daemon()
     S.daemon_warned = true
     local started = M.try_autostart()
     if started then
-        M.osd("SubSync helper not running – starting it…")
+        M.osd_info("SubSync helper not running – starting it…")
     else
         M.osd("SubSync helper not running")
     end
@@ -1018,7 +1034,7 @@ function M.check_adding(input, snap)
     -- the new selection must not look like a user change
     S.last_spu, S.last_audio = snap.spu, snap.audio
     if a.select then
-        M.osd("Subtitles synced: " .. (e.message ~= "" and e.message or "done"))
+        M.osd_info("Subtitles synced: " .. (e.message ~= "" and e.message or "done"))
     end
     log_info("synced track es=" .. tostring(es) .. " for " .. e.audio .. "|" .. e.sub)
     return false
@@ -1076,7 +1092,7 @@ function M.fire(input, snap, sel, force)
                 log_dbg("re-selecting synced track " .. m.es)
                 select_spu(input, m.es)
                 S.last_spu = m.es
-                M.osd("Subtitles synced: " .. (m.message ~= "" and m.message or "done"))
+                M.osd_info("Subtitles synced: " .. (m.message ~= "" and m.message or "done"))
             end
             return
         end
@@ -1128,7 +1144,7 @@ function M.handle_status(input, snap)
         if text ~= job.last_text and t - (S.last_progress_osd or 0) >= M.OSD_PROGRESS_US then
             job.last_text = text
             S.last_progress_osd = t
-            M.osd(text)
+            M.osd_info(text)
         end
         return
     end

@@ -27,7 +27,7 @@
       "description": "Runner versions in workflow matrices (os: [ubuntu-24.04, ...]); the github-actions manager only reads plain runs-on values",
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
-      "matchStrings": ["\\b(?<depName>ubuntu|macos|windows)-(?<currentValue>\\d[\\w.-]*?)(?=\\s*[,\\]])"],
+      "matchStrings": ["\\b(?<depName>ubuntu|macos|windows)-(?<currentValue>\\d[\\w.-]*?)\\s*[,\\]]"],
       "datasourceTemplate": "github-runners",
       "versioningTemplate": "docker"
     }

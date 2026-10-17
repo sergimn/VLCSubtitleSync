@@ -410,10 +410,26 @@ def run_doctor(out=print, ctx=None) -> int:
     except Exception as exc:  # noqa: BLE001
         item("config", f"error: {exc}", False)
     try:
-        import ctranslate2
+        from . import gpu as G
 
-        n = ctranslate2.get_cuda_device_count()
-        item("CUDA", f"{n} device(s)" if n else "not available (CPU will be used)")
+        # informational (ok=None): the CPU works, a GPU is only faster
+        if ctx.platform == "macos":
+            item("CUDA", "not available on macOS (CPU will be used)")
+        else:
+            st = G.gpu_status(ctx)
+            hint: list[str] | tuple[str, ...] = ()
+            if st.gpu is None:
+                item("CUDA", "no NVIDIA GPU found (CPU will be used)")
+            elif st.usable:
+                item("CUDA", f"{st.gpu}: libraries found (GPU will be used)", True)
+            elif not st.driver_ok:
+                item("CUDA", f"{st.gpu}, but CUDA sees no device (CPU will be used)")
+                hint = G.DRIVER_HINT
+            else:
+                item("CUDA", f"{st.gpu}, but missing {', '.join(st.missing)} (CPU will be used)")
+                hint = G.install_hint(ctx, st.missing)
+            for line in hint:
+                out(f"          {line}")
     except Exception as exc:  # noqa: BLE001
         item("CUDA", f"unknown ({exc})")
 

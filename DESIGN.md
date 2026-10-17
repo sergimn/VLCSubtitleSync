@@ -532,6 +532,15 @@ mode, default track; reported to the intf in each done status). Invalid values a
 ignored (default kept).
 The daemon loads the config for every job.
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
+ctranslate2 loads cuBLAS for CUDA 12 at run time and does not ship it (4.8.3's binary
+names only `libcublas.so.12` and the driver's `libcuda.so.1`: no cuDNN), and
+`get_cuda_device_count()` counts GPUs through the driver alone. So `setup` (last step)
+and `doctor` find the GPU (`nvidia-smi -L`, else the device count), require a device
+count > 0 (else: driver too old for CUDA 12), and try to load the CUDA library files
+named in the installed ctranslate2 binary (`gpu.py`). With a GPU but missing
+libraries they name the packages for the package manager found. They report only and
+install nothing. The check runs in setup's environment, not the helper's: the README
+asks for a system-wide install.
 
 ## Installation UX
 * Linux/macOS: `curl -LsSf https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.sh | sh`

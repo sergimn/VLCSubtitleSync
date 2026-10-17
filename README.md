@@ -103,26 +103,36 @@ for it.
 
 ### NVIDIA GPU
 
-SubSync uses an NVIDIA GPU automatically when two CUDA 12 libraries are installed:
-cuBLAS for CUDA 12 and cuDNN 9 for CUDA 12. The NVIDIA driver alone is not enough,
-and CUDA 13 versions do not work. Without them SubSync runs on the CPU, which works
-but is slower.
+SubSync uses an NVIDIA GPU automatically when **cuBLAS for CUDA 12** is installed
+(`libcublas.so.12`, or `cublas64_12.dll` on Windows). The NVIDIA driver alone is not
+enough, and CUDA 13 versions do not work. Without it SubSync runs on the CPU, which
+works but is slower. cuDNN is not needed.
 
-At the end, the installer checks for these libraries. If you have an NVIDIA GPU and
-they are missing, it names the packages to install. `vlc-subsync doctor` shows the
-same. SubSync does not install them for you.
+At the end, the installer checks for this library. If you have an NVIDIA GPU and it
+is missing, it names the package to install. `vlc-subsync doctor` shows the same.
+SubSync does not install it for you.
 
 | System | What to install |
 |---|---|
-| Debian, Ubuntu | `sudo apt install libcublas12 libcublaslt12` (Ubuntu multiverse, Debian non-free), and `libcudnn9-cuda-12` from [NVIDIA's CUDA repository](https://developer.nvidia.com/cudnn-downloads) |
-| Fedora, RHEL, openSUSE, SLES | `libcublas-12-9` and `libcudnn9-cuda-12` from [NVIDIA's CUDA repository](https://developer.nvidia.com/cuda-downloads) |
-| Arch | the `cuda` package is CUDA 13, which does not work: install CUDA 12 builds of cuBLAS and cuDNN 9, for example from the AUR |
-| Windows | from NVIDIA, the [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-toolkit-archive) (it includes cuBLAS) and [cuDNN 9](https://developer.nvidia.com/cudnn-downloads) for CUDA 12, with their `bin` folders on `PATH` |
+| Ubuntu 24.04+, Debian 13+ | `sudo apt install libcublas12` (Ubuntu multiverse, Debian non-free) |
+| Older Ubuntu and Debian | `libcublas-12-9` from [NVIDIA's CUDA repository](https://developer.nvidia.com/cuda-downloads) |
+| Fedora, RHEL, openSUSE, SLES | `libcublas-12-9` from [NVIDIA's CUDA repository](https://developer.nvidia.com/cuda-downloads) |
+| Arch | the `cuda` package is CUDA 13, which does not work: install a CUDA 12 build, for example the AUR package `cuda12.0` |
+| Windows | the [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-toolkit-archive) from NVIDIA (it includes cuBLAS), with its `bin` folder on `PATH` |
 | macOS | nothing: there is no CUDA on macOS, so SubSync runs on the CPU |
 
 Not every NVIDIA repository has CUDA 12 builds. At the time of writing, its
-repositories for RHEL 9 and openSUSE/SLES 15 do, but those for newer Fedora releases
-only have CUDA 13. After installing the libraries, restart VLC.
+repositories for RHEL 9, Fedora 41 and openSUSE/SLES 15 do, but those for newer Fedora
+releases only have CUDA 13.
+
+Install the library system-wide. The helper that VLC starts does not see a
+`LD_LIBRARY_PATH` or `PATH` set only in your shell, so a library found that way can
+fool the check while the helper still runs on the CPU. Then restart VLC. On Windows,
+if the GPU is still not used after installing the CUDA Toolkit, sign out and back in
+so that VLC gets the new `PATH`.
+
+If the installer says the GPU was found but CUDA cannot use it, the NVIDIA driver is
+too old for CUDA 12: update it (version 525 or newer; Windows: 527 or newer).
 
 ## How it works
 

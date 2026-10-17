@@ -1572,10 +1572,12 @@ def run_setup(
         ctx.warn("VLC is running: restart VLC so the new settings take effect")
 
     # last, so a missing-library notice is what the user reads before "Done!"
+    gpu = None
     try:
-        G.report(ctx)
+        gpu = G.report(ctx)
     except Exception as exc:  # noqa: BLE001
         ctx.info(f"GPU check skipped ({exc})")
+    cpu_only = gpu is not None and gpu.gpu is not None and not gpu.usable
 
     ctx.out("")
     if ctx.errors:
@@ -1588,6 +1590,8 @@ def run_setup(
             "Done! Open a video in VLC and pick a subtitle track: it will be synced "
             "automatically.\nUse View > 'SubSync' in VLC for manual control."
         )
+        if cpu_only:
+            ctx.out("Whisper will run on the CPU (slower): see 'GPU' above for what to install.")
     return 0
 
 

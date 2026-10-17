@@ -255,3 +255,17 @@ def synth() -> type[_SynthKit]:
 def _keep_test_process_priority(monkeypatch):
     """``serve()`` lowers its own priority; in tests it would hit pytest's process."""
     monkeypatch.setenv("VLC_SUBSYNC_PRIORITY", "normal")
+
+
+# --------------------------------------------------------------------------------------
+# GPU check: never probe the test machine's GPU
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cuda_devices(monkeypatch):
+    """setup and doctor run the GPU check; on a machine with an NVIDIA GPU the real
+    probe would change their output. Tests that want a GPU pass their own probes."""
+    import vlcsubsync.gpu as G
+
+    monkeypatch.setattr(G, "cuda_device_count", lambda: 0)

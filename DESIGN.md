@@ -532,6 +532,11 @@ mode, default track; reported to the intf in each done status). Invalid values a
 ignored (default kept).
 The daemon loads the config for every job.
 `device=auto` tries CUDA and silently falls back to CPU on any load error.
+ctranslate2 loads cuBLAS for CUDA 12 and cuDNN 9 at run time and does not ship them,
+and `get_cuda_device_count()` counts GPUs through the driver alone. So `setup` (last
+step) and `doctor` check for an NVIDIA GPU with `nvidia-smi -L` and try to load the
+library files (`gpu.py`). With a GPU but missing libraries they name the packages
+to install for the package manager found. They report only and install nothing.
 
 ## Installation UX
 * Linux/macOS: `curl -LsSf https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.sh | sh`

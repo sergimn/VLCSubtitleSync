@@ -92,7 +92,7 @@ From the menu **View → SubSync** you can:
 ### How long does it take?
 
 The first sync of a file usually takes **30–90 seconds on a typical CPU** (seconds
-with an NVIDIA GPU). SubSync only transcribes a few 30-second samples spread over the
+with an [NVIDIA GPU](#nvidia-gpu)). SubSync only transcribes a few 30-second samples spread over the
 file, not the whole movie. Playback continues normally meanwhile.
 
 The section check (see *How it works*) may transcribe a few extra samples: at most
@@ -100,6 +100,29 @@ The section check (see *How it works*) may transcribe a few extra samples: at mo
 one adds a second or so (one extra sample on a 28-minute episode: 19.2 s instead of
 19.1 s). Set `verify_windows=0` in `config.ini` to never transcribe extra samples
 for it.
+
+### NVIDIA GPU
+
+SubSync uses an NVIDIA GPU automatically when two CUDA 12 libraries are installed:
+cuBLAS for CUDA 12 and cuDNN 9 for CUDA 12. The NVIDIA driver alone is not enough,
+and CUDA 13 versions do not work. Without them SubSync runs on the CPU, which works
+but is slower.
+
+At the end, the installer checks for these libraries. If you have an NVIDIA GPU and
+they are missing, it names the packages to install. `vlc-subsync doctor` shows the
+same. SubSync does not install them for you.
+
+| System | What to install |
+|---|---|
+| Debian, Ubuntu | `sudo apt install libcublas12 libcublaslt12` (Ubuntu multiverse, Debian non-free), and `libcudnn9-cuda-12` from [NVIDIA's CUDA repository](https://developer.nvidia.com/cudnn-downloads) |
+| Fedora, RHEL, openSUSE, SLES | `libcublas-12-9` and `libcudnn9-cuda-12` from [NVIDIA's CUDA repository](https://developer.nvidia.com/cuda-downloads) |
+| Arch | the `cuda` package is CUDA 13, which does not work: install CUDA 12 builds of cuBLAS and cuDNN 9, for example from the AUR |
+| Windows | from NVIDIA, the [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-toolkit-archive) (it includes cuBLAS) and [cuDNN 9](https://developer.nvidia.com/cudnn-downloads) for CUDA 12, with their `bin` folders on `PATH` |
+| macOS | nothing: there is no CUDA on macOS, so SubSync runs on the CPU |
+
+Not every NVIDIA repository has CUDA 12 builds. At the time of writing, its
+repositories for RHEL 9 and openSUSE/SLES 15 do, but those for newer Fedora releases
+only have CUDA 13. After installing the libraries, restart VLC.
 
 ## How it works
 
@@ -345,7 +368,13 @@ vlc-subsync doctor
 
 It checks every VLC installation it finds (Lua scripts, `vlcrc` settings, queue
 folder), how the helper is started with VLC and whether it is running, the models and
-CUDA. The helper not running is normal while VLC is closed. Things to try:
+whether an NVIDIA GPU can be used. The helper not running is normal while VLC is
+closed. Things to try:
+
+- **Syncing is slow although I have an NVIDIA GPU**: look at the `CUDA` line of
+  `vlc-subsync doctor`. If it lists missing libraries, install the packages it names
+  (see [NVIDIA GPU](#nvidia-gpu)) and restart VLC. When the GPU cannot be used, the
+  helper log says `falling back to CPU`.
 
 - **Nothing happens when I pick a subtitle**: restart VLC after installing. The
   script is loaded when VLC starts. Check *Tools → Messages* (verbosity 2) for lines

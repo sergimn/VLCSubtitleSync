@@ -40,6 +40,7 @@ from typing import Any
 
 from . import __version__
 from . import daemon as D
+from . import gpu as G
 from . import protocol as P
 
 SERVICE_NAME = "vlc-subsync.service"
@@ -1569,6 +1570,12 @@ def run_setup(
     if is_vlc_running(ctx):
         ctx.step("Note")
         ctx.warn("VLC is running: restart VLC so the new settings take effect")
+
+    # last, so a missing-library notice is what the user reads before "Done!"
+    try:
+        G.report(ctx)
+    except Exception as exc:  # noqa: BLE001
+        ctx.info(f"GPU check skipped ({exc})")
 
     ctx.out("")
     if ctx.errors:

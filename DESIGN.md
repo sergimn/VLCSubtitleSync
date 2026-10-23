@@ -152,13 +152,13 @@ Lua considers the daemon alive if `os.time() - time <= 10`.
 `<q>/control` (extension → intf; `cache=on|off` → daemon, see the result cache below): `sync_now=<counter>`, `auto=1|0`, optionally
 `sync_now_mode=exhaustive`, and `messages=all|errors` once "Show all messages" was used
 (kept by every control write; absent = errors, see "On-screen messages"). intf reacts
-when `sync_now` increases; the
-`sync_now_mode` present in that same write becomes the request's `mode=` (absent =
-no `mode` key, i.e. the configured mode). "Sync now (exhaustive)" in the extension
-writes it; "Sync subtitles now" does not. `<q>/intf_state` (intf → extension,
-display only, except `modes`): `state`, `message`, `last_result`, `modes` (the
-`sync_now_mode` values it understands; an intf from before sync modes lacks it, and
-the extension then asks for a VLC restart instead of claiming an exhaustive sync).
+when `sync_now` increases; the `sync_now_mode` present in that same write becomes the
+request's `mode=` (absent = no `mode` key, i.e. the configured mode). "Sync now
+(exhaustive)" in the extension writes it; "Sync subtitles now" does not.
+`<q>/intf_state` (intf → extension, display only, except `modes`): `state`, `message`,
+`last_result`, `modes` (the `sync_now_mode` values it understands; an intf from before
+sync modes lacks it, and the extension then asks for a VLC restart instead of claiming
+an exhaustive sync).
 
 `<q>/launcher` (setup → intf), see "Lifecycle":
 ```

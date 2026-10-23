@@ -170,7 +170,7 @@ class Harness:
         data = {"id": req_id, **kv}
         write_kv(self.q / "jobs" / f"{req_id}.status", data)
 
-    def finish(self, req_id: str, message="offset +2.35s, drift +4.1%", applied=1, **extra):
+    def finish(self, req_id: str, message="offset +2.35s, drift +4.1%", applied=1):
         out = self.q / "out" / f"{req_id}.srt"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("1\n00:00:01,000 --> 00:00:02,000\nHi\n", encoding="utf-8")
@@ -185,7 +185,6 @@ class Harness:
             offset="2.350",
             scale="1.0417",
             confidence="0.93",
-            **extra,
         )
         # the daemon deletes the request once picked up
         req = self.q / "requests" / f"{req_id}.req"

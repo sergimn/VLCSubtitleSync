@@ -29,24 +29,11 @@ _VALID_DEVICES = ("auto", "cpu", "cuda")
 MODES = ("fast", "thorough", "exhaustive")
 DEFAULT_MODE = "fast"
 
-# How VLC applies a result (see DESIGN.md "Delay mode"):
-#   track   load the re-timed file as an extra subtitle track (default)
-#   delay   EXPERIMENTAL: keep the original track and correct it live through the
-#           input's "spu-delay" variable, following the piecewise mapping
-SYNC_MODES = ("track", "delay")
-DEFAULT_SYNC_MODE = "track"
-
 
 def normalize_mode(value: object) -> str | None:
     """``value`` as one of :data:`MODES` (case-insensitive), or None if invalid/empty."""
     v = str(value or "").strip().lower()
     return v if v in MODES else None
-
-
-def normalize_sync_mode(value: object) -> str | None:
-    """``value`` as one of :data:`SYNC_MODES` (case-insensitive), or None."""
-    v = str(value or "").strip().lower()
-    return v if v in SYNC_MODES else None
 
 
 def mode_rank(mode: str) -> int:
@@ -71,8 +58,6 @@ def default_config_path() -> Path:
 @dataclass
 class Config:
     mode: str = DEFAULT_MODE  # fast | thorough | exhaustive (see MODES)
-    # track | delay (see SYNC_MODES); "delay" is experimental and off by default
-    sync_mode: str = DEFAULT_SYNC_MODE
     model_en: str = "base.en"
     model_multi: str = "base"
     device: str = "auto"  # auto | cpu | cuda
@@ -94,10 +79,6 @@ class Config:
     @property
     def effective_mode(self) -> str:
         return normalize_mode(self.mode) or DEFAULT_MODE
-
-    @property
-    def effective_sync_mode(self) -> str:
-        return normalize_sync_mode(self.sync_mode) or DEFAULT_SYNC_MODE
 
     def with_mode(self, mode: str | None) -> Config:
         """Copy of this config with ``mode`` replaced (None/invalid → unchanged copy)."""
@@ -211,10 +192,6 @@ class Config:
                 m = normalize_mode(value)
                 if m:
                     self.mode = m
-            elif key == "sync_mode":
-                sm = normalize_sync_mode(value)
-                if sm:
-                    self.sync_mode = sm
             elif key == "device":
                 if value.lower() in _VALID_DEVICES:
                     self.device = value.lower()

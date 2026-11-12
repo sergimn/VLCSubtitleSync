@@ -40,6 +40,7 @@ from typing import Any
 
 from . import __version__
 from . import daemon as D
+from . import gpu as G
 from . import protocol as P
 
 SERVICE_NAME = "vlc-subsync.service"
@@ -1570,6 +1571,14 @@ def run_setup(
         ctx.step("Note")
         ctx.warn("VLC is running: restart VLC so the new settings take effect")
 
+    # last, so a missing-library notice is what the user reads before "Done!"
+    gpu = None
+    try:
+        gpu = G.report(ctx)
+    except Exception as exc:  # noqa: BLE001
+        ctx.info(f"GPU check skipped ({exc})")
+    cpu_only = gpu is not None and gpu.gpu is not None and not gpu.usable
+
     ctx.out("")
     if ctx.errors:
         ctx.out(f"Setup finished with {len(ctx.errors)} error(s).")
@@ -1581,6 +1590,8 @@ def run_setup(
             "Done! Open a video in VLC and pick a subtitle track: it will be synced "
             "automatically.\nUse View > 'SubSync' in VLC for manual control."
         )
+        if cpu_only:
+            ctx.out("Whisper will run on the CPU (slower): see 'GPU' above for what to install.")
     return 0
 
 

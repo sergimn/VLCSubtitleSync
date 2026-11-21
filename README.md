@@ -363,7 +363,7 @@ uv venv && uv pip install -e ".[dev]"
 .venv/bin/pre-commit run --all-files
 ```
 
-Dependency updates are proposed by [Renovate](https://docs.renovatebot.com/) (`renovate.json`): CI tooling and dev extras are grouped and automerged when CI passes; runtime dependencies always get a PR for manual review.
+Dependency updates are proposed by [Renovate](https://docs.renovatebot.com/) (`renovate.json`) on Sundays: CI tooling (GitHub Actions, pre-commit hooks, the CI ruff pin) and CI runner images are grouped and automerged when CI passes. The Python dependencies in `pyproject.toml` are minimum versions (`>=`), which Renovate leaves as they are, so every install gets the newest release.
 
 Test markers:
 

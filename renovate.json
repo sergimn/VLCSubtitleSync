@@ -3,11 +3,10 @@
   "extends": [
     "config:recommended",
     ":semanticCommits",
-    ":maintainLockFilesWeekly",
     "helpers:pinGitHubActionDigestsToSemver"
   ],
   "timezone": "Europe/Madrid",
-  "schedule": ["before 6am on monday"],
+  "schedule": ["on sunday"],
   "minimumReleaseAge": "14 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
   "internalChecksFilter": "strict",
@@ -55,14 +54,14 @@
     },
     {
       "description": "Dev extras (pytest, ruff, lupa, piper-tts) are low risk",
-      "matchManagers": ["pep621"],
+      "matchManagers": ["pep621", "poetry"],
       "matchDepTypes": ["project.optional-dependencies"],
       "groupName": "dev dependencies",
       "automerge": true
     },
     {
       "description": "Runtime deps affect users: never automerge, one PR per package",
-      "matchManagers": ["pep621"],
+      "matchManagers": ["pep621", "poetry"],
       "matchDepTypes": ["project.dependencies"],
       "automerge": false
     }

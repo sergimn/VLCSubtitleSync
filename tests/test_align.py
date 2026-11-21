@@ -383,7 +383,8 @@ def test_retime_dense_negative_prefix_never_moves_real_cues():
     times = neg + good
     out = retime(times, m)
     _check_retimed(times, out)
-    assert out[100:] == pytest.approx([(s - 10.0, e - 10.0) for s, e in good])
+    # approx() in pytest >= 9.2 rejects a list of tuples; a 2-D array works.
+    assert np.array(out[100:]) == pytest.approx(np.array([(s - 10.0, e - 10.0) for s, e in good]))
     assert all(0.0 <= s and e <= 0.5 + 1e-9 for s, e in out[:100])
 
 
@@ -754,8 +755,8 @@ def test_short_segment_from_one_biased_window_is_folded(synth):
     out, _anchors = subdivide(fit, anchors, cues, probe, None, 0.01, len(windows))
     assert len(probes) == 1 and not 60.0 <= probes[0] <= 90.0  # away from the bad window
     assert out.details["verify_folded"] == 1
-    assert [(s.scale, s.offset) for s in out.mapping.segments] == pytest.approx(
-        [(1.0, 2.0)], abs=0.05
+    assert np.array([(s.scale, s.offset) for s in out.mapping.segments]) == pytest.approx(
+        np.array([(1.0, 2.0)]), abs=0.05
     )
 
 

@@ -6,6 +6,9 @@
 # Environment:
 #   VLC_SUBSYNC_SOURCE     package source (default: GitHub main branch archive);
 #                          may be a local checkout directory for testing
+#   VLC_SUBSYNC_CONSTRAINTS  dependency versions to install, as a constraints file or URL
+#                          (default: a release's installer uses the versions that release
+#                          was tested with; "none" installs the newest ones)
 #   VLC_SUBSYNC_PYTHON     Python version or uv Python request (default 3.12; x64 Python
 #                          on Windows on ARM, where the speech engine has no ARM64 build)
 #   VLC_SUBSYNC_UNINSTALL  set to 1 to uninstall (for `irm | iex`, which takes no args)
@@ -18,8 +21,18 @@ param(
 $ErrorActionPreference = 'Stop'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
+# The release workflow (scripts/release_assets.py) points these two at the release's
+# wheel and at the dependency versions its CI tested (constraints.txt, from uv.lock).
 $DefaultSource = 'https://github.com/sergimn/VLCSubtitleSync/archive/refs/heads/main.zip'
+$DefaultConstraints = ''
 $Source = if ($env:VLC_SUBSYNC_SOURCE) { $env:VLC_SUBSYNC_SOURCE } else { $DefaultSource }
+$Constraints = $DefaultConstraints
+# The default versions belong to the default source: another source gets none unless asked.
+if ($env:VLC_SUBSYNC_SOURCE) { $Constraints = '' }
+if ($env:VLC_SUBSYNC_CONSTRAINTS) { $Constraints = $env:VLC_SUBSYNC_CONSTRAINTS }
+if ($Constraints -eq 'none') { $Constraints = '' }
+# uv older than this has no `uv tool install --constraints` (or no remote constraints files)
+$MinUv = [version]'0.6.0'
 $PyVer = if ($env:VLC_SUBSYNC_PYTHON) { $env:VLC_SUBSYNC_PYTHON } else { '3.12' }
 $VcRedistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
 if ($env:VLC_SUBSYNC_UNINSTALL -eq '1') { $Uninstall = $true }
@@ -38,6 +51,14 @@ function Find-Uv {
         (Join-Path $env:LOCALAPPDATA 'Programs\uv\uv.exe')
     )
     foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
+    return $null
+}
+
+function Get-UvVersion($uv) {
+    $out = (& $uv --version) | Select-Object -First 1
+    if ("$out" -match '^uv (\d+)\.(\d+)\.(\d+)') {
+        return [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+    }
     return $null
 }
 
@@ -156,9 +177,27 @@ function Invoke-Main {
         $spec = 'vlc-subsync @ ' + ([System.Uri]$abs).AbsoluteUri
     }
 
-    Say "Installing vlc-subsync with Python $PyVer (this downloads ~200 MB the first time)"
-    & $uv tool install --force --python $PyVer $spec
-    if ($LASTEXITCODE -ne 0) { Fail 'package installation failed' }
+    $installArgs = @('tool', 'install', '--force', '--python', $PyVer)
+    if ($Constraints) {
+        $have = Get-UvVersion $uv
+        if (-not $have -or $have -lt $MinUv) {
+            $shown = if ($have) { "uv $have" } else { 'This uv' }
+            Fail ("$shown is too old for this installer (it needs uv $MinUv or newer). " +
+                "Update uv (`"$uv`" self update, or the package manager it came from) and run this again")
+        }
+        $installArgs += @('--constraints', $Constraints)
+        Say "Installing vlc-subsync with Python $PyVer and the dependency versions it was tested with (this downloads ~200 MB the first time)"
+    } else {
+        Say "Installing vlc-subsync with Python $PyVer (this downloads ~200 MB the first time)"
+    }
+    & $uv @installArgs $spec
+    if ($LASTEXITCODE -ne 0) {
+        if ($Constraints) {
+            Fail ('package installation failed. If it says a pinned version has no build for this computer, ' +
+                'set VLC_SUBSYNC_CONSTRAINTS=none to install the newest versions instead')
+        }
+        Fail 'package installation failed'
+    }
 
     $bin = Get-ToolBinDir $uv
     if (-not $bin) { Fail 'cannot determine the uv tool bin directory' }

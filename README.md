@@ -40,7 +40,8 @@ powershell -c "irm https://github.com/sergimn/VLCSubtitleSync/releases/latest/do
 ```
 
 Then **restart VLC**. The first install downloads about 200 MB (Python runtime,
-speech-recognition libraries and the English model). On Windows, if the Microsoft
+speech-recognition libraries and the English model). It installs the exact library
+versions that release was tested with. On Windows, if the Microsoft
 Visual C++ runtime is missing (most PCs already have it), the installer adds it and
 Windows asks once for permission. Windows on ARM PCs are supported (the helper runs
 as an x64 program under emulation).
@@ -365,7 +366,8 @@ uv sync --extra dev                # .venv with the exact versions pinned in uv.
 
 Python dependencies are pinned in `uv.lock`, direct and indirect ones alike, while
 `pyproject.toml` keeps minimum versions (`>=`). CI installs exactly the lock
-(`uv sync --locked`, which also fails if `pyproject.toml` changed without `uv lock`). After
+(`uv sync --locked`, which also fails if `pyproject.toml` changed without `uv lock`), and
+each release's installers install the same versions (see [Releasing](#releasing)). After
 changing a dependency in `pyproject.toml`, run `uv lock` and commit both files. `uv lock`
 only picks releases at least 14 days old (`exclude-newer` in `pyproject.toml`).
 
@@ -402,9 +404,11 @@ itself.
    already lists the PRs merged since the last release.
 2. Write the notes in that PR, then **merge** it. The tag moves to the merge commit and
    the GitHub Release is published with the notes and the assets: wheel, sdist, the
-   installers pinned to that release, and `SubSync-1.0.0.zip` (those installers plus an
-   `INSTALL.txt`: the file to upload to addons.videolan.org). **Closing** the PR without
-   merging cancels the release and deletes the tag.
+   installers pinned to that release, `constraints.txt` (the dependency versions from
+   `uv.lock` that those installers install, the same file CI's installer jobs use), and
+   `SubSync-1.0.0.zip` (those installers plus an `INSTALL.txt`: the file to upload to
+   addons.videolan.org). **Closing** the PR without merging cancels the release and
+   deletes the tag.
 
 The workflow opens the PR as GitHub Actions, which needs *Settings → Actions → General →
 Allow GitHub Actions to create and approve pull requests*.

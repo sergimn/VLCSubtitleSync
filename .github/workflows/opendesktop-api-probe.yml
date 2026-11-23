@@ -1,0 +1,74 @@
+name: OpenDesktop API probe
+
+# Throwaway, read-only check (2026-11-23): does api.opendesktop.org accept the
+# OCS write calls (content/edit, content/uploaddownload) once signed in? Never
+# changes the store listing: it makes no content/edit POST and sends no file.
+# Prints only status codes and messages, never account data, because the logs
+# of this repository are public.
+
+on:
+  push:
+    branches: [claude/project-thread-dfiabb]
+    paths: [.github/workflows/opendesktop-api-probe.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    env:
+      OD_USER: ${{ secrets.OPENDESKTOP_USERNAME }}
+      OD_PASS: ${{ secrets.OPENDESKTOP_PASSWORD }}
+    steps:
+      - name: Probe the OCS API
+        shell: python3 {0}
+        run: |
+          import base64, json, os, urllib.error, urllib.parse, urllib.request
+
+          BASE = "https://api.opendesktop.org/ocs/v1/"
+          PID = "2377843"
+          UA = "SubSync-release-probe (+https://github.com/sergimn/VLCSubtitleSync)"
+          user, pw = os.environ["OD_USER"], os.environ["OD_PASS"]
+          assert user and pw, "both secrets must be set"
+          auth = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+
+          def call(method, path, signed_in=True, form=None, show_data=False):
+              url = BASE + path + ("&" if "?" in path else "?") + "format=json"
+              body = urllib.parse.urlencode(form).encode() if form is not None else None
+              req = urllib.request.Request(url, data=body, method=method)
+              req.add_header("User-Agent", UA)
+              if signed_in:
+                  req.add_header("Authorization", auth)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      http, raw = r.status, r.read()
+              except urllib.error.HTTPError as e:
+                  http, raw = e.code, e.read()
+              try:
+                  d = json.loads(raw)
+                  meta = {k: d.get(k) for k in ("status", "statuscode", "message")}
+                  data = d.get("data")
+                  if show_data:
+                      meta["data"] = data
+                  elif data:
+                      item = data[0] if isinstance(data, list) and data else data
+                      meta["data_keys"] = sorted(item)[:40] if isinstance(item, dict) else type(item).__name__
+              except ValueError:
+                  meta = {"non_json": raw[:200].decode(errors="replace")}
+              who = "signed in" if signed_in else "anonymous"
+              print(f"{method:4} {path:34} {who:9} HTTP {http}  {json.dumps(meta)}")
+
+          # Is the sign-in itself accepted?
+          call("POST", "person/check", signed_in=False, form={"login": user, "password": pw})
+          call("GET", "person/self", signed_in=False)
+          call("GET", "person/self")
+          # A known read route, signed in.
+          call("GET", f"content/data/{PID}")
+          # The write routes the spec defines. GETs and an empty upload only:
+          # nothing here can change the listing.
+          call("GET", "content/add")
+          call("GET", f"content/edit/{PID}")
+          call("GET", f"content/uploaddownload/{PID}")
+          call("POST", f"content/uploaddownload/{PID}", form={})

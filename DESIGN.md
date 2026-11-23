@@ -416,6 +416,12 @@ The daemon loads the config for every job.
 * Linux/macOS: `curl -LsSf https://github.com/sergimn/VLCSubtitleSync/releases/latest/download/install.sh | sh`
 * Windows: double-click `install.cmd` (or `irm …/install.ps1 | iex`).
 Steps: install `uv` if missing → `uv tool install --python 3.12 vlc-subsync@<archive url>`
+(a release's installers: `vlc-subsync@<release wheel> --constraints <release>/constraints.txt`,
+the dependency versions pinned in `uv.lock` that the release's CI tested; uv ≥ 0.5.6
+(the first with `uv tool install --constraints`) is required for that, otherwise the
+installer stops and asks to update uv; a local constraints file is passed as a `file://`
+URL, because uv splits a `--constraints` value at spaces;
+`VLC_SUBSYNC_CONSTRAINTS` names another file or URL, or `none` for the newest versions)
 (Windows on ARM: `cpython-3.12-windows-x86_64-none`, since ctranslate2 has no win_arm64
 wheels; the helper runs under x64 emulation) → on Windows, import the speech engine
 (`av, ctranslate2, onnxruntime, faster_whisper`) and, if that fails, install the

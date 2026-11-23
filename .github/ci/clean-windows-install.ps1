@@ -12,6 +12,9 @@ if (Test-Path (Join-Path $sys 'msvcp140.dll')) {
 foreach ($d in Get-ChildItem C:\sys -Filter *.dll) { Copy-Item $d.FullName $sys }
 
 $env:VLC_SUBSYNC_SOURCE = 'C:\src'
+# the versions a release pins (ci.yml downloads them into the checkout)
+$env:VLC_SUBSYNC_CONSTRAINTS = 'C:\src\ci-constraints\constraints.txt'
+if (-not (Test-Path $env:VLC_SUBSYNC_CONSTRAINTS)) { throw "missing $env:VLC_SUBSYNC_CONSTRAINTS" }
 cmd /c "C:\src\install.cmd --no-model < NUL"
 if ($LASTEXITCODE -ne 0) { throw "install.cmd failed ($LASTEXITCODE)" }
 if (-not (Test-Path (Join-Path $sys 'msvcp140.dll'))) { throw 'the Visual C++ runtime was not installed' }

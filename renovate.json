@@ -12,6 +12,14 @@
   "internalChecksFilter": "strict",
   "labels": ["dependencies"],
   "pre-commit": { "enabled": true },
+  "poetry": { "enabled": false },
+  "lockFileMaintenance": {
+    "description": "Weekly `uv lock --upgrade`, for the indirect dependencies (ctranslate2, onnxruntime, tokenizers, ...) that no rule below covers. The 14-day minimum age is enforced by uv itself here (exclude-newer in pyproject.toml): this PR has no release dates, so Renovate's own check would stay pending forever.",
+    "enabled": true,
+    "schedule": ["on sunday"],
+    "automerge": false,
+    "minimumReleaseAge": null
+  },
   "customManagers": [
     {
       "description": "ruff pinned in CI (RUFF_VERSION) follows the ruff-pre-commit rev in .pre-commit-config.yaml",
@@ -53,15 +61,21 @@
       "enabled": false
     },
     {
-      "description": "Dev extras (pytest, ruff, lupa, piper-tts) are low risk",
-      "matchManagers": ["pep621", "poetry"],
+      "description": "Python deps: keep the >= ranges in pyproject.toml and move the versions pinned in uv.lock. One branch per package (or group), not one per major and one per minor: Renovate runs `uv lock --upgrade-package <name>`, which always takes the newest version old enough, so a minor branch would lock the new major too.",
+      "matchManagers": ["pep621"],
+      "rangeStrategy": "update-lockfile",
+      "separateMajorMinor": false
+    },
+    {
+      "description": "Dev extras (pytest, ruff, lupa, pre-commit, piper-tts) are low risk",
+      "matchManagers": ["pep621"],
       "matchDepTypes": ["project.optional-dependencies"],
       "groupName": "dev dependencies",
       "automerge": true
     },
     {
-      "description": "Runtime deps affect users: never automerge, one PR per package",
-      "matchManagers": ["pep621", "poetry"],
+      "description": "Runtime deps reach users with the next release: never automerge, one PR per package",
+      "matchManagers": ["pep621"],
       "matchDepTypes": ["project.dependencies"],
       "automerge": false
     }

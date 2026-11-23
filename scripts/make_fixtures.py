@@ -33,7 +33,7 @@ onnxruntime build produces slightly different waveforms the truth stays exact.
 
 Regenerate::
 
-    uv pip install --python .venv piper-tts      # or: pip install -e .[fixtures]
+    uv sync --extra dev --extra fixtures         # or: pip install -e .[fixtures]
     .venv/bin/python scripts/make_fixtures.py all
     .venv/bin/python scripts/make_fixtures.py long --out /tmp/long --minutes 12
 
@@ -275,7 +275,7 @@ def synthesize(lang: str, voices_dir: Path) -> list[np.ndarray]:
     try:
         from piper import PiperVoice, SynthesisConfig
     except ImportError:  # pragma: no cover
-        sys.exit("piper-tts is required: uv pip install --python .venv piper-tts")
+        sys.exit("piper-tts is required: uv sync --extra dev --extra fixtures")
 
     loaded = []
     for name in VOICES[lang]:

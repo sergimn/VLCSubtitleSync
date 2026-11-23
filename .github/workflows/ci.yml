@@ -53,7 +53,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-26.04, macos-26, windows-2025]
-        python: ["3.10", "3.12"]
+        python: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -61,9 +61,9 @@ jobs:
           python-version: ${{ matrix.python }}
           activate-environment: true
           enable-cache: true
-          cache-dependency-glob: pyproject.toml
-      - name: Install
-        run: uv pip install -e ".[dev]"
+          cache-dependency-glob: uv.lock
+      - name: Install (the versions pinned in uv.lock)
+        run: uv sync --locked --extra dev
       - name: Install ffmpeg (media tests generate files with it)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
@@ -83,9 +83,9 @@ jobs:
           python-version: "3.12"
           activate-environment: true
           enable-cache: true
-          cache-dependency-glob: pyproject.toml
-      - name: Install
-        run: uv pip install -e ".[dev]"
+          cache-dependency-glob: uv.lock
+      - name: Install (the versions pinned in uv.lock)
+        run: uv sync --locked --extra dev
       - name: Cache Whisper models
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -114,9 +114,9 @@ jobs:
           python-version: "3.12"
           activate-environment: true
           enable-cache: true
-          cache-dependency-glob: pyproject.toml
-      - name: Install
-        run: uv pip install -e ".[dev]"
+          cache-dependency-glob: uv.lock
+      - name: Install (the versions pinned in uv.lock)
+        run: uv sync --locked --extra dev
       - name: Cache Whisper models
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -128,19 +128,59 @@ jobs:
         # -I dummy + --vout/--aout dummy need no display; xvfb-run only as a safety net
         run: xvfb-run -a pytest -m vlc -v -rA -s
 
+  constraints:
+    # The dependency versions a release's installers pin: uv.lock exported the way the
+    # release workflow does it. The installer jobs install with this file, so they test
+    # what users get. They do not set up uv themselves: the installers bring their own.
+    name: Pinned versions for the installers
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Export uv.lock as constraints.txt
+        run: |
+          python3 scripts/release_assets.py constraints constraints.txt
+          cat constraints.txt
+      - name: Every pinned version has a wheel for each platform the installers support
+        # uv lock's required-environments only covers packages that publish no sdist, and
+        # no job here runs on Linux ARM. A pin without a wheel would make users build it
+        # from source (FFmpeg for av, Rust for tokenizers), so check every pin, on the
+        # installers' Python. Apple Silicon needs macOS 14 already (av, onnxruntime).
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          for platform in x86_64-manylinux_2_28 aarch64-manylinux_2_28 \
+              aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
+            echo "$platform"
+            uv pip compile --no-config --quiet --only-binary :all: --python-version 3.12 \
+              --python-platform "$platform" --constraints constraints.txt pyproject.toml >/dev/null
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: constraints
+          path: constraints.txt
+
   installer:
     name: Installer (${{ matrix.os }})
+    needs: constraints
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         # windows-11-arm: the installer must pick x64 Python (no ARM64 ctranslate2 wheels)
-        os: [ubuntu-26.04, macos-26, windows-2025, windows-11-arm]
+        # macos-26-intel: Intel Macs get their own onnxruntime pin (the last with Intel wheels)
+        os: [ubuntu-26.04, macos-26, macos-26-intel, windows-2025, windows-11-arm]
     env:
       VLC_SUBSYNC_SOURCE: ${{ github.workspace }}
+      VLC_SUBSYNC_CONSTRAINTS: ${{ github.workspace }}/ci-constraints/constraints.txt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: constraints
+          path: ci-constraints
 
       - name: install.sh (no model download)
         if: runner.os != 'Windows'
@@ -170,6 +210,24 @@ jobs:
             [ -d "$c" ] && echo "$c" >> "$GITHUB_PATH"
           done
           true
+
+      - name: The installed dependencies are the pinned versions, and the speech engine loads
+        shell: bash
+        run: |
+          tool="$(uv tool dir --color never)/vlc-subsync"
+          py="$tool/bin/python"
+          [ -e "$py" ] || py="$tool/Scripts/python.exe"
+          [ -e "$py" ] || { echo "::error::no Python in the tool environment $tool"; exit 1; }
+          if ! out="$(uv pip install --python "$py" --dry-run -r "$VLC_SUBSYNC_CONSTRAINTS" 2>&1)"; then
+            echo "$out"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q "Would make no changes"
+          # (on Windows, install.ps1 has already checked this)
+          if [ "$RUNNER_OS" != Windows ]; then
+            "$py" -c "import av, ctranslate2, onnxruntime, faster_whisper; print('speech engine loads')"
+          fi
 
       - name: vlc-subsync doctor (retry while the daemon starts)
         shell: bash
@@ -231,10 +289,15 @@ jobs:
   installer-clean-windows:
     # Runners come with Python and the Visual C++ runtime; a fresh PC may have neither.
     name: Installer (fresh Windows container)
+    needs: constraints
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: constraints
+          path: ci-constraints # in the checkout, which the container sees as C:\src
       - name: install.cmd in mcr.microsoft.com/windows/servercore:ltsc2022
         shell: pwsh
         run: |
@@ -276,7 +339,7 @@ jobs:
     # tests/test_ci_workflow.py checks that `needs` lists every job in this file.
     name: All green
     if: always()
-    needs: [lint, unit, integration, e2e-vlc, installer, installer-clean-windows, build]
+    needs: [lint, unit, integration, e2e-vlc, constraints, installer, installer-clean-windows, build]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

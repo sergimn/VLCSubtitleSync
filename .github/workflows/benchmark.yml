@@ -41,9 +41,9 @@ jobs:
           python-version: "3.12"
           activate-environment: true
           enable-cache: true
-          cache-dependency-glob: pyproject.toml
-      - name: Install
-        run: uv pip install -e ".[dev]"
+          cache-dependency-glob: uv.lock
+      - name: Install (the versions pinned in uv.lock)
+        run: uv sync --locked --extra dev
       - name: Cache Whisper models
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

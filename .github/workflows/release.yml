@@ -8,8 +8,9 @@ name: Release
 #    to fill in (with the PRs merged since the last release already listed).
 # 2. Merge that PR to publish: the `publish` job moves the tag to the merge commit
 #    on main, builds from it and creates the GitHub Release with those notes and
-#    the assets (wheel, sdist, installers pinned to this release, and SubSync-X.Y.Z.zip
-#    with those installers, the file to upload to addons.videolan.org).
+#    the assets (wheel, sdist, installers pinned to this release, constraints.txt with
+#    the dependency versions they install, and SubSync-X.Y.Z.zip with those installers,
+#    the file to upload to addons.videolan.org).
 #    Close it without merging to cancel: the `cancel` job deletes the tag and branch.
 #
 # Needs Settings > Actions > General > "Allow GitHub Actions to create and approve
@@ -72,10 +73,14 @@ jobs:
             exit 1
           fi
 
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Bump the version
         run: |
           git switch -c "$BRANCH"
           python3 scripts/version.py set "$VERSION"
+          # uv.lock records the project's own version; relock so CI's `--locked` passes.
+          # This only rewrites that line: uv keeps every locked dependency version.
+          uv lock
       - name: Release notes skeleton
         run: |
           # The PRs merged since the latest release (or since the start, for the first one).
@@ -159,26 +164,27 @@ jobs:
 
       - name: Build sdist + wheel
         run: uv build
+      - name: Pinned dependency versions (constraints.txt, from uv.lock)
+        # the same export CI's installer jobs test with; fails if uv.lock is out of date
+        run: |
+          python3 scripts/release_assets.py constraints release/constraints.txt
+          cat release/constraints.txt
       - name: Smoke-test the wheel
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/smoke"
-          uv pip install --python "$RUNNER_TEMP/smoke" dist/*.whl
+          uv pip install --python "$RUNNER_TEMP/smoke" -c release/constraints.txt dist/*.whl
           out="$("$RUNNER_TEMP/smoke/bin/vlc-subsync" --version)"
           echo "$out"
           [ "$out" = "vlc-subsync $VERSION" ]
 
       - name: Assets
         run: |
-          mkdir -p release
-          # The released installers install this release's wheel, not the main branch.
+          # The released installers install this release's wheel with the dependency
+          # versions in its constraints.txt, not the main branch.
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
-          whl="$(basename dist/*.whl)"
-          sed "s#^DEFAULT_SOURCE=.*#DEFAULT_SOURCE=\"${base}/${whl}\"#" install.sh > release/install.sh
-          sed "s#^\$DefaultSource = '[^']*'#\$DefaultSource = '${base}/${whl}'#" install.ps1 > release/install.ps1
-          sed "s#https://raw.githubusercontent.com/[^/]*/[^/]*/main/install.ps1#${base}/install.ps1#" \
-            install.cmd > release/install.cmd
-          grep -q "${base}/${whl}" release/install.sh
-          grep -q "${base}/${whl}" release/install.ps1
+          python3 scripts/release_assets.py installers "$base" "$(basename dist/*.whl)" release
+          grep -q "${base}/constraints.txt" release/install.sh
+          grep -q "${base}/constraints.txt" release/install.ps1
           grep -q "${base}/install.ps1" release/install.cmd
           # One downloadable file for addons.videolan.org (a download page; it installs
           # nothing into VLC): the three installers. The Lua scripts alone do nothing

@@ -31,8 +31,8 @@ $Constraints = $DefaultConstraints
 if ($env:VLC_SUBSYNC_SOURCE) { $Constraints = '' }
 if ($env:VLC_SUBSYNC_CONSTRAINTS) { $Constraints = $env:VLC_SUBSYNC_CONSTRAINTS }
 if ($Constraints -eq 'none') { $Constraints = '' }
-# uv older than this has no `uv tool install --constraints` (or no remote constraints files)
-$MinUv = [version]'0.6.0'
+# uv older than this has no `uv tool install --constraints`
+$MinUv = [version]'0.5.6'
 $PyVer = if ($env:VLC_SUBSYNC_PYTHON) { $env:VLC_SUBSYNC_PYTHON } else { '3.12' }
 $VcRedistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
 if ($env:VLC_SUBSYNC_UNINSTALL -eq '1') { $Uninstall = $true }
@@ -183,7 +183,11 @@ function Invoke-Main {
         if (-not $have -or $have -lt $MinUv) {
             $shown = if ($have) { "uv $have" } else { 'This uv' }
             Fail ("$shown is too old for this installer (it needs uv $MinUv or newer). " +
-                "Update uv (`"$uv`" self update, or the package manager it came from) and run this again")
+                "Update uv (in PowerShell: & `"$uv`" self update; or with the package manager it came from) and run this again")
+        }
+        if (Test-Path -LiteralPath $Constraints) {
+            # a local file goes in as a file:// URL: uv splits a --constraints value at spaces
+            $Constraints = ([System.Uri](Resolve-Path -LiteralPath $Constraints).Path).AbsoluteUri
         }
         $installArgs += @('--constraints', $Constraints)
         Say "Installing vlc-subsync with Python $PyVer and the dependency versions it was tested with (this downloads ~200 MB the first time)"
@@ -194,7 +198,8 @@ function Invoke-Main {
     if ($LASTEXITCODE -ne 0) {
         if ($Constraints) {
             Fail ('package installation failed. If it says a pinned version has no build for this computer, ' +
-                'set VLC_SUBSYNC_CONSTRAINTS=none to install the newest versions instead')
+                'run this again with VLC_SUBSYNC_CONSTRAINTS set to none to install the newest versions instead ' +
+                '(PowerShell: $env:VLC_SUBSYNC_CONSTRAINTS = ''none''; cmd: set VLC_SUBSYNC_CONSTRAINTS=none)')
         }
         Fail 'package installation failed'
     }

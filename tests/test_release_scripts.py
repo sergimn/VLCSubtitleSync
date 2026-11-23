@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
 
@@ -245,3 +246,37 @@ def test_install_sh_stops_on_a_uv_too_old_for_constraints(run_install_sh):
     assert "uv 0.5.5 (fake) is too old" in proc.stderr
     proc, args = run_install_sh(ROOT / "install.sh", FAKE_UV_VERSION="0.5.5")
     assert args is not None  # no pins asked: any uv will do
+    # 0.5.6 is the first uv with `uv tool install --constraints`
+    proc, args = run_install_sh(
+        ROOT / "install.sh", VLC_SUBSYNC_CONSTRAINTS="c.txt", FAKE_UV_VERSION="0.5.6"
+    )
+    assert _constraints_arg(args) == "c.txt", proc.stderr
+
+
+def test_install_sh_passes_a_local_constraints_file_as_a_url(tmp_path, run_install_sh):
+    # uv splits a --constraints value at spaces, so a local file goes in as a file:// URL
+    folder = tmp_path / "My Files #1"
+    folder.mkdir()
+    pins = folder / "pins 100%.txt"
+    pins.write_text("six==1.16.0\n")
+    proc, args = run_install_sh(ROOT / "install.sh", VLC_SUBSYNC_CONSTRAINTS=str(pins))
+    url = _constraints_arg(args)
+    assert url is not None, proc.stderr
+    assert url.startswith("file:///") and " " not in url
+    assert os.path.samefile(unquote(urlsplit(url).path), pins)
+    # a URL is passed on as it is
+    _, args = run_install_sh(ROOT / "install.sh", VLC_SUBSYNC_CONSTRAINTS=url)
+    assert _constraints_arg(args) == url
+
+    uv = shutil.which("uv")
+    if uv is None:
+        return
+    # and the real uv reads it back as that file (offline: nothing to resolve)
+    (tmp_path / "empty.in").write_text("")
+    proc = subprocess.run(
+        [uv, "pip", "compile", "--no-config", "--offline", "-q", "empty.in", "-c", url],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr

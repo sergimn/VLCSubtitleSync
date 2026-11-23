@@ -40,9 +40,10 @@ packages = ["src/vlcsubsync"]
 # Lock only releases at least 14 days old, like Renovate's minimumReleaseAge.
 # Keep this exact spelling: uv.lock stores it, and "2 weeks" would count as a change.
 exclude-newer = "14 days"
-# Every pin must have a wheel for each platform the installers support. Windows on ARM
-# runs x64 Python (no ARM64 ctranslate2 wheels), so it is covered by the AMD64 entry and
-# must not be listed itself.
+# Every pin must have a wheel for each platform the installers support. uv enforces this
+# only for packages that publish no sdist (ctranslate2, onnxruntime); CI's "Pinned versions
+# for the installers" job checks every pin. Windows on ARM runs x64 Python (no ARM64
+# ctranslate2 wheels), so it is covered by the AMD64 entry and must not be listed itself.
 required-environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
   "sys_platform == 'linux' and platform_machine == 'aarch64'",

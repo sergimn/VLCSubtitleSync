@@ -371,8 +371,9 @@ each release's installers install the same versions (see [Releasing](#releasing)
 changing a dependency in `pyproject.toml`, run `uv lock` and commit both files. `uv lock`
 only picks releases at least 14 days old (`exclude-newer` in `pyproject.toml`).
 
-Dependency updates are proposed by [Renovate](https://docs.renovatebot.com/) (`renovate.json`) on Sundays, for releases at least 14 days old:
-- CI tooling (GitHub Actions, pre-commit hooks, the CI ruff pin) and CI runner images: grouped and automerged when CI passes.
+Dependency updates are proposed by [Renovate](https://docs.renovatebot.com/) (`renovate.json`) on Sundays, for releases at least 14 days old (CI runner images excepted):
+- CI tooling (GitHub Actions, pre-commit hooks, the CI ruff pin): grouped and automerged when CI passes.
+- CI runner images: grouped and automerged when CI passes, with no minimum age.
 - Dev extras (pytest, ruff, ...): one grouped `uv.lock` update, automerged when CI passes.
 - Runtime dependencies: one `uv.lock` update per package, never automerged.
 - A weekly lock refresh (`uv lock --upgrade`) for the indirect dependencies (ctranslate2, onnxruntime, ...), never automerged.
@@ -433,7 +434,7 @@ They are synthesized with [Piper](https://github.com/OHF-Voice/piper1-gpl) TTS
 bit-for-bit reproducible on the same toolchain. To regenerate:
 
 ```sh
-uv pip install -e ".[fixtures]"            # piper-tts (+ onnxruntime)
+uv sync --extra dev --extra fixtures       # piper-tts (+ onnxruntime), as pinned in uv.lock
 .venv/bin/python scripts/make_fixtures.py  # needs ffmpeg with libopus + libx264 (or set $FFMPEG)
 ```
 

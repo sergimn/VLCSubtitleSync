@@ -61,9 +61,10 @@
       "enabled": false
     },
     {
-      "description": "Python deps: keep the >= ranges in pyproject.toml and move the versions pinned in uv.lock",
+      "description": "Python deps: keep the >= ranges in pyproject.toml and move the versions pinned in uv.lock. One branch per package (or group), not one per major and one per minor: Renovate runs `uv lock --upgrade-package <name>`, which always takes the newest version old enough, so a minor branch would lock the new major too.",
       "matchManagers": ["pep621"],
-      "rangeStrategy": "update-lockfile"
+      "rangeStrategy": "update-lockfile",
+      "separateMajorMinor": false
     },
     {
       "description": "Dev extras (pytest, ruff, lupa, pre-commit, piper-tts) are low risk",

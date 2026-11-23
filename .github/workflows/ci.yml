@@ -142,6 +142,21 @@ jobs:
         run: |
           python3 scripts/release_assets.py constraints constraints.txt
           cat constraints.txt
+      - name: Every pinned version has a wheel for each platform the installers support
+        # uv lock's required-environments only covers packages that publish no sdist, and
+        # no job here runs on Linux ARM. A pin without a wheel would make users build it
+        # from source (FFmpeg for av, Rust for tokenizers), so check every pin, on the
+        # installers' Python. Apple Silicon needs macOS 14 already (av, onnxruntime).
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          for platform in x86_64-manylinux_2_28 aarch64-manylinux_2_28 \
+              aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
+            echo "$platform"
+            uv pip compile --no-config --quiet --only-binary :all: --python-version 3.12 \
+              --python-platform "$platform" --constraints constraints.txt pyproject.toml \
+              --output-file /dev/null
+          done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: constraints
@@ -203,7 +218,11 @@ jobs:
           tool="$(uv tool dir --color never)/vlc-subsync"
           py="$tool/bin/python"
           [ -e "$py" ] || py="$tool/Scripts/python.exe"
-          out="$(uv pip install --python "$py" --dry-run -r "$VLC_SUBSYNC_CONSTRAINTS" 2>&1)"
+          [ -e "$py" ] || { echo "::error::no Python in the tool environment $tool"; exit 1; }
+          if ! out="$(uv pip install --python "$py" --dry-run -r "$VLC_SUBSYNC_CONSTRAINTS" 2>&1)"; then
+            echo "$out"
+            exit 1
+          fi
           echo "$out"
           echo "$out" | grep -q "Would make no changes"
           # (on Windows, install.ps1 has already checked this)

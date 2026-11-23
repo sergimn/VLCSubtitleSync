@@ -27,8 +27,8 @@ SOURCE="${VLC_SUBSYNC_SOURCE:-$DEFAULT_SOURCE}"
 if [ -n "${VLC_SUBSYNC_SOURCE:-}" ]; then DEFAULT_CONSTRAINTS=""; fi
 CONSTRAINTS="${VLC_SUBSYNC_CONSTRAINTS:-$DEFAULT_CONSTRAINTS}"
 if [ "$CONSTRAINTS" = none ]; then CONSTRAINTS=""; fi
-# uv older than this has no `uv tool install --constraints` (or no remote constraints files)
-MIN_UV=0.6.0
+# uv older than this has no `uv tool install --constraints`
+MIN_UV=0.5.6
 PYVER="${VLC_SUBSYNC_PYTHON:-3.12}"
 ACTION=install
 
@@ -66,6 +66,11 @@ download() { # url -> stdout
     else
         die "need curl or wget to download $1"
     fi
+}
+
+file_url() { # local path -> file:// URL (uv splits a --constraints value at spaces)
+    abs="$(CDPATH="" cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    printf 'file://%s\n' "$(printf '%s' "$abs" | sed 's/%/%25/g; s/ /%20/g; s/#/%23/g; s/?/%3F/g; s/\\/%5C/g')"
 }
 
 find_uv() {
@@ -123,15 +128,13 @@ say "Using uv: $UV"
 
 # A local directory/file source is turned into a PEP 508 file:// reference.
 SPEC="vlc-subsync @ $SOURCE"
-if [ -e "$SOURCE" ]; then
-    ABS="$(cd "$(dirname "$SOURCE")" && pwd)/$(basename "$SOURCE")"
-    SPEC="vlc-subsync @ file://$ABS"
-fi
+if [ -e "$SOURCE" ]; then SPEC="vlc-subsync @ $(file_url "$SOURCE")"; fi
 
 if [ -n "$CONSTRAINTS" ]; then
     if ! uv_at_least "$MIN_UV"; then
         die "$("$UV" --version 2>/dev/null || echo uv) is too old for this installer (it needs uv $MIN_UV or newer). Update uv ('$UV self update', or the package manager it came from) and run this again"
     fi
+    if [ -e "$CONSTRAINTS" ]; then CONSTRAINTS="$(file_url "$CONSTRAINTS")"; fi
     say "Installing vlc-subsync with Python $PYVER and the dependency versions it was tested with (this downloads ~200 MB the first time)"
     "$UV" tool install --force --python "$PYVER" --constraints "$CONSTRAINTS" "$SPEC" ||
         die "package installation failed. If it says a pinned version has no build for this computer, VLC_SUBSYNC_CONSTRAINTS=none installs the newest versions instead"

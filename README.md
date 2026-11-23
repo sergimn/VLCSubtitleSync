@@ -355,7 +355,7 @@ Whisper models stay in the shared Hugging Face cache (`~/.cache/huggingface`).
 
 ```sh
 git clone https://github.com/sergimn/VLCSubtitleSync && cd VLCSubtitleSync
-uv venv && uv pip install -e ".[dev]"
+uv sync --extra dev                # .venv with the exact versions pinned in uv.lock
 .venv/bin/pre-commit install       # ruff, shellcheck, actionlint, luacheck (if installed) on every commit
 .venv/bin/pytest                 # unit tests (fast; excludes slow/vlc)
 .venv/bin/pytest -m slow         # real Whisper models on real speech (downloads tiny.en, base.en, base)
@@ -363,13 +363,27 @@ uv venv && uv pip install -e ".[dev]"
 .venv/bin/pre-commit run --all-files
 ```
 
-Dependency updates are proposed by [Renovate](https://docs.renovatebot.com/) (`renovate.json`) on Sundays: CI tooling (GitHub Actions, pre-commit hooks, the CI ruff pin) and CI runner images are grouped and automerged when CI passes. The Python dependencies in `pyproject.toml` are minimum versions (`>=`), which Renovate leaves as they are, so every install gets the newest release.
+Python dependencies are pinned in `uv.lock`, direct and indirect ones alike, while
+`pyproject.toml` keeps minimum versions (`>=`). CI installs exactly the lock
+(`uv sync --locked`, which also fails if `pyproject.toml` changed without `uv lock`). After
+changing a dependency in `pyproject.toml`, run `uv lock` and commit both files. `uv lock`
+only picks releases at least 14 days old (`exclude-newer` in `pyproject.toml`).
+
+Dependency updates are proposed by [Renovate](https://docs.renovatebot.com/) (`renovate.json`) on Sundays, for releases at least 14 days old:
+- CI tooling (GitHub Actions, pre-commit hooks, the CI ruff pin) and CI runner images: grouped and automerged when CI passes.
+- Dev extras (pytest, ruff, ...): one grouped `uv.lock` update, automerged when CI passes.
+- Runtime dependencies: one `uv.lock` update per package, never automerged.
+- A weekly lock refresh (`uv lock --upgrade`) for the indirect dependencies (ctranslate2, onnxruntime, ...), never automerged.
+
+Users get these updates with the next release. A security fix that is less than 14 days
+old needs a temporary `exclude-newer-package = { <package> = false }` under `[tool.uv]`,
+then `uv lock --upgrade-package <package>` and a patch release.
 
 Test markers:
 
 | marker | needs | CI job |
 |---|---|---|
-| *(none)* | nothing | `unit` (Linux/macOS/Windows × Python 3.10/3.12) |
+| *(none)* | nothing | `unit` (Linux/macOS/Windows × Python 3.12/3.14) |
 | `slow` | Whisper models (cached in `~/.cache/huggingface`) | `integration` |
 | `vlc` | a VLC 3 binary (`VLC_BIN` to override) | `e2e-vlc` (Ubuntu, apt VLC) |
 

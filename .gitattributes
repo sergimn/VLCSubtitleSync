@@ -6,3 +6,4 @@
 *.mka binary
 *.ico binary
 *.png binary
+uv.lock text eol=lf

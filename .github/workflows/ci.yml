@@ -154,8 +154,7 @@ jobs:
               aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
             echo "$platform"
             uv pip compile --no-config --quiet --only-binary :all: --python-version 3.12 \
-              --python-platform "$platform" --constraints constraints.txt pyproject.toml \
-              --output-file /dev/null
+              --python-platform "$platform" --constraints constraints.txt pyproject.toml >/dev/null
           done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

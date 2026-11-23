@@ -62,6 +62,12 @@ function Get-UvVersion($uv) {
     return $null
 }
 
+function ConvertTo-FileUrl($path) {
+    # FullName normalises \\server\share, //server/share and mixed slashes; the one-argument
+    # Uri constructor makes an absolute file:// URL, which uv reads back as the same path
+    ([System.Uri]::new((Get-Item -LiteralPath $path -Force).FullName)).AbsoluteUri
+}
+
 function Get-ToolBinDir($uv) {
     $dir = (& $uv tool dir --bin --color never) | Select-Object -Last 1
     if ($LASTEXITCODE -ne 0 -or -not $dir) { return $null }
@@ -172,10 +178,7 @@ function Invoke-Main {
     }
 
     $spec = "vlc-subsync @ $Source"
-    if (Test-Path -LiteralPath $Source) {
-        $abs = (Resolve-Path -LiteralPath $Source).Path
-        $spec = 'vlc-subsync @ ' + ([System.Uri]$abs).AbsoluteUri
-    }
+    if (Test-Path -LiteralPath $Source) { $spec = 'vlc-subsync @ ' + (ConvertTo-FileUrl $Source) }
 
     $installArgs = @('tool', 'install', '--force', '--python', $PyVer)
     if ($Constraints) {
@@ -185,10 +188,8 @@ function Invoke-Main {
             Fail ("$shown is too old for this installer (it needs uv $MinUv or newer). " +
                 "Update uv (in PowerShell: & `"$uv`" self update; or with the package manager it came from) and run this again")
         }
-        if (Test-Path -LiteralPath $Constraints) {
-            # a local file goes in as a file:// URL: uv splits a --constraints value at spaces
-            $Constraints = ([System.Uri](Resolve-Path -LiteralPath $Constraints).Path).AbsoluteUri
-        }
+        # a local file goes in as a file:// URL: uv splits a --constraints value at spaces
+        if (Test-Path -LiteralPath $Constraints) { $Constraints = ConvertTo-FileUrl $Constraints }
         $installArgs += @('--constraints', $Constraints)
         Say "Installing vlc-subsync with Python $PyVer and the dependency versions it was tested with (this downloads ~200 MB the first time)"
     } else {

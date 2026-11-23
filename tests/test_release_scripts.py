@@ -228,7 +228,9 @@ def test_install_sh_uses_the_release_constraints(tmp_path, run_install_sh):
     # another source does not get this release's versions unless asked
     _, args = run_install_sh(script, VLC_SUBSYNC_SOURCE=str(ROOT))
     assert _constraints_arg(args) is None
-    assert args[-1] == f"vlc-subsync @ file://{ROOT}"
+    url = args[-1].removeprefix("vlc-subsync @ ")
+    assert url.startswith("file:///") and " " not in url
+    assert os.path.samefile(unquote(urlsplit(url).path), ROOT)
 
 
 def test_install_sh_from_main_installs_unpinned_unless_asked(run_install_sh):

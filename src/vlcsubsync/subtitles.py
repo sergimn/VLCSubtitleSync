@@ -214,6 +214,38 @@ def subtitle_files_near(media_path: str | os.PathLike[str]) -> list[str]:
     return out[:MAX_NEARBY]
 
 
+# Where VLC 3 looks for subtitle files by itself (src/input/subtitles.c): the video's
+# folder and, by default (sub-autodetect-path), these subfolders.
+VLC_SUB_DIRS = ("subtitles", "subs")
+
+
+def vlc_trim(name: str) -> str:
+    """``name`` the way VLC 3 compares subtitle and video names (``strcpy_trim``):
+    its ASCII letters and digits, lowercased, as words separated by single spaces."""
+    return " ".join(w.lower() for w in re.findall(r"[A-Za-z0-9]+", name))
+
+
+def may_be_vlc_autoloaded(media_path: str | os.PathLike[str], path: str) -> bool:
+    """Whether VLC 3 may have loaded subtitle file ``path`` by itself for the video.
+
+    True when the file is in the video's folder or a ``Subs/``-style subfolder of it
+    and its name contains the video's (as :func:`vlc_trim` gives them). VLC's default
+    settings load the names that are the video's or start with it ("Movie - English",
+    "Movie_en"), lower ``sub-autodetect-fuzzy`` settings load more. Such a file sits
+    among VLC's sidecars, wherever :func:`find_sidecars` would put it.
+    """
+    from .openfiles import same_file_key
+
+    media, sub = Path(media_path), Path(path)
+    home = same_file_key(str(media.parent))
+    folder = sub.parent
+    if same_file_key(str(folder)) != home and not (
+        folder.name.casefold() in VLC_SUB_DIRS and same_file_key(str(folder.parent)) == home
+    ):
+        return False
+    return vlc_trim(media.stem) in vlc_trim(sub.stem)
+
+
 # --------------------------------------------------------------------------------------
 # Text normalisation / tokenisation
 # --------------------------------------------------------------------------------------

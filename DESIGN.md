@@ -103,33 +103,55 @@ def sync_subtitles(media_path: str, audio_index: int, subtitle: SubtitleSource,
 ```
 `audio_index` = ordinal among the container's **audio** streams (0-based), which is
 the order VLC lists them. External subs: if VLC's sub ordinal ≥ number of embedded
-sub streams, the track is external track `k = ordinal - n_embedded`. VLC lists the
-sidecars it loaded with the video first, then the files the user added (Subtitle → Add
-Subtitle File, drag and drop) in the order they were added. VLC 3's Lua API can't tell
-which file a track came from (no slave URI, the label has at most a language, the
-`sub-file` variable only holds a command-line file), so `daemon.resolve_source`:
+sub streams, the track is external track `k = ordinal - n_embedded`. VLC 3 lists the
+external tracks in three groups (`LoadSlaves` in src/input/input.c, checked with VLC
+3.0.20): the files given when the video opened (`--sub-file`, the Open dialog's "Use a
+subtitle file", and every file added during an earlier play of the same playlist item,
+our synced copies too, because VLC keeps them on the item), then the sidecars it found
+itself, then the files added during this play (Subtitle → Add Subtitle File, drag and
+drop) in the order they were added. (VLC 3 also silently drops a `--sub-file` whose
+URI sorts after the first sidecar it found.) VLC 3's Lua API can't tell which file a
+track came from (no slave URI, the label has at most a language, the `sub-file`
+variable only holds the startup file), so the intf sends `sub_count` (the subtitle
+tracks it lists) and `sub_added` (how many of them showed up after the input reached
+`PLAYING_S`; empty when unknown: the input had already played 5 s when the intf saw it
+open, or `vlc.var.create` is missing, which the intf uses to mark each input object so
+it notices the same item playing again), both without our synced tracks. Then
+`daemon.resolve_source`:
 1. uses sidecar discovery (`subtitles.find_sidecars(media_path)`: same stem /
    stem.*.ext in the media dir and `Subs/`, `Subtitles/` subdirs; exts srt, ass, ssa,
    vtt, sub; exact-stem match first, then alphabetical) and picks sidecar `k` when `k`
-   is within them and VLC lists as many external tracks as there are sidecars
-   (`sub_count - n_embedded`; an intf that doesn't send `sub_count` always gets this);
+   is within them, VLC lists as many external tracks as there are sidecars and none was
+   added later (a request without the counts always gets this);
 2. otherwise asks the OS which subtitle files (any of VLC's subtitle extensions) the
    VLC process playing the video has open (`openfiles.subtitles_open_in_vlc`): VLC
    keeps every subtitle file it loaded open while the video plays. Linux reads
    `/proc/<pid>/fd` of processes named `vlc` (snap/Flatpak too), macOS runs `lsof -c
    VLC`, Windows asks the Restart Manager about each subtitle file near the video
    (`subtitles.subtitle_files_near`: the media dir, `Subs/`-style dirs and
-   `Subs/<video name>/`, any name). Our synced copies (`<q>/out/`) and the `.sub` half
-   of a VobSub pair don't count. The external tracks are then the sidecars VLC has open
-   (in sidecar order), then the other open files. If the OS can't tell (no VLC with the
-   video open, `lsof` missing, an error), the other files are the subtitle files near
-   the video;
-3. picks one of those other files only if it is the only one and VLC lists exactly
-   one external track beyond the sidecars (unknown `sub_count`: any). Two hand-added
-   files can't be told apart (VLC's open order is not their track order), so the job
-   fails with an error that names the files and says to name the wanted one like the
-   video, keep it next to it and reopen the video. No file at all: "Can't find the
-   file of subtitle track N", with the same advice.
+   `Subs/<video name>/`, any name), so there a file added from another folder is not
+   found. Our synced copies (`<q>/out/`) don't count, and a VobSub `.idx`/`.sub` pair
+   is one track. The sidecars among the open files are VLC's sidecar group (in sidecar
+   order); the other files were given at startup or added since. If the OS can't tell
+   (no VLC with the video open, `lsof` missing, an error), a request from VLC only gets
+   the sidecar rule (`k` within the sidecars); the CLI and older intfs, which send no
+   counts, also take the one subtitle file near the video beyond the sidecars;
+3. picks a file outside the sidecars only where the counts place it for certain
+   (`daemon._external_track_file`): it is the only subtitle file VLC has open and VLC
+   lists one external track; or VLC lists one track added later, every track listed at
+   the start is a sidecar, and it is the only other file; or it is the only other file
+   and VLC lists one more track at the start than there are sidecars (it comes first:
+   track `k = 0`, the sidecars follow). Tracks it can't place make it fall back to the
+   sidecar rule: SubSync's synced copies VLC reloads when the video plays again (the
+   intf can't tell they are ours), tracks without a file (closed captions, subtitles
+   attached to an MKV), and files VLC may have loaded by itself that `find_sidecars`
+   doesn't know (`subtitles.may_be_vlc_autoloaded`: in the media dir or a
+   `Subs/`/`Subtitles/` dir, name containing the video's as VLC compares names, such as
+   `Movie.smi` or `Movie - Spanish.srt`; VLC sorts them among its sidecars). Otherwise
+   the job fails with an error that names the files ("Can't tell which file subtitle
+   track N is (…)") or, without other files, "Can't find the file of subtitle track N",
+   and says to name the wanted file like the video, keep it next to it and reopen the
+   video.
 
 ### File protocol (Lua ↔ daemon) — all files UTF-8 `key=value` lines
 
@@ -146,6 +168,7 @@ audio_label=Track 2 - [English]
 sub_index=0                            # ordinal among subtitle tracks VLC lists (0-based, our own synced tracks excluded)
 sub_label=Track 1 - [English]
 sub_count=2                            # subtitle tracks VLC lists (our synced ones excluded), see "External subs"
+sub_added=0                            # how many of those showed up after the video opened (empty: unknown)
 sub_path=                              # optional explicit external subtitle path
 force=0                                # 1 = ignore result cache
 mode=exhaustive                        # optional: fast|thorough|exhaustive, overrides config
@@ -248,7 +271,12 @@ own picks and do not count. "Sync subtitles now" never waits, and a result
 remembered from earlier in the session is applied at once as before. `intf_state`
 says `state=waiting` meanwhile. Track ordinals come from
 `vlc.var.get_list(input, "audio-es"/"spu-es")` (skip value -1 "Disable"; skip ES ids we
-added). On `done` + `applied=1`: `vlc.input.add_subtitle(output, true)` (try path, then
+added). The intf remembers the `spu-es` ids listed at the first tick that sees the
+input in state `PLAYING_S`/`PAUSE_S` (VLC loads the sidecars and the startup files
+before that); ids that show up later count as `sub_added`. It sets a variable
+(`subsync-seen`, `vlc.var.create`) on every input object it sees: a new object for the
+same file means the item plays again, which is handled like a new file (its synced
+tracks are forgotten, the wait after opening starts again). On `done` + `applied=1`: `vlc.input.add_subtitle(output, true)` (try path, then
 `vlc.strings.make_uri(output)`), remember the new ES id(s) as "ours → source", OSD
 `"Subtitles synced: <message>"`. On error / not applied: short OSD message, keep
 original. Remember the result per (input, audio, source) so re-selecting doesn't resync.

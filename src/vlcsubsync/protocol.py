@@ -205,6 +205,10 @@ class Request:
     # Number of subtitle tracks VLC lists, our synced ones excluded (None: an older
     # intf did not send it). Tells the daemon whether VLC has files it doesn't expect.
     sub_count: int | None = None
+    # How many of those showed up after the video opened (files the user added, which
+    # VLC lists last); None: unknown (an older intf, the extension, or the intf did not
+    # see the video open). See DESIGN.md "External subs".
+    sub_added: int | None = None
     audio_label: str = ""
     sub_label: str = ""
     force: bool = False
@@ -230,6 +234,8 @@ class Request:
         }
         if self.sub_count is not None:
             out["sub_count"] = self.sub_count
+        if self.sub_added is not None:
+            out["sub_added"] = self.sub_added
         mode = normalize_mode(self.mode)
         if mode:
             out["mode"] = mode
@@ -262,6 +268,9 @@ class Request:
         sub_count = _to_int(data.get("sub_count"), None)
         if sub_count is not None and sub_count < 0:
             sub_count = None
+        sub_added = _to_int(data.get("sub_added"), None)
+        if sub_added is not None and sub_added < 0:
+            sub_added = None
         return cls(
             id=req_id,
             media=media,
@@ -269,6 +278,7 @@ class Request:
             sub_index=sub_index,
             sub_path=sub_path,
             sub_count=sub_count,
+            sub_added=sub_added,
             audio_label=data.get("audio_label") or "",
             sub_label=data.get("sub_label") or "",
             force=_to_bool(data.get("force")),

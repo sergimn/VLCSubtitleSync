@@ -56,8 +56,8 @@ VLC settings are kept. Before it changes `vlcrc` it saves a backup copy next to 
 ## Usage
 
 Open a video and choose a subtitle track: an embedded one, a `.srt`/`.ass`/`.vtt` file
-next to the video, or one you added with **Subtitle → Add Subtitle File…**. That's all. A few seconds later a new subtitle track is added and
-selected. The original track is still in the **Subtitle → Sub Track** menu if you want
+next to the video, or one you added with **Subtitle → Add Subtitle File…**. That's all.
+A few seconds later a new subtitle track is added and selected. The original track is still in the **Subtitle → Sub Track** menu if you want
 it back.
 
 SubSync only puts a message on screen when something goes wrong, for example
@@ -315,12 +315,12 @@ CUDA. The helper not running is normal while VLC is closed. Things to try:
   never exits by itself.
 - **"Can't find the file of subtitle track 1" or "Can't tell which file subtitle
   track 1 is"**: VLC doesn't tell SubSync which file a subtitle track came from.
-  SubSync finds a file you added by hand among the files VLC has open, but it can't
-  tell two hand-added files apart, and if the OS can't say which files VLC has open
-  it only takes a file that is the only subtitle file next to the video or in its
-  `Subs/` folder. Give the file the video's name (`Movie.srt` or `Movie.en.srt` for
-  `Movie.mkv`), keep it next to the video or in `Subs/`, and reopen the video: VLC
-  then loads it by itself.
+  SubSync finds a file you added by hand among the files VLC has open, but not
+  always: it can't tell two hand-added files apart, on Windows it only checks files
+  next to the video or in its `Subs/` folder, and it can't check at all if the OS
+  doesn't say which files VLC has open. Give the file the video's name (`Movie.srt`
+  or `Movie.en.srt` for `Movie.mkv`), keep it next to the video or in `Subs/`, and
+  reopen the video: VLC then loads it by itself.
 - **Snap VLC (Ubuntu)**: snap VLC cannot start programs, so it relies on systemd
   starting the helper (`vlc-subsync.path`). This works across snap updates: the
   watch follows `~/snap/vlc/current` to the new revision. If you install the snap

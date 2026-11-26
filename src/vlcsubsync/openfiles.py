@@ -270,8 +270,20 @@ def _windows_image_name(pid: int) -> str:  # pragma: no cover - Windows only
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    # a private handle: setting argtypes on the shared ctypes.windll.kernel32 would
+    # change it for the daemon's other callers
+    kernel32 = ctypes.WinDLL("kernel32")  # type: ignore[attr-defined]
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
         return ""

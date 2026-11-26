@@ -701,8 +701,10 @@ def test_vlc_subtitle_not_named_like_the_video(tmp_path: Path):
     track 1 not found (0 embedded, 0 external files)". The helper must find it among
     the files VLC has open, not one of the other files in ``Subs/``.
 
-    ``--sub-file`` loads it like **Subtitle → Add Subtitle File…** does (VLC selects
-    it, and the Lua API can't tell its path either).
+    ``--sub-file`` stands in for **Subtitle → Add Subtitle File…**: VLC selects the
+    file and the Lua API can't tell the helper its path. (VLC lists a startup file
+    before its sidecars and a file added later after them; with no sidecar the order
+    doesn't matter.)
     """
     place = {
         "Movie.mkv": "en_dialogue.mkv",
@@ -716,4 +718,24 @@ def test_vlc_subtitle_not_named_like_the_video(tmp_path: Path):
         daemon_log = run.daemon_log.read_text(encoding="utf-8")
         assert "not found" not in daemon_log
         assert "2_English.srt (open in VLC)" in daemon_log, "picked the wrong file"
+        assert_synced(run)
+
+
+@pytest.mark.slow
+@pytest.mark.vlc
+def test_vlc_startup_subtitle_next_to_a_sidecar(tmp_path: Path):
+    """A file given when the video opens (``--sub-file``, the Open dialog's subtitle
+    file, or one added during an earlier play) is listed before the sidecar VLC found
+    itself, and VLC selects it: the helper must not sync the sidecar instead."""
+    place = {
+        "Movie.mkv": "en_dialogue.mkv",
+        "Movie.srt": "es_dialogue.offset_plus_3_2.srt",  # the sidecar: another film
+        "English.srt": "en_dialogue.offset_plus_3_2.srt",
+    }
+    # (VLC 3 drops a --sub-file that sorts after the sidecar: "English" < "Movie")
+    args = ["--sub-file", "{media}/English.srt", "{media}/Movie.mkv"]
+    with vlc_with_subsync(tmp_path, place, args) as run:
+        assert " sub=0 of 2 (0 added) " in run.text, "the request must count VLC's tracks"
+        daemon_log = run.daemon_log.read_text(encoding="utf-8")
+        assert "English.srt (open in VLC)" in daemon_log, "picked the wrong file"
         assert_synced(run)

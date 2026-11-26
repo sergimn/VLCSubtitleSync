@@ -163,6 +163,7 @@ def test_cmd_sync_vlc_ordinal(tmp_path, monkeypatch):
             sub_path,
             count_embedded=lambda m: 1,
             find_sidecars=lambda m: [str(side)],
+            open_in_vlc=lambda m, c: None,  # not the OS's open files
         )
 
     monkeypatch.setattr(D, "resolve_source", resolve)

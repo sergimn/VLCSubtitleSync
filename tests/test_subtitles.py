@@ -11,11 +11,13 @@ from vlcsubsync.subtitles import (
     find_sidecars,
     guess_language,
     load_subtitles,
+    may_be_vlc_autoloaded,
     output_format,
     plain_text,
     save_subtitles,
     subtitle_files_near,
     tokenize,
+    vlc_trim,
 )
 
 SRT = (
@@ -236,3 +238,30 @@ def test_subtitle_files_near(tmp_path):
     assert sorted(got) == sorted(str(p) for p in want)
     assert got == sorted(got, key=lambda p: (p.casefold(), p))
     assert subtitle_files_near(str(tmp_path / "nope" / "x.mkv")) == []
+
+
+def test_vlc_trim_is_vlcs_strcpy_trim():
+    assert vlc_trim("The.Matrix (1999)") == "the matrix 1999"
+    assert vlc_trim("Movie - Spanish") == "movie spanish"
+    assert vlc_trim("Am\u00e9lie_EN") == "am lie en"  # VLC compares ASCII letters only
+    assert vlc_trim("\u0130stanbul") == "stanbul"  # no ASCII from lower() of others
+    assert vlc_trim("...") == ""
+
+
+def test_may_be_vlc_autoloaded(tmp_path):
+    media = str(tmp_path / "The.Matrix.mkv")
+    yes = [
+        "The Matrix - Spanish.srt",
+        "the_matrix_en.smi",
+        "Subs/The.Matrix.fr.srt",
+        "subtitles/THE MATRIX.ass",
+        "Best of The Matrix.srt",  # VLC loads it with a lower sub-autodetect-fuzzy
+    ]
+    no = ["Subs/2_English.srt", "English.srt", "Sub/The.Matrix.srt", "Extras/The.Matrix.srt"]
+    for name in yes:
+        assert may_be_vlc_autoloaded(media, str(tmp_path / name)), name
+    for name in no:
+        assert not may_be_vlc_autoloaded(media, str(tmp_path / name)), name
+    assert not may_be_vlc_autoloaded(media, str(tmp_path.parent / "The.Matrix.srt"))
+    # a name without ASCII letters: VLC matches every subtitle file
+    assert may_be_vlc_autoloaded(str(tmp_path / "\u65e5\u672c.mkv"), str(tmp_path / "x.srt"))

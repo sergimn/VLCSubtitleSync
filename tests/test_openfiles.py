@@ -71,9 +71,10 @@ def test_parse_lsof_output():
     assert O._lsof_unescape(r"/a\\b\tc") == "/a\\b\tc"
 
 
-def test_darwin_runs_lsof_for_vlc(tmp_path):
-    media = str(tmp_path / "Movie.mp4")
-    sub = str(tmp_path / "Subs" / "3_English.srt")
+def test_darwin_runs_lsof_for_vlc():
+    # lsof prints POSIX paths: no tmp_path, which is a C:\\ path on Windows CI
+    media = "/Users/me/Movies/Movie.mp4"
+    sub = "/Users/me/Movies/Subs/3_English.srt"
     calls = []
 
     def run(cmd, **kw):

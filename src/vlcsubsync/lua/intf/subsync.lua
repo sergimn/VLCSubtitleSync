@@ -51,6 +51,12 @@ M.DEBOUNCE_US = 1500000       -- wait this long after a track change
 M.START_HOLD_US = 10000000
 M.START_SETTLE_US = 2000000   -- track changes this soon after audio shows up are VLC's
 M.ADD_TIMEOUT_US = 10000000   -- wait at most this long for an added track to appear
+-- The tracks listed once the input has opened (input state PLAYING_S or PAUSE_S) are
+-- the ones VLC loaded with it; later ones were added. If the input has already played
+-- this long when we first see it open, we may have missed additions: unknown.
+M.OPENED_MAX_TIME_US = 5000000
+M.PLAYING_S, M.PAUSE_S = 2, 3 -- vlc_input.h input_state_e
+M.MARK_VAR = "subsync-seen"   -- set on each input object we have seen
 M.OSD_PROGRESS_US = 3000000   -- min interval between progress OSD updates
 M.HEARTBEAT_CHECK_US = 2000000
 M.STATE_REFRESH_S = 5         -- rewrite intf_state at least this often
@@ -510,9 +516,54 @@ function M.sub_count(snap)
     return n
 end
 
+-- How many of those showed up after the input opened (files the user added; VLC
+-- lists them last, after the files it loaded with the video), or nil if unknown.
+-- Sent as sub_added.
+function M.sub_added(snap)
+    if not S.opened_spu then return nil end
+    local n = 0
+    for _, v in ipairs(snap.spu_ids) do
+        if v ~= -1 and not S.ours[v] and not S.opened_spu[v] then n = n + 1 end
+    end
+    return n
+end
+
+-- true if `input` is an input object we haven't seen (VLC starts a new one when the
+-- same playlist item plays again), false if we have, nil if we can't tell.
+function M.new_input_object(input)
+    if S.no_mark then return nil end
+    local ok, v = pcall(vlc.var.get, input, M.MARK_VAR)
+    if ok and v ~= nil then return false end
+    local created = type(vlc.var.create) == "function"
+        and pcall(vlc.var.create, input, M.MARK_VAR, true)
+    local ok2, v2 = pcall(vlc.var.get, input, M.MARK_VAR)
+    if not (created and ok2 and v2 ~= nil) then
+        S.no_mark = true
+        log_dbg("cannot mark the input: tracks added later can't be told apart")
+        return nil
+    end
+    return true
+end
+
+-- Remember the subtitle tracks VLC lists once the input has opened.
+function M.note_opened(input, snap)
+    if S.opened_spu or S.opened_unknown then return end
+    local state = var_get(input, "state")
+    if not state or state < M.PLAYING_S or state > M.PAUSE_S then return end
+    local time = var_get(input, "time") or 0
+    if time > M.OPENED_MAX_TIME_US then
+        S.opened_unknown = true
+        log_dbg("input opened a while ago: tracks added later can't be told apart")
+        return
+    end
+    S.opened_spu = {}
+    for _, id in ipairs(snap.spu_ids) do S.opened_spu[id] = true end
+end
+
 -- Resolve the current selection into {audio=ordinal, sub=ordinal, ...} or nil.
 function M.selection(snap)
-    local sel = { audio_id = snap.audio, spu_id = snap.spu, sub_count = M.sub_count(snap) }
+    local sel = { audio_id = snap.audio, spu_id = snap.spu, sub_count = M.sub_count(snap),
+                  sub_added = M.sub_added(snap) }
     if snap.audio ~= -1 then
         sel.audio, sel.audio_label = M.ordinal(snap.audio_ids, snap.audio_labels, snap.audio)
     end
@@ -563,6 +614,7 @@ function M.reset_input()
     S.adding = nil
     S.non_file_logged = nil
     S.hold_until, S.settle_until, S.cache_missed = nil, nil, {}
+    S.opened_spu, S.opened_unknown = nil, nil
 end
 
 local function memo_for(uri)
@@ -609,6 +661,7 @@ function M.submit(sel, force, mode, probe)
         { "sub_index", sel.sub },
         { "sub_label", sel.sub_label or "" },
         { "sub_count", sel.sub_count or "" },
+        { "sub_added", sel.sub_added or "" },
         { "sub_path", "" },
         { "force", force and 1 or 0 },
     }
@@ -621,8 +674,8 @@ function M.submit(sel, force, mode, probe)
         M.set_state("error", "cannot write request", nil)
         return nil
     end
-    log_info(string.format("request %s: audio=%d sub=%d of %s mode=%s%s media=%s",
-        id, sel.audio, sel.sub, tostring(sel.sub_count or "?"),
+    log_info(string.format("request %s: audio=%d sub=%d of %s (%s added) mode=%s%s media=%s",
+        id, sel.audio, sel.sub, tostring(sel.sub_count or "?"), tostring(sel.sub_added or "?"),
         mode ~= "" and mode or "default", probe and " (cache only)" or "", S.media_path))
     S.job = {
         id = id, key = sel.key, audio = sel.audio, sub = sel.sub,
@@ -882,7 +935,9 @@ function M.tick()
 
     local item = vlc.input.item()
     local uri = item and item:uri() or nil
-    if uri ~= S.input_uri then
+    local fresh = M.new_input_object(input)
+    if uri ~= S.input_uri or fresh then
+        if uri == S.input_uri then log_dbg("the same file plays again") end
         M.reset_input()
         S.input_uri = uri
         S.media_path = M.uri_to_path(uri)
@@ -899,6 +954,8 @@ function M.tick()
         return
     end
 
+    if fresh == nil then S.opened_unknown = true end
+
     local snap = M.snapshot(input)
 
     -- forget our tracks that vanished (input restarted / re-opened)
@@ -914,6 +971,8 @@ function M.tick()
             log_dbg("synced track " .. id .. " (" .. tostring(o.output) .. ") gone")
         end
     end
+
+    M.note_opened(input, snap)
 
     if S.adding and M.check_adding(input, snap) then
         M.write_state()
@@ -981,7 +1040,7 @@ function M.tick()
                 fsel = {
                     audio = sel.audio, audio_label = sel.audio_label,
                     sub = sel.sub, sub_label = sel.sub_label, key = sel.key,
-                    sub_count = sel.sub_count,
+                    sub_count = sel.sub_count, sub_added = sel.sub_added,
                 }
             end
             if p.explicit then

@@ -110,12 +110,20 @@ def test_linux_reads_proc_fd(tmp_path):
         for n, t in enumerate(targets, start=3):
             os.symlink(t, fd / str(n))
 
-    fake_process(4242, "vlc", [str(media), str(sub), "/gone.srt (deleted)", "pipe:[1]"])
+    # an editor saved Movie.en.srt again (a new file renamed over it): VLC's fd shows
+    # "(deleted)", and the path names the subtitle file again
+    saved = tmp_path / "Movie.en.srt"
+    saved.write_bytes(b"")
+    fake_process(
+        4242,
+        "vlc",
+        [str(media), str(sub), "/gone.srt (deleted)", f"{saved} (deleted)", "pipe:[1]"],
+    )
     fake_process(4343, "vlc-subsync", [str(media), str(tmp_path / "out.srt")])
     (proc / "self").mkdir()
     (proc / "4444").mkdir()  # a process that went away: no comm, no fd
     got = O.subtitles_open_in_vlc(str(media), platform="linux", proc=proc)
-    assert got == [str(sub)]
+    assert got == [str(sub), str(saved)]
     assert O.subtitles_open_in_vlc(str(tmp_path / "x.mp4"), platform="linux", proc=proc) is None
     assert O.subtitles_open_in_vlc(str(media), platform="linux", proc=tmp_path / "no") is None
 

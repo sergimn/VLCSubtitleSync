@@ -533,9 +533,10 @@ def test_same_file_playing_again_counts_from_its_new_start(h):
 
 
 def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_path):
-    # the input was already playing when we first saw it: files may have been added
-    (tmp_path / "late").mkdir()
-    (tmp_path / "old").mkdir()
+    # the input was already playing a minute when the intf first looked (it started
+    # after the video): files may have been added
+    for d in ("late", "old", "resume", "start"):
+        (tmp_path / d).mkdir()
     late = Harness(runtime, tmp_path / "late", INTF)
     late.heartbeat()
     late.init()
@@ -544,6 +545,28 @@ def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_pat
     late.settle()
     r = late.requests()[0]
     assert r["sub_count"] == "2" and r["sub_added"] == ""
+    # a video VLC starts at a resume point: it opens after our first tick, so its
+    # position doesn't matter
+    resume = Harness(runtime, tmp_path / "resume", INTF)
+    resume.heartbeat()
+    resume.init()
+    resume.mock.input = None
+    resume.tick()
+    resume.set_input()
+    resume.mock.input.time = 1_500_000_000
+    resume.settle()
+    r = resume.requests()[0]
+    assert r["sub_count"] == "2" and r["sub_added"] == "0"
+    # --start-time 60 with the video open at our first tick: played from there
+    start = Harness(runtime, tmp_path / "start", INTF)
+    start.heartbeat()
+    start.init()
+    start.set_input()
+    start.mock.input.time = 61_000_000
+    start.mock.input.vars["start-time"] = 60.0
+    start.settle()
+    r = start.requests()[0]
+    assert r["sub_count"] == "2" and r["sub_added"] == "0"
     # no vlc.var.create: a replay of the same item can't be told apart
     old = Harness(runtime, tmp_path / "old", INTF)
     old.heartbeat()

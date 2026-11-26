@@ -169,7 +169,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
         if args.sub_file:
             source = resolve_source(media, None, os.path.abspath(args.sub_file))
         else:
-            source = resolve_source(media, args.sub if args.sub is not None else 0)
+            source = resolve_source(
+                media, args.sub if args.sub is not None else 0, assume_sidecars_first=True
+            )
     except JobError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

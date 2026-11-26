@@ -2,8 +2,8 @@
 by itself for a video ("sidecars") and in which order it lists them.
 
 A port of ``subtitles_Detect`` (src/input/subtitles.c) and of the sorts in
-``LoadSlaves`` (src/input/input.c) of VLC 3.0, checked against VLC 3.0.20 (VLC 4 has
-the same code):
+``LoadSlaves`` (src/input/input.c) of VLC 3.0 (VLC 4 has the same code), checked
+against a real VLC on Linux, macOS and Windows by scripts/vlc_order_probe.py:
 
 * VLC looks in the video's folder, then in the folders of its ``sub-autodetect-path``
   setting (``./Subtitles, ./subtitles, ./Subs, ./subs``; ``.\\subtitles, .\\subs`` on
@@ -19,8 +19,10 @@ the same code):
   default; 0 turns it off, as does ``sub-autodetect-file``). It then drops a ``.sub``
   that an ``.idx`` of the same name goes with (VobSub), and a ``.cdg`` that hasn't the
   video's exact name.
-* It sorts them twice with the C library's ``qsort``: by ``strcoll`` of their
-  ``file://`` URIs in VLC's ``LC_COLLATE`` locale, then by priority, highest first.
+* It sorts them twice with the C library's ``qsort``: by their ``file://`` URIs, then
+  by priority, highest first. The URIs are compared with ``strcoll`` in VLC's
+  ``LC_COLLATE`` locale on Linux, byte by byte on Windows and macOS (VLC for those is
+  cross-compiled, and then its configure leaves ``strcoll`` out).
   ``qsort`` need not keep the order of equal items (on Windows it doesn't), and a
   dropped file stays in the first sort as an item equal to every other. So the order
   is the C library's: :class:`VlcSidecars` runs this machine's ``qsort`` and
@@ -269,7 +271,11 @@ def _sorter() -> tuple[Callable[[list, Callable[[object, object], int]], list], 
     return _msort, sys.platform.startswith("linux")  # glibc's, if this is glibc
 
 
-_LC_COLLATE_MASK = {"darwin": 1 << 0}  # glibc and musl: 1 << LC_COLLATE (3)
+# VLC compares the URIs with strcoll only where it was built on the OS it runs on:
+# VLC for Windows and macOS is cross-compiled, so configure's AC_FUNC_STRCOLL can't run
+# its test and VLC uses strcmp (checked with VLC 3.0.24 from videolan.org).
+_VLC_USES_STRCOLL = sys.platform not in ("win32", "darwin")
+_LC_COLLATE_MASK = 1 << 3  # glibc and musl: 1 << LC_COLLATE (3)
 
 
 @functools.lru_cache(maxsize=8)
@@ -278,7 +284,7 @@ def _strcoll(name: str) -> Callable[[str, str], int] | None:
     this OS or the locale is not available). "C" is a byte compare everywhere."""
     if name in ("C", "POSIX"):
         return lambda a, b: (a > b) - (a < b)  # URIs are ASCII
-    if sys.platform == "win32":  # pragma: no cover - VLC for Windows never sets a locale
+    if not _VLC_USES_STRCOLL:  # pragma: no cover - not needed there
         return None
     try:  # pragma: no cover - depends on the C library
         import ctypes
@@ -289,7 +295,7 @@ def _strcoll(name: str) -> Callable[[str, str], int] | None:
         newlocale.restype = ctypes.c_void_p
         strcoll_l.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
         strcoll_l.restype = ctypes.c_int
-        loc = newlocale(_LC_COLLATE_MASK.get(sys.platform, 1 << 3), name.encode(), None)
+        loc = newlocale(_LC_COLLATE_MASK, name.encode(), None)
     except (OSError, AttributeError, ImportError):
         return None
     if not loc:
@@ -410,7 +416,12 @@ class VlcSidecars:
         sort, exact = _sorter()
         why = [] if exact or len(self.entries) < 2 else ["can't sort like VLC's C library"]
         collate = self.settings.collate
-        names = [collate] if collate else list(dict.fromkeys([_env_collate(), "C"]))
+        if not _VLC_USES_STRCOLL:
+            names = ["C"]
+        elif collate:
+            names = [collate]
+        else:
+            names = list(dict.fromkeys([_env_collate(), "C"]))
         live = [i for i, e in enumerate(self.entries) if not e.dropped]
         orders: list[tuple[str, ...]] = []
         for name in names:

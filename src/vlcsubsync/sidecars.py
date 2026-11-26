@@ -28,21 +28,27 @@ against a real VLC on Linux, macOS and Windows by scripts/vlc_order_probe.py:
   is the C library's: :class:`VlcSidecars` runs this machine's ``qsort`` and
   ``strcoll`` the way VLC does, which matches VLC when both run on the same machine.
 
-Files given when the video opens (``--sub-file``, ``--input-slave``, the Open
-dialog's subtitle file, the files added during an earlier play of the same playlist
-item) take part in those sorts too. VLC lists them first, but where they are in the
-sorts can change the order of equal sidecars: :meth:`VlcSidecars.orders` tries every
-place they can be. Not covered: a playlist item's own options.
+Files given when the video opens take part in those sorts too, at the highest
+priority (5), so VLC lists them first. The ``--sub-file`` (also the Open dialog's
+subtitle file) is in the URI sort; right after it VLC deletes every item from the
+second one on with the ``--sub-file``'s URI: its own copy among the sidecars if it
+sorted first, else the ``--sub-file`` itself (and with it the string it compares
+with, so on glibc and macOS nothing else matches after that). The files added during
+an earlier play of the same playlist item come after the URI sort. Where they all
+sit can change the order of equal sidecars: :meth:`VlcSidecars.lists` works it out
+for a known ``--sub-file`` and tries every place an unknown one can be.
 """
 
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 import os
+import platform
 import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -165,6 +171,10 @@ class Entry:
 def scan(media_path: str, settings: Autodetect, windows: bool) -> list[Entry]:
     """VLC's ``subtitles_Detect`` scan: the files it keeps, in the order it finds them
     (folder by folder, each in the order the OS lists it)."""
+    return _mark_dropped(_found(media_path, settings, windows))
+
+
+def _found(media_path: str, settings: Autodetect, windows: bool) -> list[Entry]:
     if settings.enabled is False or settings.fuzzy == 0:
         return []
     fuzzy = 3 if settings.fuzzy is None else settings.fuzzy
@@ -193,6 +203,12 @@ def scan(media_path: str, settings: Autodetect, windows: bool) -> list[Entry]:
             if path == media_path or not os.path.isfile(path):
                 continue
             found.append(Entry(path, path_to_uri(path, windows), prio))
+    return found
+
+
+def _mark_dropped(found: Sequence[Entry]) -> list[Entry]:
+    """VLC drops a ``.sub`` that an ``.idx`` of the same name goes with and a ``.cdg``
+    without the video's exact name."""
     out = []
     for e in found:
         ext = _ext(e.uri)
@@ -200,8 +216,24 @@ def scan(media_path: str, settings: Autodetect, windows: bool) -> list[Entry]:
         if ext == "sub":
             stem = e.uri[:-3].lower()
             drop = any(o.uri.lower().startswith(stem) and _ext(o.uri) == "idx" for o in found)
-        out.append(Entry(e.path, e.uri, e.priority, dropped=True) if drop else e)
+        out.append(Entry(e.path, e.uri, e.priority, dropped=drop))
     return out
+
+
+def startup_file(sub_file: str, windows: bool) -> tuple[str, str] | None:
+    """The path and URI VLC uses for a ``--sub-file`` (``input_SubtitleFile2Uri``: a
+    ``.sub`` with an ``.idx`` next to it is taken as the ``.idx``), or None for a
+    relative path (VLC makes it absolute with its own working folder)."""
+    path = sub_file
+    if path.endswith(".sub") and os.path.isfile(path[:-4] + ".idx"):
+        path = path[:-4] + ".idx"
+    if windows:
+        absolute = path.startswith("\\\\") or (
+            len(path) >= 3 and path[0].isascii() and path[0].isalpha() and path[1:3] == ":\\"
+        )
+    else:
+        absolute = path.startswith("/")
+    return (path, path_to_uri(path, windows)) if absolute else None
 
 
 # --------------------------------------------------------------------------------------
@@ -303,7 +335,7 @@ def _strcoll(name: str) -> Callable[[str, str], int] | None:
     return lambda a, b: strcoll_l(a.encode(), b.encode(), loc)  # loc is kept for good
 
 
-def _env_collate() -> str:
+def env_collate() -> str:
     for var in ("LC_ALL", "LC_COLLATE", "LANG"):
         if os.environ.get(var):
             return os.environ[var]
@@ -324,31 +356,73 @@ def _ranks(uris: Sequence[str], coll: Callable[[str, str], int]) -> tuple[dict[i
     return rank, r
 
 
-_HEAD, _TAIL = object(), object()  # files given when the video opened
+@functools.cache
+def _free_clobbers() -> tuple[bool, ...]:
+    """Whether freeing a string overwrites its first bytes here, which VLC's duplicate
+    check relies on without knowing it: once VLC deleted the ``--sub-file`` itself, it
+    goes on comparing with the freed URI, which matches nothing on glibc (its tcache
+    and bins keep their links there) and macOS. Elsewhere (Windows' heap) both may
+    happen."""
+    linux_glibc = sys.platform.startswith("linux") and platform.libc_ver()[0] == "glibc"
+    return (True,) if sys.platform == "darwin" or linux_glibc else (True, False)
+
+
+@dataclass(frozen=True)
+class _Head:
+    """The ``--sub-file`` in VLC's sorts: a known file (``path``, ``uri``), an unknown
+    one that is sidecar number ``same``, or (neither) an unknown other file."""
+
+    path: str = ""
+    uri: str = ""
+    same: int = -1
+
+    @property
+    def unseen(self) -> bool:  # a file SubSync doesn't know
+        return not self.path and self.same < 0
+
+
+_HEAD, _TAIL = object(), object()  # the --sub-file, another file given at startup
 
 
 def _order(
     entries: Sequence[Entry],
-    rank: dict[int, int],
+    rank: dict[int, float],
     sort: Callable[[list, Callable[[object, object], int]], list],
-    head: float | None,
-    tail: int,
-) -> tuple[str, ...]:
-    """VLC's order of ``entries`` (``rank``: index -> strcoll rank of its URI), with
-    the ``--sub-file`` (strcoll rank ``head``, None: none) and ``tail`` other files given
-    when the video opened."""
+    head: _Head | None,
+    head_rank: float,
+    tails: int,
+    clobber: bool,
+) -> tuple[str | None, ...]:
+    """VLC's list of the files it loads as the video opens (``LoadSlaves``): the paths
+    of ``entries`` (``rank``: index -> strcoll rank of its URI) and of the ``--sub-file``
+    ``head`` (strcoll rank ``head_rank``), None for one SubSync doesn't know (an
+    unknown ``--sub-file``, the ``tails`` other files given at startup). ``clobber``:
+    see :func:`_free_clobbers`."""
     items: list = ([_HEAD] if head is not None else []) + [
         None if e.dropped else i for i, e in enumerate(entries)
     ]
 
+    def uri_rank(x) -> float:
+        return head_rank if x is _HEAD else rank[x]
+
     def by_uri(a, b) -> int:  # slave_strcmp
         if a is None or b is None:
             return 0
-        ra = head if a is _HEAD else rank[a]
-        rb = head if b is _HEAD else rank[b]
+        ra, rb = uri_rank(a), uri_rank(b)
         return (ra > rb) - (ra < rb)
 
-    items = sort(items, by_uri) + [_TAIL] * tail
+    items = sort(items, by_uri)
+    if head is not None:  # every item with the --sub-file's URI from the second one on
+        matching = True
+        for i in range(1, len(items)):
+            x = items[i]
+            if x is None or not matching:
+                continue
+            if x is _HEAD or x == head.same or (head.uri and entries[x].uri == head.uri):
+                items[i] = None
+                if x is _HEAD and clobber:
+                    matching = False  # the URI it compares with is gone
+    items += [_TAIL] * tails
 
     def prio(x) -> int:
         return PRIORITY_USER if x is _HEAD or x is _TAIL else entries[x].priority
@@ -359,27 +433,37 @@ def _order(
         pa, pb = prio(a), prio(b)
         return -1 if pa > pb else 1 if pa < pb else 0
 
-    out = []
+    out: list[str | None] = []
     for x in sort(items, by_priority):
         if x is None:
-            break  # VLC stops at the first dropped one
-        if x is not _HEAD and x is not _TAIL:
+            break  # VLC stops at the first deleted one
+        if x is _TAIL or (x is _HEAD and head is not None and head.unseen):
+            out.append(None)
+        elif x is _HEAD and head is not None:
+            out.append(os.path.normpath(head.path or entries[head.same].path))
+        else:
             out.append(os.path.normpath(entries[x].path))
     return tuple(out)
 
 
+MAX_ABSENT = 6  # files VLC hasn't open whose presence at startup is tried both ways
+
+
 @dataclass(frozen=True)
 class Orders:
-    """The orders VLC may list a video's sidecars in."""
+    """The lists VLC may have made of the files it loaded as the video opened."""
 
-    orders: list[tuple[str, ...]]  # the likeliest first
+    orders: list[tuple[str | None, ...]]  # the likeliest first; None: a file SubSync can't see
     exact: bool  # False: VLC's sort or locale couldn't be redone here, so not sure at all
     why: str = ""  # why there is more than one, or why it isn't exact
 
 
 class VlcSidecars:
     """The sidecars VLC 3 loads for a video (see the module docstring), a sequence of
-    their paths in the likeliest order."""
+    their paths in the likeliest order.
+
+    ``sub_file``: VLC's ``sub-file`` variable for the video ("" for none, None if not
+    known): the ``--sub-file`` or the Open dialog's subtitle file."""
 
     def __init__(
         self,
@@ -387,13 +471,25 @@ class VlcSidecars:
         settings: Autodetect | None = None,
         *,
         windows: bool | None = None,
+        sub_file: str | None = "",
     ):
         self.media = os.fspath(media_path)
         self.settings = settings or Autodetect()
         self.windows = sys.platform == "win32" if windows is None else windows
-        self.entries = scan(self.media, self.settings, self.windows)
-        self._cache: dict[int, Orders] = {}
-        self.paths: list[str] = list(self.orders(0).orders[0])
+        self._found = _found(self.media, self.settings, self.windows)
+        self.entries = _mark_dropped(self._found)
+        self.startup = startup_file(sub_file, self.windows) if sub_file else None
+        # where SubSync can't tell what VLC made of it: an unknown or relative --sub-file
+        self.sub_file_known = sub_file is not None and (not sub_file or self.startup is not None)
+        first = self.lists(first_only=True).orders
+        self.paths: list[str] = [p for p in first[0] if p is not None] if first else []
+        live = [os.path.normpath(e.path) for e in self.entries if not e.dropped]
+        startup = [os.path.normpath(self.startup[0])] if self.startup else []
+        # every file that can be in VLC's list, and every file the scan found
+        self.group: list[str] = list(dict.fromkeys([*self.paths, *live, *startup]))
+        self.files: list[str] = list(
+            dict.fromkeys([*self.group, *(os.path.normpath(e.path) for e in self.entries)])
+        )
 
     def __iter__(self):
         return iter(self.paths)
@@ -404,44 +500,100 @@ class VlcSidecars:
     def __getitem__(self, i):
         return self.paths[i]
 
-    def orders(self, extra: int = 0) -> Orders:
-        """Every order VLC may list the sidecars in when ``extra`` other files were given
-        as the video opened (they are listed first)."""
-        extra = max(0, extra)
-        if extra not in self._cache:
-            self._cache[extra] = self._orders(extra)
-        return self._cache[extra]
+    def lists(
+        self,
+        tails: Callable[[int], Iterable[int]] = lambda n: (0,),
+        *,
+        maybe_absent: Sequence[Iterable[str]] = (),
+        is_open: Callable[[str], bool] | None = None,
+        first_only: bool = False,
+    ) -> Orders:
+        """Every list VLC may have made of the files it loaded as the video opened.
 
-    def _orders(self, extra: int) -> Orders:
+        ``tails(n)``: how many other files may have been given at startup (files added
+        during an earlier play of the same playlist item), when VLC listed ``n`` files
+        besides them. ``maybe_absent``: the paths of files (one group each) that may
+        have appeared after the video opened (VLC hasn't them open); both are tried.
+        ``is_open``: whether VLC has a file open; the others are left out of the lists
+        (VLC couldn't load them)."""
         sort, exact = _sorter()
         why = [] if exact or len(self.entries) < 2 else ["can't sort like VLC's C library"]
+        live_prios = [e.priority for e in self.entries if not e.dropped]
         collate = self.settings.collate
         if not _VLC_USES_STRCOLL:
             names = ["C"]
         elif collate:
             names = [collate]
         else:
-            names = list(dict.fromkeys([_env_collate(), "C"]))
-        live = [i for i, e in enumerate(self.entries) if not e.dropped]
-        orders: list[tuple[str, ...]] = []
-        for name in names:
-            coll = _strcoll(name)
-            if coll is None:
+            names = list(dict.fromkeys([env_collate(), "C"]))
+            # the order depends on the locale unless the priorities alone decide it
+            if (
+                len(set(live_prios)) < len(live_prios)
+                or self.startup is not None
+                or (not self.sub_file_known and live_prios)
+            ):
                 exact = False
-                why.append(f"can't compare names like VLC's locale {name!r}")
-                coll = _strcoll("C")
-            rank, r = _ranks([self.entries[i].uri for i in live], coll)
-            rank = {live[j]: v for j, v in rank.items()}
-            heads: list[float | None] = [None]
-            if extra:  # if one of them is the --sub-file, it can be anywhere among the URIs
-                heads += [h - 0.5 for h in range(r + 2)]
-            for head in heads:
-                o = _order(self.entries, rank, sort, head, extra - (head is not None))
-                if o not in orders:
-                    orders.append(o)
-        if len(orders) > 1:
+                why.append("VLC's locale isn't known")
+        groups = [g for g in (frozenset(map(os.path.normpath, g)) for g in maybe_absent) if g]
+        if first_only:
+            subsets: list[frozenset[str]] = [frozenset()]
+        elif len(groups) <= MAX_ABSENT:
+            subsets = [
+                frozenset().union(*c)
+                for r in range(len(groups) + 1)
+                for c in itertools.combinations(groups, r)
+            ]
+        else:
+            subsets = [frozenset(), frozenset().union(*groups)]
+            exact = False
+            why.append(f"VLC hasn't {len(groups)} of the subtitle files open")
+        out: list[tuple[str | None, ...]] = []
+        for absent in subsets:
+            entries = (
+                self.entries
+                if not absent
+                else _mark_dropped(
+                    [e for e in self._found if os.path.normpath(e.path) not in absent]
+                )
+            )
+            live = [i for i, e in enumerate(entries) if not e.dropped]
+            for name in names:
+                coll = _strcoll(name)
+                if coll is None:
+                    exact = False
+                    why.append(f"can't compare names like VLC's locale {name!r}")
+                    coll = _strcoll("C")
+                uris = [entries[i].uri for i in live] + ([self.startup[1]] if self.startup else [])
+                ranked, r = _ranks(uris, coll)
+                rank: dict[int, float] = {live[j]: ranked[j] for j in range(len(live))}
+                heads: list[tuple[_Head | None, float]]
+                if self.startup:
+                    heads = [(_Head(*self.startup), ranked[len(live)])]
+                elif self.sub_file_known:
+                    heads = [(None, 0.0)]
+                else:  # it may be one of the sidecars, or another file at any rank
+                    heads = [(None, 0.0)]
+                    heads += [(_Head(same=i), rank[i]) for i in live]
+                    heads += [(_Head(), h - 0.5) for h in range(r + 2)]
+                for head, head_rank in heads[:1] if first_only else heads:
+                    for clobber in _free_clobbers()[:1] if head is None else _free_clobbers():
+                        base = _order(entries, rank, sort, head, head_rank, 0, clobber)
+                        n = sum(1 for x in base if x is None or is_open is None or is_open(x))
+                        for t in tails(n):
+                            seq = (
+                                base
+                                if t == 0
+                                else _order(entries, rank, sort, head, head_rank, t, clobber)
+                            )
+                            if is_open is not None:
+                                seq = tuple(x for x in seq if x is None or is_open(x))
+                            if seq not in out:
+                                out.append(seq)
+                        if first_only and out:
+                            return Orders(out, exact, "; ".join(dict.fromkeys(why)))
+        if len(out) > 1:
             why.append("VLC's order depends on things SubSync can't see")
-        return Orders(orders, exact, "; ".join(why))
+        return Orders(out, exact, "; ".join(dict.fromkeys(why)))
 
     def autoloads(self, path: str) -> bool:
         """Whether VLC's scan takes subtitle file ``path``."""

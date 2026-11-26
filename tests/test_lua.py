@@ -516,14 +516,15 @@ def test_request_counts_tracks_added_after_the_file_opened(h):
     assert r["sub_index"] == "3" and r["sub_count"] == "4" and r["sub_added"] == "1"
 
 
-def autodetect_vars(hh, on=True, fuzzy=3, paths="./Subs, ./subs"):
-    """VLC's subtitle autodetection settings, as the input object has them."""
+def autodetect_vars(hh, on=True, fuzzy=3, paths="./Subs, ./subs", sub_file=""):
+    """VLC's subtitle autodetection settings and sub-file, as the input object has them."""
     v = hh.mock.input.vars
     v["sub-autodetect-file"], v["sub-autodetect-fuzzy"], v["sub-autodetect-path"] = (
         on,
         fuzzy,
         paths,
     )
+    v["sub-file"] = sub_file
 
 
 def this_collate() -> str | None:
@@ -542,6 +543,7 @@ def test_request_sends_vlcs_subtitle_autodetection_settings(h):
     assert r["sub_autodetect"] == "1" and r["sub_fuzzy"] == "3"
     assert r["sub_paths"] == "./Subs, ./subs"
     assert r.get("sub_collate") == this_collate()
+    assert r["sub_file"] == ""  # no --sub-file: sent, so the helper knows
     h.finish(r["id"])
     h.tick(3)  # our synced track shows up
     # read once per video: a change in VLC's preferences counts from the next one
@@ -557,13 +559,20 @@ def test_request_sends_vlcs_subtitle_autodetection_settings(h):
     h.settle()
     r = h.requests()[0]
     assert r["sub_autodetect"] == "0" and r["sub_fuzzy"] == "1" and r["sub_paths"] == ""
+    h.finish(r["id"])
+    h.tick(3)
+    # the Open dialog's subtitle file (or --sub-file)
+    h.set_input(uri="file:///media/Third.mkv")
+    autodetect_vars(h, sub_file="/media/Third.en.srt")
+    h.settle()
+    assert h.requests()[0]["sub_file"] == "/media/Third.en.srt"
 
 
 def test_request_leaves_out_settings_vlc_does_not_give(h):
     h.set_input()  # an input without these variables
     h.settle()
     r = h.requests()[0]
-    assert not {"sub_autodetect", "sub_fuzzy", "sub_paths"} & r.keys()
+    assert not {"sub_autodetect", "sub_fuzzy", "sub_paths", "sub_file"} & r.keys()
 
 
 def test_same_file_playing_again_counts_from_its_new_start(h):
@@ -1130,12 +1139,13 @@ def test_ext_fallback_sync_sends_vlcs_subtitle_autodetection_settings(ext):
     write_intf_state(ext, age=600, state="idle")
     ext.heartbeat()
     ext.set_input(audio_sel=11, spu_sel=21)
-    autodetect_vars(ext, fuzzy=-1, paths=".\\subs")
+    autodetect_vars(ext, fuzzy=-1, paths=".\\subs", sub_file="C:\\Videos\\Movie.en.srt")
     ext.lua.eval("trigger_menu(1)")
     r = ext.requests()[0]
     assert r["sub_autodetect"] == "1" and r["sub_fuzzy"] == "-1"
     assert r["sub_paths"] == ".\\subs"
     assert r.get("sub_collate") == this_collate()
+    assert r["sub_file"] == "C:\\Videos\\Movie.en.srt"
 
 
 def test_ext_sync_now_exhaustive_signals_running_intf(ext):

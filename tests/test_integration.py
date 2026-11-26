@@ -553,19 +553,43 @@ def _is_snap(vlc: str) -> bool:
     return os.path.realpath(vlc).startswith("/snap/") or vlc.startswith("/snap/")
 
 
+# A Lua intf that adds a subtitle file to the video 2 s after it starts playing, the
+# way Subtitle -> Add Subtitle File... does (vlc.input.add_subtitle selects it).
+ADD_LATER_LUA = """
+local path = [[@PATH@]]
+local since = nil
+while not vlc.misc.should_die() do
+    local input = vlc.object.input()
+    local state = input and vlc.var.get(input, "state")
+    if state == 3 then
+        since = since or vlc.misc.mdate()
+        if vlc.misc.mdate() - since > 2000000 then
+            vlc.msg.info("[subsync-test] adding " .. path)
+            vlc.input.add_subtitle(path)
+            return
+        end
+    end
+    vlc.misc.mwait(vlc.misc.mdate() + 200000)
+end
+"""
+
+
 @contextlib.contextmanager
 def vlc_with_subsync(
     tmp_path: Path,
     place: dict[str, str],
     vlc_args: list[str],
     vlc_env: dict[str, str] | None = None,
+    add_later: str | None = None,
 ):
     """Headless VLC with our Lua intf, and the daemon, until the synced subtitle is
     loaded as a new track (or VLC exits, or 10 minutes pass).
 
     ``place`` maps paths under the media dir to fixture names; ``vlc_args`` go before
-    the media (``{media}`` is replaced by the media dir). Yields the VLC log text, the
-    queue dir and the daemon log path; the caller asserts on them.
+    the media (``{media}`` is replaced by the media dir). ``add_later``: a path under
+    the media dir that a second Lua intf adds to the video once it plays, as
+    **Subtitle → Add Subtitle File…** does (VLC selects it). Yields the VLC log text,
+    the queue dir and the daemon log path; the caller asserts on them.
 
     Isolation: the Lua scripts are found through ``VLC_DATA_PATH`` (VLC searches
     ``$VLC_DATA_PATH/lua/intf``); the interface is enabled on the command line
@@ -601,6 +625,13 @@ def vlc_with_subsync(
     pkg_lua = ROOT / "src" / "vlcsubsync" / "lua"
     shutil.copy2(pkg_lua / "intf" / "subsync.lua", lua_root / "lua" / "intf")
     shutil.copy2(pkg_lua / "extensions" / "subsync_ext.lua", lua_root / "lua" / "extensions")
+    intfs = "luaintf"
+    if add_later:
+        (lua_root / "lua" / "intf" / "subsync_test_add.lua").write_text(
+            ADD_LATER_LUA.replace("@PATH@", str(base / "media" / add_later).replace("\\", "/")),
+            encoding="utf-8",
+        )
+        intfs += ":luaintf{intf=subsync_test_add}"
 
     if snap:
         q = Path.home() / "snap" / "vlc" / "current" / ".local" / "share" / "vlc" / "subsync"
@@ -639,7 +670,7 @@ def vlc_with_subsync(
     vlog_path = base / "vlc.log"
     vlog = vlog_path.open("w", encoding="utf-8", errors="replace")
     vlc_cmd = [
-        vlc, "-I", "dummy", "--extraintf", "luaintf", "--lua-intf", "subsync",
+        vlc, "-I", "dummy", "--extraintf", intfs, "--lua-intf", "subsync",
         "-vv", "--no-metadata-network-access",
         "--vout", "dummy", "--aout", "dummy",
         "--play-and-exit",
@@ -703,25 +734,21 @@ def test_vlc_end_to_end(tmp_path: Path):
 @pytest.mark.slow
 @pytest.mark.vlc
 def test_vlc_subtitle_not_named_like_the_video(tmp_path: Path):
-    """The bug report: a release-pack subtitle (``Subs/2_English.srt``) that VLC
-    loaded although its name doesn't match the video used to fail with "Subtitle
-    track 1 not found (0 embedded, 0 external files)". The helper must find it among
-    the files VLC has open, not one of the other files in ``Subs/``.
-
-    ``--sub-file`` stands in for **Subtitle → Add Subtitle File…**: VLC selects the
-    file and the Lua API can't tell the helper its path. (VLC lists a startup file
-    before its sidecars and a file added later after them; with no sidecar the order
-    doesn't matter.)
-    """
+    """The bug report: a release-pack subtitle (``Subs/2_English.srt``) added with
+    **Subtitle → Add Subtitle File…** while the video plays used to fail with
+    "Subtitle track 1 not found (0 embedded, 0 external files)". The Lua API can't
+    tell the helper its path: the helper must find it among the files VLC has open,
+    not one of the other files in ``Subs/``."""
     place = {
         "Movie.mkv": "en_dialogue.mkv",
         "Subs/2_English.srt": "en_dialogue.offset_plus_3_2.srt",
         "Subs/3_English.srt": "en_dialogue.es_text.offset_plus_3_2.srt",
         "Subs/8_Spanish.srt": "es_dialogue.offset_plus_3_2.srt",
     }
-    args = ["--sub-file", "{media}/Subs/2_English.srt", "{media}/Movie.mkv"]
-    with vlc_with_subsync(tmp_path, place, args) as run:
-        assert " sub=0 of 1 " in run.text, "the request must count VLC's subtitle tracks"
+    args = ["{media}/Movie.mkv"]
+    with vlc_with_subsync(tmp_path, place, args, add_later="Subs/2_English.srt") as run:
+        assert "[subsync-test] adding " in run.text, "the test intf did not add the file"
+        assert " sub=0 of 1 (1 added) " in run.text, "the request must count VLC's tracks"
         daemon_log = run.daemon_log.read_text(encoding="utf-8")
         assert "not found" not in daemon_log
         assert "2_English.srt (open in VLC)" in daemon_log, "picked the wrong file"

@@ -86,9 +86,10 @@ def test_request_sub_count_optional(tmp_path):
 def test_request_vlc_autodetect_settings_optional(tmp_path):
     path = P.write_request(tmp_path, P.Request(id="a1", media="/m.mkv", sub_index=0))
     kv = P.read_kv(path)
-    assert not {"sub_autodetect", "sub_fuzzy", "sub_paths", "sub_collate"} & kv.keys()
+    assert not {"sub_autodetect", "sub_fuzzy", "sub_paths", "sub_collate", "sub_file"} & kv.keys()
     got = P.read_request(path)
     assert (got.sub_autodetect, got.sub_fuzzy, got.sub_paths, got.sub_collate) == (None,) * 4
+    assert got.sub_file is None
     req = P.Request(
         id="a2",
         media="/m.mkv",
@@ -97,14 +98,19 @@ def test_request_vlc_autodetect_settings_optional(tmp_path):
         sub_fuzzy=-1,
         sub_paths="",
         sub_collate="es_ES.UTF-8",
+        sub_file="",
     )
     path = P.write_request(tmp_path, req)
     kv = P.read_kv(path)
     assert kv["sub_autodetect"] == "0" and kv["sub_fuzzy"] == "-1"
     assert kv["sub_paths"] == "" and kv["sub_collate"] == "es_ES.UTF-8"
+    assert kv["sub_file"] == ""
     got = P.read_request(path)
     assert got.sub_autodetect is False and got.sub_fuzzy == -1
     assert got.sub_paths == "" and got.sub_collate == "es_ES.UTF-8"
+    assert got.sub_file == ""  # "" is a value: no file given at startup
+    req = P.Request(id="a5", media="/m.mkv", sub_index=0, sub_file="/v/Movie.en.srt")
+    assert P.read_request(P.write_request(tmp_path, req)).sub_file == "/v/Movie.en.srt"
     # what the Lua intf and extension write
     got = P.Request.from_dict(
         {

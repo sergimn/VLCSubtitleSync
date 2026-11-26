@@ -177,47 +177,17 @@ EXPECTED = {
 LAYOUTS = {"two": TWO, "three": THREE, "case": CASE, "nine": NINE, "vobsub": VOBSUB}
 
 
-def listed_in(order, monkeypatch):
-    """Make SubSync read folders in this order of names (then the rest).
-
-    VLC and SubSync read a folder in the order the file system gives (readdir). ext4
-    hashes names with a seed of each file system, so that order differs between Linux
-    machines; NTFS keeps names sorted and APFS hashes them the same way everywhere. It
-    only shows where a dropped file (a .sub next to its .idx) sits among equal ones:
-    VLC's sort takes it as equal to every other file, so the sort depends on where
-    each file started."""
-    real = os.scandir
-
-    class Listing:
-        def __init__(self, entries):
-            self.entries = entries
-
-        def __enter__(self):
-            return iter(self.entries)
-
-        def __exit__(self, *exc):
-            return False
-
-    def scandir(folder):
-        with real(folder) as it:
-            entries = list(it)
-        rank = {n: i for i, n in enumerate(order)}
-        return Listing(sorted(entries, key=lambda e: rank.get(e.name, len(rank))))
-
-    monkeypatch.setattr(S.os, "scandir", scandir)
-
-
 @pytest.mark.parametrize("name", list(LAYOUTS))
-def test_order_is_what_vlc_loads_on_this_os(tmp_path, name, monkeypatch):
+def test_order_is_what_vlc_loads_on_this_os(tmp_path, name, listed_in):
     plat = "linux" if LINUX else sys.platform
     if plat not in EXPECTED:
         pytest.skip(f"no VLC order known for {sys.platform}")
     if LINUX:
-        listed_in(LAYOUTS[name], monkeypatch)  # the order the files were made in
+        listed_in(LAYOUTS[name])  # the order the files were made in
     media = layout(tmp_path, *LAYOUTS[name])
     det = VlcSidecars(media, C())
     assert names(tmp_path, det.paths) == EXPECTED[plat][name]
-    got = det.orders(0)
+    got = det.lists()
     assert got.exact and len(got.orders) == 1 and not got.why
 
 
@@ -272,29 +242,47 @@ def test_unknown_locale_gives_every_candidate(tmp_path, monkeypatch):
         pytest.skip("no en_US.UTF-8 locale here")
     monkeypatch.setenv("LC_ALL", "en_US.UTF-8")
     media = layout(tmp_path, *MATRIX, media="The.Matrix.mp4")
-    got = VlcSidecars(media, Autodetect()).orders(0)  # an older intf: no settings
+    got = VlcSidecars(media, Autodetect()).lists()  # an older intf: no settings
     assert [names(tmp_path, o)[-3:] for o in got.orders] == [
         ["the_matrix_de.ass", "The.Matrix.en.srt", "The.Matrix-ZZ.ssa"],  # this process's
         ["The.Matrix-ZZ.ssa", "The.Matrix.en.srt", "the_matrix_de.ass"],  # C
     ]
-    got = VlcSidecars(media, Autodetect(True, 3, None, "xx_NOPE.UTF-8")).orders(0)
+    # ... and VLC's may be another one
+    assert not got.exact and "locale isn't known" in got.why
+    got = VlcSidecars(media, Autodetect(True, 3, None, "xx_NOPE.UTF-8")).lists()
     assert not got.exact and "xx_NOPE" in got.why
 
 
+@pytest.mark.skipif(not LINUX, reason="VLC sorts with the locale on Linux only")
+def test_unknown_locale_is_no_matter_where_the_priorities_decide(tmp_path):
+    media = layout(tmp_path, "Movie.srt", "Movie.EN.srt", "Best of Movie.srt")
+    got = VlcSidecars(media, Autodetect(True, 2, None, None)).lists()
+    assert got.exact and len(got.orders) == 1
+    two = layout(tmp_path / "two", "Movie.EN.srt", "Movie.de.srt")
+    assert not VlcSidecars(two, Autodetect(True, 3, None, None)).lists().exact
+
+
 def test_files_given_at_startup_can_change_the_order(tmp_path):
+    # VLC lists four files: the three sidecars and one SubSync doesn't know about (an
+    # unknown --sub-file, or a file added during an earlier play)
     media = layout(tmp_path, *THREE)
-    det = VlcSidecars(media, C())
-    got = det.orders(1)
+    det = VlcSidecars(media, C(), sub_file=None)
+    got = det.lists(lambda n: (4 - n,) if n <= 4 else ())
     assert got.exact
     for order in got.orders:  # the same files, maybe in another order
-        assert sorted(names(tmp_path, order)) == sorted(names(tmp_path, det.paths))
+        assert sorted(names(tmp_path, [p for p in order if p])) == sorted(
+            names(tmp_path, det.paths)
+        )
+        assert len(order) == 4
     if WINDOWS:  # where the --sub-file sorts among them changes Windows' qsort order
         assert len(got.orders) > 1 and got.why
     if LINUX:  # glibc's merge sort keeps equal ones in order
-        assert [names(tmp_path, o) for o in got.orders] == [names(tmp_path, det.paths)]
+        assert {tuple(names(tmp_path, [p for p in o if p])) for o in got.orders} == {
+            tuple(names(tmp_path, det.paths))
+        }
 
 
-def test_a_dropped_sub_makes_the_order_depend_on_the_folder_listing(tmp_path, monkeypatch):
+def test_a_dropped_sub_makes_the_order_depend_on_the_folder_listing(tmp_path, listed_in):
     # what the ext4 CI runners showed: the same files, listed in another order
     media = layout(tmp_path, *VOBSUB)
     want = {
@@ -314,7 +302,7 @@ def test_a_dropped_sub_makes_the_order_depend_on_the_folder_listing(tmp_path, mo
     if not LINUX:
         pytest.skip("glibc's merge sort only")
     for order, expected in want.items():
-        listed_in(order, monkeypatch)
+        listed_in(order)
         assert names(tmp_path, VlcSidecars(media, C()).paths) == expected
 
 
@@ -340,7 +328,7 @@ def test_c_qsort_is_this_c_librarys(monkeypatch):
 def test_without_the_c_library_sort_the_order_is_not_sure(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "_c_qsort", lambda: None)
     media = layout(tmp_path, *TWO)
-    got = VlcSidecars(media, C()).orders(0)
+    got = VlcSidecars(media, C()).lists()
     assert got.exact == LINUX
     assert names(tmp_path, got.orders[0]) == TWO
 

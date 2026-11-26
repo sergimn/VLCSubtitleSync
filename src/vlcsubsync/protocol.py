@@ -216,6 +216,9 @@ class Request:
     sub_fuzzy: int | None = None
     sub_paths: str | None = None
     sub_collate: str | None = None
+    # VLC's sub-file variable (the --sub-file or the Open dialog's subtitle file): ""
+    # for none, None if not sent.
+    sub_file: str | None = None
     audio_label: str = ""
     sub_label: str = ""
     force: bool = False
@@ -251,6 +254,8 @@ class Request:
             out["sub_paths"] = self.sub_paths
         if self.sub_collate:
             out["sub_collate"] = self.sub_collate
+        if self.sub_file is not None:
+            out["sub_file"] = self.sub_file
         mode = normalize_mode(self.mode)
         if mode:
             out["mode"] = mode
@@ -299,6 +304,7 @@ class Request:
             sub_fuzzy=_to_int(data.get("sub_fuzzy"), None),
             sub_paths=data.get("sub_paths"),  # "" is a value: no subfolders
             sub_collate=(data.get("sub_collate") or "").strip() or None,
+            sub_file=data.get("sub_file"),  # "" is a value: no file given at startup
             audio_label=data.get("audio_label") or "",
             sub_label=data.get("sub_label") or "",
             force=_to_bool(data.get("force")),

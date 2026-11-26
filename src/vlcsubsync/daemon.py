@@ -453,7 +453,6 @@ def _external_track_file(
     *,
     vlc_files: bool,
     autoloaded_others: bool,
-    strict: bool = False,
     assume_sidecars_first: bool = False,
 ) -> str | None:
     """The file of external subtitle track ``k`` (0-based), or None if it can't be told.
@@ -468,9 +467,7 @@ def _external_track_file(
     and every file added during an earlier play of the same playlist item, SubSync's
     synced copies too), then the sidecars it found itself, then the files added during
     this play, in the order they were added. A file outside the sidecars is picked only
-    where these counts place it for certain. ``strict``: ``known`` are exactly the files
-    VLC's rules load, so more of them than VLC listed when the video opened means one
-    appeared since (VLC lists it last): give up instead of guessing. Without counts
+    where these counts place it for certain. Without counts
     (``n_ext`` None) VLC's order is unknown, so only the sidecars and the only open file
     are picked, unless ``assume_sidecars_first`` (the CLI's numbering): then the one
     other file is taken as the track after the sidecars. See DESIGN.md "External subs".
@@ -503,8 +500,6 @@ def _external_track_file(
     startup = n_ext - n_added  # tracks listed when the video opened
     extra = startup - a  # ... that are not sidecars: listed before them
     startup_others = n - n_added  # other files open since then (if every added track is one)
-    if extra < 0 and strict:
-        return None  # a sidecar that appeared after the video opened, VLC lists it last
     if extra < 0 or startup_others < 0:
         return as_before()  # e.g. closed captions: added tracks without a file
     if k >= startup:
@@ -519,6 +514,50 @@ def _external_track_file(
     # tracks we can't place: SubSync's synced copies from an earlier play (VLC lists them
     # first), subtitles attached to the video (VLC lists them after the sidecars)
     return as_before()
+
+
+def _track_in_list(
+    k: int,
+    n_ext: int | None,
+    n_added: int | None,
+    listed: Sequence[str | None],
+    others: Sequence[str],
+    *,
+    vlc_files: bool,
+    autoloaded_others: bool,
+    assume_sidecars_first: bool = False,
+) -> str | None:
+    """The file of external subtitle track ``k`` (0-based) from one list VLC may have
+    made of the files it loaded as the video opened (``listed``, see
+    :meth:`vlcsubsync.sidecars.VlcSidecars.lists`: paths in VLC's order, None for a file
+    SubSync can't see), or None if it can't be told. The other arguments are
+    :func:`_external_track_file`'s. VLC lists the files added during this play after
+    those, in the order they were added."""
+    known = [x for x in listed if x is not None]
+    a, n, unseen = len(known), len(others), len(listed) - len(known)
+    if vlc_files and a + n == 1 and k == 0 and n_ext in (None, 1):
+        return [*known, *others][0]  # the only subtitle file VLC has open
+    if n_ext is None:  # no counts: SubSync's own numbering, the sidecars first
+        if k < a:
+            return known[k]
+        return others[0] if assume_sidecars_first and k == a and n == 1 else None
+    if vlc_files and autoloaded_others:
+        # VLC's settings are unknown and it sorts these among its sidecars
+        return known[k] if k < a else None
+    if k < len(listed):
+        if listed[k] is not None:
+            return listed[k]
+        # a file given at startup that isn't a sidecar: the one other file VLC has open,
+        # if every other file was given at startup
+        return (
+            others[0]
+            if vlc_files and n == 1 and n_added is not None and n - n_added == unseen
+            else None
+        )
+    if not vlc_files or n_added is None:
+        return None
+    # added during this play
+    return others[0] if unseen == 0 and n == 1 and n_added == 1 else None
 
 
 def _file_id(path: str) -> object:
@@ -542,6 +581,7 @@ def resolve_source(
     sub_count: int | None = None,
     sub_added: int | None = None,
     autodetect: Autodetect | None = None,
+    sub_file: str | None = None,
     exclude_dirs: Iterable[str | os.PathLike[str]] | None = None,
     count_embedded: Callable[[str], int] = count_embedded_subtitles,
     find_sidecars: Callable[[str], Sequence[Any]] | None = None,
@@ -558,23 +598,26 @@ def resolve_source(
     ``sub_path`` always wins. ``sub_count`` is the number of subtitle tracks VLC lists
     and ``sub_added`` how many of them showed up after the video opened, our synced
     ones excluded (None: unknown). ``autodetect``: VLC's subtitle autodetection
-    settings for the video, as the intf sent them.
+    settings for the video and ``sub_file`` its ``sub-file`` variable ("" for none,
+    None: unknown), as the intf sent them.
 
     VLC's Lua API can't tell which file an external track came from. SubSync works out
-    the sidecars VLC loaded by itself and their order with a copy of VLC's rules
-    (:class:`vlcsubsync.sidecars.VlcSidecars`, or ``find_sidecars``). With one sidecar
-    and no other external track VLC lists, it picks that sidecar. Otherwise it looks at
-    the subtitle files the VLC process playing ``media`` has open (``open_in_vlc``;
+    the files VLC loaded as the video opened and their order with a copy of VLC's rules
+    (:class:`vlcsubsync.sidecars.VlcSidecars`, or ``find_sidecars``). With one such
+    file and no other external track VLC lists, it picks that file. Otherwise it looks
+    at the subtitle files the VLC process playing ``media`` has open (``open_in_vlc``;
     files in ``exclude_dirs``, our synced copies, don't count) or, if the OS can't
     tell, the subtitle files near the video (``subtitles_near``), and picks one only
-    where VLC's track order places it for certain (:func:`_external_track_file`) in
-    every order VLC may have listed the sidecars in. When VLC has a subtitle file open
-    that its rules would have loaded but SubSync's copy didn't find, it doesn't guess.
-    ``may_autoload(media, path)``: whether VLC may have loaded ``path`` by itself when
-    its settings are not known (default :func:`vlcsubsync.sidecars.may_be_autoloaded`).
-    ``assume_sidecars_first``: without counts, number the one other file after the
-    sidecars (the CLI's numbering; VLC's own order is unknown then). See DESIGN.md
-    "External subs".
+    where every list VLC may have made places it for certain (:func:`_track_in_list`,
+    :func:`_external_track_file` for ``find_sidecars``). A file VLC hasn't open may
+    have appeared after the video opened: the lists with and without it must agree.
+    When VLC has a subtitle file open that its rules would have loaded but SubSync's
+    copy didn't find, or tracks were added but it isn't known how many, it doesn't
+    guess. ``may_autoload(media, path)``: whether VLC may have loaded ``path`` by itself
+    when its settings are not known (default
+    :func:`vlcsubsync.sidecars.may_be_autoloaded`). ``assume_sidecars_first``: without
+    counts, number the one other file after the sidecars (the CLI's numbering, in this
+    machine's locale; VLC's own order is unknown then). See DESIGN.md "External subs".
     """
     if sub_path:
         if not os.path.isfile(sub_path):
@@ -589,17 +632,23 @@ def resolve_source(
     if sub_index < n_embedded:
         return ResolvedSource("embedded", index=sub_index)
     k = sub_index - n_embedded
-    from .sidecars import VlcSidecars, may_be_autoloaded
+    from .sidecars import VlcSidecars, env_collate, may_be_autoloaded
 
-    detected = VlcSidecars(media, autodetect) if find_sidecars is None else None
+    n_ext = None if sub_count is None else max(0, sub_count - n_embedded)
+    n_added = None if sub_added is None or n_ext is None else min(max(0, sub_added), n_ext)
+    if assume_sidecars_first:  # the CLI: no VLC, no file given at startup
+        sub_file = ""
+        autodetect = autodetect or Autodetect(collate=env_collate())
+    elif n_ext is None and not sub_file:
+        sub_file = ""  # without counts SubSync can't place files given at startup anyway
+    detected = VlcSidecars(media, autodetect, sub_file=sub_file) if find_sidecars is None else None
+    # every file VLC may have loaded as the video opened (the sidecars and the --sub-file)
     sidecars = (
-        list(detected.paths) if detected is not None else [str(p) for p in find_sidecars(media)]
+        list(detected.group) if detected is not None else [str(p) for p in find_sidecars(media)]
     )
     # VLC's own settings: SubSync's copy of its rules is exact, so a file it can't
     # place means the copy is wrong (another VLC, a playlist item's own options)
     exact = detected is not None and autodetect is not None and autodetect.known
-    n_ext = None if sub_count is None else max(0, sub_count - n_embedded)
-    n_added = None if sub_added is None or n_ext is None else min(max(0, sub_added), n_ext)
     from .subtitles import in_vlc_sub_folder
 
     def vlc_looks_there(s: str) -> bool:
@@ -607,13 +656,17 @@ def resolve_source(
         # hand; SubSync's copy of VLC's rules only finds VLC's own
         return detected is not None or in_vlc_sub_folder(media, s)
 
-    if (
-        k == 0
-        and len(sidecars) == 1
-        and n_ext in (None, 1)
-        and not n_added
-        and vlc_looks_there(sidecars[0])
-    ):
+    if detected is None:
+        fast = (
+            n_ext in (None, 1) and not n_added and vlc_looks_there(sidecars[0])
+            if sidecars
+            else False
+        )
+    else:
+        fast = (exact and detected.sub_file_known and n_ext == 1 and n_added == 0) or (
+            assume_sidecars_first and n_ext is None
+        )
+    if k == 0 and len(sidecars) == 1 and fast:
         return ResolvedSource("external", path=sidecars[0])
 
     from .openfiles import same_file_key
@@ -634,7 +687,10 @@ def resolve_source(
     side_keys = keyset(sidecars)
     nearby = [p for p in subtitles_near(media) if not ours(p)]
     others_near = [p for p in nearby if _file_id(p) not in side_keys]
-    opened = open_in_vlc(media, sidecars + others_near)
+    scanned = detected.files if detected is not None else []
+    opened = open_in_vlc(media, list(dict.fromkeys([*sidecars, *scanned, *others_near])))
+    is_open: Callable[[str], bool] | None = None
+    maybe_absent: list[list[str]] = []
     if opened is not None:
         open_list = [str(p) for p in opened if not ours(str(p))]
         open_keys = keyset(open_list)
@@ -660,6 +716,12 @@ def resolve_source(
         if by_hand:
             known = [s for s in known if s not in by_hand]
             others = [*by_hand, *others]
+        # files the scan finds that VLC hasn't open may have appeared since it scanned
+        absent: dict[object, list[str]] = {}
+        for f in scanned:
+            if _file_id(f) not in open_keys:
+                absent.setdefault(_file_id(f), []).append(f)
+        maybe_absent = list(absent.values())
         where = "open in VLC"
     else:
         known, others, where = sidecars, others_near, "near the video (VLC's files unknown)"
@@ -682,7 +744,7 @@ def resolve_source(
     )
     if detected is not None:
         log.info(
-            "VLC's subtitle autodetection for %s: %s",
+            "VLC's subtitle autodetection for %s: %s; startup file %s",
             os.path.basename(media),
             "settings unknown, defaults assumed"
             if not exact
@@ -690,8 +752,11 @@ def resolve_source(
                 f"{'on' if autodetect.enabled else 'off'}, fuzzy {autodetect.fuzzy}, "
                 f"paths {autodetect.paths!r}, locale {autodetect.collate}"
             ),
+            "unknown" if not detected.sub_file_known else repr(sub_file or None),
         )
     hint = f'Name it "{Path(media).stem}.srt", keep it next to the video and reopen the video'
+    if detected is not None and not exact and not assume_sidecars_first:
+        hint += " (restart VLC first if SubSync was updated since it started)"
     if exact and autoloaded:
         log.warning(
             "VLC loaded %s by itself, which SubSync's copy of VLC's rules doesn't expect",
@@ -702,48 +767,68 @@ def resolve_source(
             f"({_names([*autoloaded, *known])}). {hint}"
         )
 
-    def pick(order: Sequence[str]) -> str | None:
-        k_set = keyset(known)
-        return _external_track_file(
-            k,
-            n_ext,
-            n_added,
-            [s for s in order if _file_id(s) in k_set] if opened is not None else list(order),
-            others,
-            vlc_files=opened is not None,
-            autoloaded_others=bool(autoloaded),
-            strict=exact,
-            assume_sidecars_first=assume_sidecars_first,
-        )
-
     # more than one file fits; with VLC's settings known, also when more sidecars are
     # open than VLC listed as the video opened (one appeared since: VLC lists it last)
     ambiguous = exact and n_ext is not None and n_added is not None and n_ext - n_added < len(known)
     if detected is None:
-        path = pick(sidecars)
+        k_set = keyset(known)
+        path = _external_track_file(
+            k,
+            n_ext,
+            n_added,
+            [s for s in sidecars if _file_id(s) in k_set] if opened is not None else sidecars,
+            others,
+            vlc_files=opened is not None,
+            autoloaded_others=bool(autoloaded),
+            assume_sidecars_first=assume_sidecars_first,
+        )
     else:
-        # files given when the video opened are sorted with the sidecars; how many there
-        # are: VLC's count less the sidecars and the files added since (if known)
-        most = 0 if n_ext is None else max(0, n_ext - (n_added or 0) - len(known))
-        orders: list[tuple[str, ...]] = []
-        why, sure = "", True
-        for extra in range(most if n_added is not None else 0, most + 1):
-            got = detected.orders(extra)
-            sure = sure and got.exact
-            why = why or got.why
-            orders += [o for o in got.orders if o not in orders]
-        picks = {pick(o) for o in orders}
+
+        def tails(listed: int) -> Iterable[int]:
+            # files given at startup that SubSync can't see: VLC's count less the files
+            # it listed besides them and the tracks added since (all of them if unknown)
+            if n_ext is None:
+                return (0,)
+            startup = n_ext - (n_added or 0)
+            if startup < listed:  # VLC listed fewer: that list can't be VLC's
+                return () if exact else (0,)
+            return (startup - listed,) if n_added is not None else range(startup - listed + 1)
+
+        got = detected.lists(tails, maybe_absent=maybe_absent, is_open=is_open)
+        picks = {
+            _track_in_list(
+                k,
+                n_ext,
+                n_added,
+                listed,
+                others,
+                vlc_files=opened is not None,
+                autoloaded_others=bool(autoloaded),
+                assume_sidecars_first=assume_sidecars_first,
+            )
+            for listed in got.orders
+        }
         path = picks.pop() if len(picks) == 1 else None
-        if len(picks) > 1:
+        if not got.orders:
             ambiguous = True
-            log.info("subtitle track %d: %s", sub_index + 1, why or "VLC's order is not sure")
-        elif not sure and path is not None and _file_id(path) in side_keys and len(known) > 1:
+            log.info("subtitle track %d: VLC listed fewer files than SubSync finds", sub_index + 1)
+        elif len(picks) > 1:
             ambiguous = True
-            log.info("subtitle track %d: %s", sub_index + 1, why)
-            path = None
+            log.info("subtitle track %d: %s", sub_index + 1, got.why or "VLC's order is not sure")
+        elif path is not None and _file_id(path) in side_keys and len(known) > 1:
+            if not got.exact:
+                ambiguous, path = True, None
+                log.info("subtitle track %d: %s", sub_index + 1, got.why)
+            elif exact and n_added is None:
+                # a sidecar added by hand is listed last, but how many were is unknown
+                # (the extension's Sync now, or the intf started after the video)
+                ambiguous, path = True, None
+                log.info(
+                    "subtitle track %d: tracks added since the video opened are unknown",
+                    sub_index + 1,
+                )
     if path is not None:
-        if _file_id(path) not in keyset(known):
-            log.info("subtitle track %d is %s (%s)", sub_index + 1, path, where)
+        log.info("subtitle track %d is %s (%s)", sub_index + 1, path, where)
         return ResolvedSource("external", path=path)
     if others or ambiguous:
         raise JobError(
@@ -964,6 +1049,7 @@ class Daemon:
             sub_count=r.sub_count,
             sub_added=r.sub_added,
             autodetect=Autodetect(r.sub_autodetect, r.sub_fuzzy, r.sub_paths, r.sub_collate),
+            sub_file=r.sub_file,
             exclude_dirs=[*out_dirs, *default_output_dirs()],
         )
 

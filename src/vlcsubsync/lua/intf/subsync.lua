@@ -548,9 +548,11 @@ function M.new_input_object(input)
     return true
 end
 
--- VLC's subtitle autodetection settings for `input` and its LC_COLLATE locale: with
--- them the helper works out which subtitle files VLC loaded by itself and in which
--- order (sent as sub_autodetect, sub_fuzzy, sub_paths, sub_collate; a nil is not sent).
+-- VLC's subtitle autodetection settings for `input`, its LC_COLLATE locale and its
+-- sub-file variable (the --sub-file or the Open dialog's subtitle file, "" for none):
+-- with them the helper works out which subtitle files VLC loaded as the video opened
+-- and in which order (sent as sub_autodetect, sub_fuzzy, sub_paths, sub_collate,
+-- sub_file; a nil is not sent).
 function M.autodetect_settings(input)
     local function get(name)
         local ok, v = pcall(vlc.var.get, input, name)
@@ -559,12 +561,14 @@ function M.autodetect_settings(input)
     end
     local on = get("sub-autodetect-file")
     local paths = get("sub-autodetect-path")
+    local sub_file = get("sub-file")
     local okc, collate = pcall(os.setlocale, nil, "collate")
     return {
         autodetect = (on == true and 1) or (on == false and 0) or nil,
         fuzzy = tonumber(get("sub-autodetect-fuzzy")),
         paths = type(paths) == "string" and paths or nil,
         collate = okc and type(collate) == "string" and collate ~= "" and collate or nil,
+        sub_file = type(sub_file) == "string" and sub_file or nil,
     }
 end
 
@@ -693,7 +697,8 @@ function M.submit(sel, force, mode, probe)
     }
     local ad = S.autodetect or {}
     for _, f in ipairs({ { "sub_autodetect", ad.autodetect }, { "sub_fuzzy", ad.fuzzy },
-                         { "sub_paths", ad.paths }, { "sub_collate", ad.collate } }) do
+                         { "sub_paths", ad.paths }, { "sub_collate", ad.collate },
+                         { "sub_file", ad.sub_file } }) do
         if f[2] ~= nil then kv[#kv + 1] = f end
     end
     if mode ~= "" then kv[#kv + 1] = { "mode", mode } end

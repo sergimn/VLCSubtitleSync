@@ -320,9 +320,13 @@ CUDA. The helper not running is normal while VLC is closed. Things to try:
   always: it can't tell two hand-added files apart, on Windows it only checks files
   next to the video or in its `Subs/` folder, it can't check at all if the OS
   doesn't say which files VLC has open, and it stops if VLC loaded a file by itself
-  that SubSync's copy of VLC's rules doesn't expect. Give the file the video's name (`Movie.srt`
+  that SubSync's copy of VLC's rules doesn't expect, if a subtitle file was saved
+  next to the video while it played and that could change VLC's order, or (with
+  **View → SubSync → Sync subtitles now** while the interface isn't running) if several
+  subtitle files are loaded. Give the file the video's name (`Movie.srt`
   or `Movie.en.srt` for `Movie.mkv`), keep it next to the video or in `Subs/`, and
-  reopen the video: VLC then loads it by itself.
+  reopen the video: VLC then loads it by itself. Right after updating SubSync,
+  restart VLC first.
 - **Snap VLC (Ubuntu)**: snap VLC cannot start programs, so it relies on systemd
   starting the helper (`vlc-subsync.path`). This works across snap updates: the
   watch follows `~/snap/vlc/current` to the new revision. If you install the snap

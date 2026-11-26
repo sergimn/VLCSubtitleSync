@@ -305,8 +305,8 @@ function E.current_selection()
              autodetect = E.autodetect_settings(input) }
 end
 
--- VLC's subtitle autodetection settings and locale (see the intf's
--- M.autodetect_settings), as request key/value pairs; unknown ones are left out.
+-- VLC's subtitle autodetection settings, locale and sub-file variable (see the
+-- intf's M.autodetect_settings), as request key/value pairs; unknown ones are left out.
 function E.autodetect_settings(input)
     local function get(name)
         local ok, v = pcall(vlc.var.get, input, name)
@@ -322,6 +322,8 @@ function E.autodetect_settings(input)
     add("sub_fuzzy", tonumber(get("sub-autodetect-fuzzy")))
     add("sub_paths", type(paths) == "string" and paths or nil)
     add("sub_collate", okc and type(collate) == "string" and collate ~= "" and collate or nil)
+    local sub_file = get("sub-file")
+    add("sub_file", type(sub_file) == "string" and sub_file or nil)
     return kv
 end
 

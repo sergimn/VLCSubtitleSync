@@ -72,6 +72,21 @@ LAYOUTS: dict[str, tuple[str, list[str], str | None]] = {
     ),
     "subfile": ("Movie.wav", ["Movie.en.srt", "Movie.es.srt", "Movie.fr.srt"], "Extra.srt"),
     "subfile9": ("Movie.wav", [f"Movie.{c}.srt" for c in "qhbxmdkat"], "Extra.srt"),
+    # a --sub-file that sorts after a sidecar: VLC deletes it
+    "subfile_after": ("Movie.wav", ["Movie.en.srt", "Movie.es.srt"], "Zed.srt"),
+    # a --sub-file that is one of the sidecars: VLC deletes one of the two
+    "subfile_first": ("Movie.wav", ["Movie.srt", "Movie.en.srt"], "Movie.en.srt"),
+    "subfile_dup": ("Movie.wav", ["Movie.en.srt", "Movie.fr.srt", "Movie.pt.srt"], "Movie.fr.srt"),
+    "subfile_dup_first": (
+        "Movie.wav",
+        ["Movie.en.srt", "Movie.fr.srt", "Movie.pt.srt"],
+        "Movie.en.srt",
+    ),
+    "subfile_vobsub": (
+        "Movie.wav",
+        ["Movie.idx", "Movie.sub", "Movie.en.srt", "Movie.es.srt", "Movie.fr.srt"],
+        "Movie.en.srt",
+    ),
 }
 
 LOADED = re.compile(r"loading spu-es slave: (\S+) \(forced")
@@ -96,7 +111,7 @@ def make_layout(root: Path, video: str, files: list[str], extra: str | None) -> 
         w.setsampwidth(2)
         w.setframerate(8000)
         w.writeframes(b"\0\0" * 4000)
-    for name in files + ([extra] if extra else []):
+    for name in dict.fromkeys(files + ([extra] if extra else [])):
         p = root / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(IDX if name.endswith(".idx") else SRT, encoding="utf-8")
@@ -150,19 +165,21 @@ def main() -> int:
             text = run_vlc(args.vlc, media, root / "vlc.log", locale, sub_file)
             version = re.search(r"VLC media player - (\S+)", text)
             loaded = LOADED.findall(text)
-            collate = locale or ("C" if sys.platform == "win32" else S._env_collate())
+            collate = locale or ("C" if sys.platform == "win32" else S.env_collate())
             if sys.platform == "win32":
                 collate = "C"
             det = S.VlcSidecars(
-                str(media), S.Autodetect(True, 3, S.default_paths(sys.platform == "win32"), collate)
+                str(media),
+                S.Autodetect(True, 3, S.default_paths(sys.platform == "win32"), collate),
+                sub_file=str(sub_file) if sub_file else "",
             )
             uri_of = {os.path.normpath(e.path): e.uri for e in det.entries}
-            extra_uri = S.path_to_uri(str(sub_file), sys.platform == "win32") if sub_file else None
-            seen = [u for u in loaded if u != extra_uri]
-            got = det.orders(1 if extra else 0)
-            ours = [[uri_of[p] for p in o] for o in got.orders]
-            ok = seen in ours and (extra is None or loaded[:1] == [extra_uri])
-            likeliest = seen == ours[0]
+            if det.startup:
+                uri_of.setdefault(os.path.normpath(det.startup[0]), det.startup[1])
+            got = det.lists()
+            ours = [[uri_of[p] for p in o if p is not None] for o in got.orders]
+            ok = loaded in ours
+            likeliest = bool(ours) and loaded == ours[0]
             bad += not ok
             print(
                 f"\n== {name} (locale {locale or 'from env'}, VLC {version and version.group(1)}):"

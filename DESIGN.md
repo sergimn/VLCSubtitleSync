@@ -110,8 +110,8 @@ subtitle file", and every file added during an earlier play of the same playlist
 our synced copies too, because VLC keeps them on the item), then the sidecars it found
 itself, then the files added during this play (Subtitle → Add Subtitle File, drag and
 drop) in the order they were added. (VLC 3 also silently drops a `--sub-file` whose
-URI sorts after the first sidecar it found.) VLC 3's Lua API can't tell which file a
-track came from (no slave URI, the label has at most a language, the `sub-file`
+URI doesn't sort before every sidecar it found.) VLC 3's Lua API can't tell which file
+a track came from (no slave URI, the label has at most a language, the `sub-file`
 variable only holds the startup file), so the intf sends `sub_count` (the subtitle
 tracks it lists) and `sub_added` (how many of them showed up after the input reached
 `PLAYING_S`; empty when unknown: the input was already open at the intf's first tick
@@ -121,9 +121,11 @@ a resume point says nothing), or `vlc.var.create` is missing, which the intf use
 mark each input object so it notices the same item playing again), both without our
 synced tracks. It also sends VLC's subtitle autodetection settings for the input
 (`sub_autodetect`, `sub_fuzzy`, `sub_paths` from `sub-autodetect-file`,
-`sub-autodetect-fuzzy` and `sub-autodetect-path`, which VLC creates on every input) and
-VLC's `LC_COLLATE` locale (`sub_collate`, `os.setlocale(nil, "collate")`), read once per
-input object; the extension sends them too. Then `daemon.resolve_source`:
+`sub-autodetect-fuzzy` and `sub-autodetect-path`, which VLC creates on every input),
+VLC's `LC_COLLATE` locale (`sub_collate`, `os.setlocale(nil, "collate")`) and the
+input's `sub-file` variable (`sub_file`: the `--sub-file` or the Open dialog's subtitle
+file, which VLC applies as an option of the playlist item; empty for none), read once
+per input object; the extension sends them too. Then `daemon.resolve_source`:
 1. works out the sidecars VLC loaded by itself and their order with a copy of VLC 3's
    rules (`sidecars.VlcSidecars`, port of `subtitles_Detect` in src/input/subtitles.c
    and the two sorts in `LoadSlaves`): the media dir, then each `sub-autodetect-path`
@@ -133,22 +135,32 @@ input object; the extension sends them too. Then `daemon.resolve_source`:
    for any other (names compared as VLC's `strcpy_trim` gives them), kept if at least
    `sub-autodetect-fuzzy` (default 3); a `.sub` with an `.idx` of the same name and a
    `.cdg` below priority 4 are dropped. VLC then sorts them by URI (`slave_strcmp`),
-   puts the `--sub-file` first, appends the other startup files, and sorts again by
-   priority (`SlaveCompare`). Both sorts are C `qsort`, which is not stable: Windows'
-   msvcrt swaps equal items (`Movie.en.srt` and `Movie.es.srt` load as es, en), Apple's
-   uses insertion sort up to 7 items, glibc a merge sort. So SubSync calls this
-   machine's own `qsort` through ctypes with the same comparators. VLC for Linux
-   compares URIs with `strcoll` in its locale; VLC for Windows and macOS (cross-compiled,
-   built without `HAVE_STRCOLL`) compares bytes. Where SubSync can't redo the sort (no
-   `qsort`, a locale it can't load), the order isn't certain and a sidecar is picked only
-   where every possible order agrees. Files given at startup can sit anywhere in the
-   first sort, so their place is tried at every rank, and a file is picked only if all
-   the orders agree. `scripts/vlc_order_probe.py` (workflow "VLC subtitle order": on
-   pull requests that change the copy and monthly, with real VLC on Linux, macOS and
-   Windows) checks the copy against VLC's own log. Without the settings (an older intf)
-   the defaults are used, with the helper's own locale and "C". When VLC lists one
-   external track, none was added later and VLC's rules find one sidecar, it picks that
-   sidecar (`subtitles.find_sidecars` and the CLI use the same rules);
+   with the `--sub-file` (priority 5) in front of them before the sort, and deletes
+   every item with the `--sub-file`'s URI from the second one on: the sidecar copy of
+   the `--sub-file` if it sorted first, else the `--sub-file` itself (on glibc and
+   macOS nothing matches after that, since freeing it overwrites the URI it compares
+   with; on Windows both may happen). It then appends the files added during an
+   earlier play and sorts again by priority (`SlaveCompare`). Both sorts are C `qsort`,
+   which is not stable: Windows' msvcrt swaps equal items (`Movie.en.srt` and
+   `Movie.es.srt` load as es, en), Apple's uses insertion sort up to 7 items, glibc a
+   merge sort, and a dropped file stays in the first sort as an item equal to every
+   other. So SubSync calls this machine's own `qsort` through ctypes with the same
+   comparators (`VlcSidecars.lists`). VLC for Linux compares URIs with `strcoll` in its
+   locale; VLC for Windows and macOS (cross-compiled, built without `HAVE_STRCOLL`)
+   compares bytes. Where SubSync can't redo the sort (no `qsort`, a locale it can't
+   load), the order isn't certain and a sidecar is picked only where every possible
+   order agrees. The files added during an earlier play can't be seen, so VLC's counts
+   say how many there are. Without `sub_file` (an older intf) the `--sub-file` may be
+   any sidecar or another file at any rank: every case is tried, and a file is picked
+   only if all the lists agree. `scripts/vlc_order_probe.py` (workflow "VLC subtitle
+   order": on pull requests that change the copy and monthly, with real VLC on Linux,
+   macOS and Windows) checks the copy against VLC's own log. Without the settings (an
+   older intf) the defaults are used, with the helper's own locale and "C"; on Linux
+   the order then counts as certain only where the names' priorities alone decide it.
+   With VLC's settings and `sub_file` known, when VLC lists one external track, none
+   was added later and the rules find one file, it picks that file
+   (`subtitles.find_sidecars` and the CLI use the same rules, the CLI in its own
+   locale);
 2. otherwise asks the OS which subtitle files (any of VLC's subtitle extensions) the
    VLC process playing the video has open (`openfiles.subtitles_open_in_vlc`): VLC
    keeps every subtitle file it loaded open while the video plays. Linux reads
@@ -165,10 +177,17 @@ input object; the extension sends them too. Then `daemon.resolve_source`:
    opened (VLC lists it last), and a file VLC has open that its rules would load but
    the copy didn't find means the copy is wrong for this VLC (another version, a
    playlist item's own options): the job then fails instead of guessing (logged as a
-   warning). If the OS can't tell (no VLC with the
-   video open, `lsof` missing, an error), a request from VLC only gets the sidecar rule
-   (`k` within the sidecars); the CLI also takes the one subtitle file near the video
-   beyond the sidecars (its own numbering, see README);
+   warning). A file the rules find that VLC hasn't open may have been saved there
+   after the video opened (VLC never sorted it) or failed to load (VLC did): the lists
+   with and without each such file must agree (up to 6 of them; more make the order
+   unsure). Without the count of tracks added since the video opened (the extension's
+   Sync now, an intf that started after the video) a sidecar added by hand can't be
+   told from one VLC found, so a sidecar is picked only if it is the only one VLC has
+   open. If the OS can't tell (no VLC with the video open, `lsof` missing, an error),
+   a request from VLC only gets the sidecar rule (`k` within the sidecars), and with
+   VLC's settings known only if VLC listed as many files at the start as there are
+   now; the CLI also takes the one subtitle file near the video beyond the sidecars
+   (its own numbering, see README);
 3. picks a file outside the sidecars only where the counts place it for certain
    (`daemon._external_track_file`): it is the only subtitle file VLC has open and VLC
    lists one external track; or VLC lists one track added later, every track listed at
@@ -187,7 +206,8 @@ input object; the extension sends them too. Then `daemon.resolve_source`:
    the job fails with an error that names the files ("Can't tell which file subtitle
    track N is (…)") or, without other files, "Can't find the file of subtitle track N",
    and says to name the wanted file like the video, keep it next to it and reopen the
-   video.
+   video (and, for a request without VLC's settings, to restart VLC first if SubSync
+   was updated since it started: the old intf is still running).
 
 ### File protocol (Lua ↔ daemon) — all files UTF-8 `key=value` lines
 
@@ -209,6 +229,7 @@ sub_autodetect=1                       # optional: VLC's sub-autodetect-file (1/
 sub_fuzzy=3                            # optional: VLC's sub-autodetect-fuzzy
 sub_paths=./Subtitles, ./subtitles, ./Subs, ./subs  # optional: VLC's sub-autodetect-path (empty: none)
 sub_collate=en_US.UTF-8                # optional: VLC's LC_COLLATE locale
+sub_file=                              # optional: VLC's sub-file variable (empty: none)
 sub_path=                              # optional explicit external subtitle path
 force=0                                # 1 = ignore result cache
 mode=exhaustive                        # optional: fast|thorough|exhaustive, overrides config

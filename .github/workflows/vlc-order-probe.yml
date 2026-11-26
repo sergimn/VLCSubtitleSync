@@ -2,11 +2,14 @@ name: VLC subtitle order
 
 # Plays videos with subtitle files next to them in a real VLC on each OS and checks
 # that SubSync's copy of VLC's subtitle autodetection (src/vlcsubsync/sidecars.py)
-# gives the order VLC loads them in. Run it by hand after a VLC update.
+# gives the order VLC loads them in. Runs on pull requests that change that copy, and
+# once a month with the VLC each OS's package manager installs then, so a VLC update
+# that changes the order shows up as a failed run.
 on:
   workflow_dispatch:
-  push:
-    branches: [claude/project-thread-tc0u2o-sidecar-order]
+  schedule:
+    - cron: "17 5 3 * *"
+  pull_request:
     paths:
       - src/vlcsubsync/sidecars.py
       - scripts/vlc_order_probe.py

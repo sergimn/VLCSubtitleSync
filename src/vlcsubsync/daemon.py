@@ -680,6 +680,17 @@ def resolve_source(
         if autoloaded
         else "",
     )
+    if detected is not None:
+        log.info(
+            "VLC's subtitle autodetection for %s: %s",
+            os.path.basename(media),
+            "settings unknown, defaults assumed"
+            if not exact
+            else (
+                f"{'on' if autodetect.enabled else 'off'}, fuzzy {autodetect.fuzzy}, "
+                f"paths {autodetect.paths!r}, locale {autodetect.collate}"
+            ),
+        )
     hint = f'Name it "{Path(media).stem}.srt", keep it next to the video and reopen the video'
     if exact and autoloaded:
         log.warning(

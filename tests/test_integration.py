@@ -25,6 +25,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -553,7 +554,12 @@ def _is_snap(vlc: str) -> bool:
 
 
 @contextlib.contextmanager
-def vlc_with_subsync(tmp_path: Path, place: dict[str, str], vlc_args: list[str]):
+def vlc_with_subsync(
+    tmp_path: Path,
+    place: dict[str, str],
+    vlc_args: list[str],
+    vlc_env: dict[str, str] | None = None,
+):
     """Headless VLC with our Lua intf, and the daemon, until the synced subtitle is
     loaded as a new track (or VLC exits, or 10 minutes pass).
 
@@ -617,6 +623,7 @@ def vlc_with_subsync(tmp_path: Path, place: dict[str, str], vlc_args: list[str])
         XDG_CONFIG_HOME=str(home / ".config"),
         XDG_CACHE_HOME=str(home / ".cache"),
         VLC_DATA_PATH=str(lua_root),
+        **(vlc_env or {}),
     )
     # the daemon must use the real HOME for the HF model cache
     denv = dict(env, HOME=os.environ.get("HOME", str(home)))
@@ -738,4 +745,31 @@ def test_vlc_startup_subtitle_next_to_a_sidecar(tmp_path: Path):
         assert " sub=0 of 2 (0 added) " in run.text, "the request must count VLC's tracks"
         daemon_log = run.daemon_log.read_text(encoding="utf-8")
         assert "English.srt (open in VLC)" in daemon_log, "picked the wrong file"
+        assert_synced(run)
+
+
+@pytest.mark.slow
+@pytest.mark.vlc
+def test_vlc_sidecars_in_vlcs_order(tmp_path: Path):
+    """VLC sorts the sidecars it finds by URI, then by how well the names match: here
+    ``Subs/Movie.de.srt`` comes first in the C locale ("…/media/./Subs/…" sorts before
+    "…/media/Movie…"), where SubSync's own sidecar order used to put the folder last
+    and sync the other file. The intf sends VLC's autodetection settings and locale,
+    and the helper redoes VLC's order with them."""
+    place = {
+        "Movie.mkv": "en_dialogue.mkv",
+        "Movie.en.srt": "es_dialogue.offset_plus_3_2.srt",  # another film
+        "Subs/Movie.de.srt": "en_dialogue.offset_plus_3_2.srt",
+    }
+    args = ["--sub-track", "0", "{media}/Movie.mkv"]
+    with vlc_with_subsync(tmp_path, place, args, vlc_env={"LC_ALL": "C"}) as run:
+        loaded = re.findall(r"loading spu-es slave: (\S+) \(forced", run.text)
+        vlcs = [u.rsplit("/", 1)[-1] for u in loaded if "/subsync/out/" not in u]
+        assert vlcs == ["Movie.de.srt", "Movie.en.srt"]  # VLC's order (ours is added later)
+        assert " sub=0 of 2 (0 added) " in run.text, "the request must count VLC's tracks"
+        daemon_log = run.daemon_log.read_text(encoding="utf-8")
+        assert "sidecars ['Movie.de.srt', 'Movie.en.srt']" in daemon_log
+        # the settings and locale as real VLC gives them to the intf
+        assert "VLC's subtitle autodetection for Movie.mkv: on, fuzzy 3, paths " in daemon_log
+        assert "locale C" in daemon_log
         assert_synced(run)

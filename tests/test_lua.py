@@ -516,6 +516,56 @@ def test_request_counts_tracks_added_after_the_file_opened(h):
     assert r["sub_index"] == "3" and r["sub_count"] == "4" and r["sub_added"] == "1"
 
 
+
+def autodetect_vars(hh, on=True, fuzzy=3, paths="./Subs, ./subs"):
+    """VLC's subtitle autodetection settings, as the input object has them."""
+    v = hh.mock.input.vars
+    v["sub-autodetect-file"], v["sub-autodetect-fuzzy"], v["sub-autodetect-path"] = (
+        on,
+        fuzzy,
+        paths,
+    )
+
+
+def this_collate() -> str | None:
+    # Lua's os.setlocale(nil, "collate") reads this process's locale, as VLC's does
+    import locale
+
+    return locale.setlocale(locale.LC_COLLATE) or None
+
+
+def test_request_sends_vlcs_subtitle_autodetection_settings(h):
+    # the helper redoes VLC's subtitle autodetection with them (sidecars.py)
+    h.set_input()
+    autodetect_vars(h)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_autodetect"] == "1" and r["sub_fuzzy"] == "3"
+    assert r["sub_paths"] == "./Subs, ./subs"
+    assert r.get("sub_collate") == this_collate()
+    h.finish(r["id"])
+    h.tick(3)  # our synced track shows up
+    # read once per video: a change in VLC's preferences counts from the next one
+    autodetect_vars(h, on=False, fuzzy=1, paths="")
+    h.select("spu-es", 21)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "1" and r["sub_autodetect"] == "1"
+    h.finish(r["id"])
+    h.tick(3)
+    h.set_input(uri="file:///media/Other.mkv")
+    autodetect_vars(h, on=False, fuzzy=1, paths="")
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_autodetect"] == "0" and r["sub_fuzzy"] == "1" and r["sub_paths"] == ""
+
+
+def test_request_leaves_out_settings_vlc_does_not_give(h):
+    h.set_input()  # an input without these variables
+    h.settle()
+    r = h.requests()[0]
+    assert not {"sub_autodetect", "sub_fuzzy", "sub_paths"} & r.keys()
+
 def test_same_file_playing_again_counts_from_its_new_start(h):
     # VLC starts a new input object; the files added during the first play are now
     # loaded with the video (VLC lists them first)
@@ -1052,6 +1102,18 @@ def test_ext_fallback_sync_and_load(ext):
     ext.lua.eval("input_changed()")
     assert ext.spu_ids()[-1] in [k for k in ext.E.state.ours.keys()]
 
+
+
+def test_ext_fallback_sync_sends_vlcs_subtitle_autodetection_settings(ext):
+    write_intf_state(ext, age=600, state="idle")
+    ext.heartbeat()
+    ext.set_input(audio_sel=11, spu_sel=21)
+    autodetect_vars(ext, fuzzy=-1, paths=".\\subs")
+    ext.lua.eval("trigger_menu(1)")
+    r = ext.requests()[0]
+    assert r["sub_autodetect"] == "1" and r["sub_fuzzy"] == "-1"
+    assert r["sub_paths"] == ".\\subs"
+    assert r.get("sub_collate") == this_collate()
 
 def test_ext_sync_now_exhaustive_signals_running_intf(ext):
     ext.show_all()

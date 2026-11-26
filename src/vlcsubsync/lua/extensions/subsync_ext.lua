@@ -301,7 +301,28 @@ function E.current_selection()
         if v ~= -1 and not ST.ours[v] then count = count + 1 end
     end
     return { media = media, uri = uri, audio = a, audio_label = alabel,
-             sub = s, sub_label = slabel, sub_count = count, spu_ids = sids }
+             sub = s, sub_label = slabel, sub_count = count, spu_ids = sids,
+             autodetect = E.autodetect_settings(input) }
+end
+
+-- VLC's subtitle autodetection settings and locale (see the intf's
+-- M.autodetect_settings), as request key/value pairs; unknown ones are left out.
+function E.autodetect_settings(input)
+    local function get(name)
+        local ok, v = pcall(vlc.var.get, input, name)
+        if ok then return v end
+        return nil
+    end
+    local on = get("sub-autodetect-file")
+    local paths = get("sub-autodetect-path")
+    local okc, collate = pcall(os.setlocale, nil, "collate")
+    local kv = {}
+    local function add(k, v) if v ~= nil then kv[#kv + 1] = { k, v } end end
+    add("sub_autodetect", (on == true and 1) or (on == false and 0) or nil)
+    add("sub_fuzzy", tonumber(get("sub-autodetect-fuzzy")))
+    add("sub_paths", type(paths) == "string" and paths or nil)
+    add("sub_collate", okc and type(collate) == "string" and collate ~= "" and collate or nil)
+    return kv
 end
 
 function E.fallback_sync(mode)
@@ -322,6 +343,7 @@ function E.fallback_sync(mode)
         { "sub_path", "" },
         { "force", 0 },
     }
+    for _, pair in ipairs(sel.autodetect or {}) do kv[#kv + 1] = pair end
     if mode and mode ~= "" then kv[#kv + 1] = { "mode", mode } end
     local ok, err = E.write_kv(join(join(q, "requests"), id .. ".req"), kv)
     if not ok then return false, "Cannot write request: " .. err end

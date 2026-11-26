@@ -209,6 +209,13 @@ class Request:
     # VLC lists last); None: unknown (an older intf, the extension, or the intf did not
     # see the video open). See DESIGN.md "External subs".
     sub_added: int | None = None
+    # VLC's subtitle autodetection settings for this video (sub-autodetect-file,
+    # -fuzzy, -path) and its LC_COLLATE locale, so the daemon can work out which
+    # subtitle files VLC loaded by itself and in which order (None: not sent).
+    sub_autodetect: bool | None = None
+    sub_fuzzy: int | None = None
+    sub_paths: str | None = None
+    sub_collate: str | None = None
     audio_label: str = ""
     sub_label: str = ""
     force: bool = False
@@ -236,6 +243,14 @@ class Request:
             out["sub_count"] = self.sub_count
         if self.sub_added is not None:
             out["sub_added"] = self.sub_added
+        if self.sub_autodetect is not None:
+            out["sub_autodetect"] = self.sub_autodetect
+        if self.sub_fuzzy is not None:
+            out["sub_fuzzy"] = self.sub_fuzzy
+        if self.sub_paths is not None:
+            out["sub_paths"] = self.sub_paths
+        if self.sub_collate:
+            out["sub_collate"] = self.sub_collate
         mode = normalize_mode(self.mode)
         if mode:
             out["mode"] = mode
@@ -271,6 +286,7 @@ class Request:
         sub_added = _to_int(data.get("sub_added"), None)
         if sub_added is not None and sub_added < 0:
             sub_added = None
+        autodetect = (data.get("sub_autodetect") or "").strip()
         return cls(
             id=req_id,
             media=media,
@@ -279,6 +295,10 @@ class Request:
             sub_path=sub_path,
             sub_count=sub_count,
             sub_added=sub_added,
+            sub_autodetect=_to_bool(autodetect) if autodetect else None,
+            sub_fuzzy=_to_int(data.get("sub_fuzzy"), None),
+            sub_paths=data.get("sub_paths"),  # "" is a value: no subfolders
+            sub_collate=(data.get("sub_collate") or "").strip() or None,
             audio_label=data.get("audio_label") or "",
             sub_label=data.get("sub_label") or "",
             force=_to_bool(data.get("force")),

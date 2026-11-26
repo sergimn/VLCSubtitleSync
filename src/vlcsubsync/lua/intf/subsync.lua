@@ -545,6 +545,26 @@ function M.new_input_object(input)
     return true
 end
 
+-- VLC's subtitle autodetection settings for `input` and its LC_COLLATE locale: with
+-- them the helper works out which subtitle files VLC loaded by itself and in which
+-- order (sent as sub_autodetect, sub_fuzzy, sub_paths, sub_collate; a nil is not sent).
+function M.autodetect_settings(input)
+    local function get(name)
+        local ok, v = pcall(vlc.var.get, input, name)
+        if ok then return v end
+        return nil
+    end
+    local on = get("sub-autodetect-file")
+    local paths = get("sub-autodetect-path")
+    local okc, collate = pcall(os.setlocale, nil, "collate")
+    return {
+        autodetect = (on == true and 1) or (on == false and 0) or nil,
+        fuzzy = tonumber(get("sub-autodetect-fuzzy")),
+        paths = type(paths) == "string" and paths or nil,
+        collate = okc and type(collate) == "string" and collate ~= "" and collate or nil,
+    }
+end
+
 -- Remember the subtitle tracks VLC lists once the input has opened.
 function M.note_opened(input, snap)
     if S.opened_spu or S.opened_unknown then return end
@@ -615,6 +635,7 @@ function M.reset_input()
     S.non_file_logged = nil
     S.hold_until, S.settle_until, S.cache_missed = nil, nil, {}
     S.opened_spu, S.opened_unknown = nil, nil
+    S.autodetect = nil
 end
 
 local function memo_for(uri)
@@ -665,6 +686,11 @@ function M.submit(sel, force, mode, probe)
         { "sub_path", "" },
         { "force", force and 1 or 0 },
     }
+    local ad = S.autodetect or {}
+    for _, f in ipairs({ { "sub_autodetect", ad.autodetect }, { "sub_fuzzy", ad.fuzzy },
+                         { "sub_paths", ad.paths }, { "sub_collate", ad.collate } }) do
+        if f[2] ~= nil then kv[#kv + 1] = f end
+    end
     if mode ~= "" then kv[#kv + 1] = { "mode", mode } end
     if probe then kv[#kv + 1] = { "cache_only", 1 } end
     local ok, err = M.write_kv(path, kv)
@@ -955,6 +981,7 @@ function M.tick()
     end
 
     if fresh == nil then S.opened_unknown = true end
+    if not S.autodetect then S.autodetect = M.autodetect_settings(input) end
 
     local snap = M.snapshot(input)
 

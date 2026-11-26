@@ -14,6 +14,7 @@ from vlcsubsync.subtitles import (
     output_format,
     plain_text,
     save_subtitles,
+    subtitle_files_near,
     tokenize,
 )
 
@@ -192,3 +193,46 @@ def test_find_sidecars_ordering(tmp_path):
 
 def test_find_sidecars_missing_dir(tmp_path):
     assert find_sidecars(str(tmp_path / "nope" / "x.mkv")) == []
+
+
+@pytest.mark.parametrize(
+    "layout, sidecars",
+    [
+        # the bug report's table: find_sidecars doesn't know these names
+        (["Subs/2_English.srt", "Subs/3_English.srt", "Subs/8_Spanish.srt"], []),
+        (["English.srt"], []),
+        (["Subs/Movie.srt"], ["Subs/Movie.srt"]),
+        (["Movie.en.srt"], ["Movie.en.srt"]),
+    ],
+)
+def test_report_layouts(tmp_path, layout, sidecars):
+    media = tmp_path / "Movie.mp4"
+    media.write_bytes(b"")
+    for name in layout:
+        _touch(tmp_path / name)
+    assert find_sidecars(str(media)) == [str(tmp_path / n) for n in sidecars]
+    # every one of them is a subtitle file near the video
+    assert subtitle_files_near(str(media)) == sorted(
+        (str(tmp_path / n) for n in layout), key=lambda p: (p.casefold(), p)
+    )
+
+
+def test_subtitle_files_near(tmp_path):
+    media = tmp_path / "Show.S01E02.mkv"
+    media.write_bytes(b"")
+    want = [
+        _touch(tmp_path / "English.srt"),
+        _touch(tmp_path / "Show.S01E02.ass"),
+        _touch(tmp_path / "subtitles" / "fr.vtt"),
+        _touch(tmp_path / "Subs" / "Show.S01E02" / "2_English.srt"),  # TV release packs
+        _touch(tmp_path / "Subs" / "Show.S01E02" / "3_English.idx"),  # any VLC extension
+    ]
+    _touch(tmp_path / "Subs" / "Show.S01E03" / "2_English.srt")  # another episode
+    _touch(tmp_path / "Extras" / "commentary.srt")  # not a subtitle folder
+    _touch(tmp_path / "._English.srt")  # macOS metadata file
+    _touch(tmp_path / "notes.txt")
+    (tmp_path / "Subs" / "dir.srt").mkdir()
+    got = subtitle_files_near(str(media))
+    assert sorted(got) == sorted(str(p) for p in want)
+    assert got == sorted(got, key=lambda p: (p.casefold(), p))
+    assert subtitle_files_near(str(tmp_path / "nope" / "x.mkv")) == []

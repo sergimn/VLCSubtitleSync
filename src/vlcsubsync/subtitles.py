@@ -168,6 +168,52 @@ def find_sidecars(media_path: str | os.PathLike[str]) -> list[str]:
     return [x[3] for x in found]
 
 
+MAX_NEARBY = 200
+
+
+def subtitle_files_near(media_path: str | os.PathLike[str]) -> list[str]:
+    """Subtitle files near ``media_path`` whatever their names: in the media dir, its
+    ``Subs/``-style subdirs and a ``Subs/<media stem>/`` dir (TV release packs).
+
+    Any extension VLC loads as a subtitle counts; hidden files (``._x.srt``) don't.
+    Sorted by path, at most ``MAX_NEARBY``. Used to find a subtitle the user added to
+    VLC by hand, which :func:`find_sidecars` does not know.
+    """
+    from .openfiles import is_subtitle_file
+
+    media = Path(media_path)
+    folder = media.parent
+    stem = media.stem.casefold()
+    dirs = [folder]
+    try:
+        for child in sorted(folder.iterdir()):
+            if child.is_dir() and child.name.casefold() in SIDECAR_SUBDIRS:
+                dirs.append(child)
+                try:
+                    dirs += [
+                        g
+                        for g in sorted(child.iterdir())
+                        if g.is_dir() and g.name.casefold() == stem
+                    ]
+                except OSError:
+                    pass
+    except OSError:
+        return []
+    out: list[str] = []
+    for d in dirs:
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for f in entries:
+            if f.name.startswith(".") or not is_subtitle_file(f.name) or f == media:
+                continue
+            if f.is_file():
+                out.append(str(f))
+    out.sort(key=lambda p: (p.casefold(), p))
+    return out[:MAX_NEARBY]
+
+
 # --------------------------------------------------------------------------------------
 # Text normalisation / tokenisation
 # --------------------------------------------------------------------------------------

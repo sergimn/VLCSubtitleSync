@@ -202,6 +202,9 @@ class Request:
     audio_index: int = 0
     sub_index: int | None = None
     sub_path: str = ""
+    # Number of subtitle tracks VLC lists, our synced ones excluded (None: an older
+    # intf did not send it). Tells the daemon whether VLC has files it doesn't expect.
+    sub_count: int | None = None
     audio_label: str = ""
     sub_label: str = ""
     force: bool = False
@@ -225,6 +228,8 @@ class Request:
             "sub_path": self.sub_path,
             "force": self.force,
         }
+        if self.sub_count is not None:
+            out["sub_count"] = self.sub_count
         mode = normalize_mode(self.mode)
         if mode:
             out["mode"] = mode
@@ -254,12 +259,16 @@ class Request:
         sub_path = data.get("sub_path") or ""
         if sub_path:
             sub_path = media_path_from_value(sub_path)
+        sub_count = _to_int(data.get("sub_count"), None)
+        if sub_count is not None and sub_count < 0:
+            sub_count = None
         return cls(
             id=req_id,
             media=media,
             audio_index=max(0, audio_index or 0),
             sub_index=sub_index,
             sub_path=sub_path,
+            sub_count=sub_count,
             audio_label=data.get("audio_label") or "",
             sub_label=data.get("sub_label") or "",
             force=_to_bool(data.get("force")),

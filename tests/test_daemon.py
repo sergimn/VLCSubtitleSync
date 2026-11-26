@@ -772,15 +772,182 @@ def test_resolve_explicit_sub_path_wins(tmp_path):
 
 
 def test_resolve_embedded_then_sidecars():
-    kw = dict(count_embedded=lambda m: 2, find_sidecars=lambda m: ["/a.srt", "/a.en.srt"])
+    kw = dict(
+        count_embedded=lambda m: 2,
+        find_sidecars=lambda m: ["/a.srt", "/a.en.srt"],
+        subtitles_near=lambda m: [],
+        open_in_vlc=lambda m, c: None,
+    )
     assert D.resolve_source("/m", 0, **kw) == D.ResolvedSource("embedded", index=0)
     assert D.resolve_source("/m", 1, **kw) == D.ResolvedSource("embedded", index=1)
     assert D.resolve_source("/m", 2, **kw) == D.ResolvedSource("external", path="/a.srt")
     assert D.resolve_source("/m", 3, **kw) == D.ResolvedSource("external", path="/a.en.srt")
-    with pytest.raises(D.JobError, match="not found"):
+    with pytest.raises(D.JobError, match="Can't find the file of subtitle track 5"):
         D.resolve_source("/m", 4, **kw)
     with pytest.raises(D.JobError, match="No subtitle"):
         D.resolve_source("/m", None, **kw)
+
+
+def report_layout(tmp_path: Path, *names: str) -> str:
+    """The bug report's release-pack layout: Movie.mp4 and differently named files."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    media = tmp_path / "Movie.mp4"
+    media.write_bytes(b"")
+    for name in names:
+        f = tmp_path / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("1\n00:00:01,000 --> 00:00:02,000\nx\n", encoding="utf-8")
+    return str(media)
+
+
+def resolve(media, sub_index, *, opened=None, sidecars=(), n_embedded=0, **kw):
+    """resolve_source with the media probe faked and VLC's open files given."""
+    calls = []
+
+    def open_in_vlc(m, candidates):
+        calls.append(list(candidates))
+        return opened
+
+    src = D.resolve_source(
+        media,
+        sub_index,
+        count_embedded=lambda m: n_embedded,
+        find_sidecars=lambda m: list(sidecars),
+        open_in_vlc=open_in_vlc,
+        exclude_dirs=kw.pop("exclude_dirs", ()),
+        **kw,
+    )
+    return src, calls
+
+
+def test_resolve_hand_added_file_is_the_one_vlc_has_open(tmp_path):
+    # bug report: Movie.mp4 without embedded subs, Subs/3_English.srt added by hand
+    media = report_layout(
+        tmp_path, "Subs/2_English.srt", "Subs/3_English.srt", "Subs/8_Spanish.srt"
+    )
+    added = str(tmp_path / "Subs" / "3_English.srt")
+    src, calls = resolve(media, 0, sub_count=1, opened=[added])
+    assert src == D.ResolvedSource("external", path=added)
+    # VLC's process is checked for every subtitle file near the video (Windows needs that)
+    assert sorted(os.path.basename(c) for c in calls[0]) == [
+        "2_English.srt",
+        "3_English.srt",
+        "8_Spanish.srt",
+    ]
+    # an intf that doesn't send sub_count gets the same answer
+    assert resolve(media, 0, opened=[added])[0].path == added
+
+
+def test_resolve_hand_added_file_anywhere(tmp_path):
+    # Linux/macOS list all of VLC's files, so a file from another folder is found too
+    media = report_layout(tmp_path / "v", "Subs/2_English.srt")
+    elsewhere = report_layout(tmp_path / "dl", "English.srt")
+    other = str(Path(elsewhere).with_name("English.srt"))
+    assert resolve(media, 0, sub_count=1, opened=[other])[0].path == other
+
+
+def test_resolve_without_vlc_info_takes_only_an_unambiguous_file(tmp_path):
+    media = report_layout(
+        tmp_path, "Subs/2_English.srt", "Subs/3_English.srt", "Subs/8_Spanish.srt"
+    )
+    with pytest.raises(D.JobError) as e:
+        resolve(media, 0, sub_count=1, opened=None)
+    msg = str(e.value)
+    assert "Can't tell which file subtitle track 1 is" in msg
+    assert "2_English.srt, 3_English.srt, 8_Spanish.srt" in msg
+    assert 'Name it "Movie.srt", keep it next to the video and reopen the video' in msg
+
+    single = report_layout(tmp_path / "one", "English.srt")
+    one = str(Path(single).with_name("English.srt"))
+    assert resolve(single, 0, sub_count=1, opened=None)[0].path == one
+    assert resolve(single, 0, opened=None)[0].path == one  # CLI / older intf
+    # VLC lists two tracks beyond the sidecars but there is one file: don't guess
+    with pytest.raises(D.JobError, match="Can't find the file of subtitle track 2"):
+        resolve(single, 1, sub_count=2, opened=None)
+
+    empty = report_layout(tmp_path / "none")
+    with pytest.raises(D.JobError, match="Can't find the file of subtitle track 1"):
+        resolve(empty, 0, sub_count=1, opened=None)
+
+
+def test_resolve_sidecars_then_hand_added_file(tmp_path):
+    # the report's related case: sidecars exist and the user adds another file
+    media = report_layout(tmp_path, "Movie.en.srt", "Subs/2_English.srt", "Subs/3_English.srt")
+    en = str(tmp_path / "Movie.en.srt")
+    added = str(tmp_path / "Subs" / "2_English.srt")
+    kw = dict(sub_count=2, sidecars=[en], opened=[en, added])
+    assert resolve(media, 0, **kw)[0].path == en
+    assert resolve(media, 1, **kw)[0].path == added
+    # with embedded tracks before them
+    kw = dict(sub_count=3, sidecars=[en], opened=[added, en], n_embedded=1)
+    assert resolve(media, 0, **kw)[0] == D.ResolvedSource("embedded", index=0)
+    assert resolve(media, 1, **kw)[0].path == en
+    assert resolve(media, 2, **kw)[0].path == added
+
+
+def test_resolve_sidecar_vlc_did_not_load_is_skipped(tmp_path):
+    # find_sidecars also looks in Sub/, which VLC doesn't: without the check, track 1
+    # (Movie.en.srt) would be synced from Sub/Movie.srt
+    media = report_layout(tmp_path, "Sub/Movie.srt", "Movie.en.srt")
+    wrong = str(tmp_path / "Sub" / "Movie.srt")
+    en = str(tmp_path / "Movie.en.srt")
+    src, _ = resolve(media, 0, sub_count=1, sidecars=[wrong, en], opened=[en])
+    assert src.path == en
+
+
+def test_resolve_fast_path_does_not_ask_the_os(tmp_path):
+    media = report_layout(tmp_path, "Movie.srt", "Movie.en.srt")
+    sidecars = [str(tmp_path / "Movie.srt"), str(tmp_path / "Movie.en.srt")]
+    for count in (None, 2):
+        src, calls = resolve(media, 1, sub_count=count, sidecars=sidecars, opened=[])
+        assert src.path == sidecars[1] and calls == []
+
+
+def test_resolve_two_hand_added_files_are_ambiguous(tmp_path):
+    media = report_layout(tmp_path, "Subs/2_English.srt", "Subs/3_English.srt")
+    a, b = (str(tmp_path / "Subs" / n) for n in ("2_English.srt", "3_English.srt"))
+    for sub in (0, 1):
+        with pytest.raises(D.JobError, match=r"\(2_English.srt, 3_English.srt\)"):
+            resolve(media, sub, sub_count=2, opened=[a, b])
+
+
+def test_resolve_ignores_our_synced_copies_and_vobsub_halves(tmp_path):
+    media = report_layout(tmp_path, "Subs/2_English.srt", "Subs/Film.idx", "Subs/Film.sub")
+    out = tmp_path / "q" / "out"
+    out.mkdir(parents=True)
+    synced = out / "1728221234_1.srt"
+    synced.write_text("", encoding="utf-8")
+    added = str(tmp_path / "Subs" / "2_English.srt")
+    src, calls = resolve(media, 0, sub_count=1, opened=[str(synced), added], exclude_dirs=[out])
+    assert src.path == added
+    idx, sub = str(tmp_path / "Subs" / "Film.idx"), str(tmp_path / "Subs" / "Film.sub")
+    assert resolve(media, 0, sub_count=1, opened=[sub, idx])[0].path == idx
+
+
+def test_resolve_counts_tracks_vlc_has_but_we_cannot_see(tmp_path):
+    # VLC lists two extra tracks (one from a file the helper can't see): don't guess
+    media = report_layout(tmp_path, "Subs/2_English.srt")
+    added = str(tmp_path / "Subs" / "2_English.srt")
+    with pytest.raises(D.JobError, match="Can't find the file of subtitle track 1"):
+        resolve(media, 0, sub_count=2, opened=[added])
+    with pytest.raises(D.JobError, match="Can't find the file"):
+        resolve(media, 0, sub_count=1, opened=[])
+
+
+def test_daemon_resolver_passes_sub_count_and_output_dirs(env, monkeypatch):
+    got = {}
+
+    def fake(media, sub_index, sub_path="", **kw):
+        got.update(kw, media=media, sub_index=sub_index)
+        return D.ResolvedSource("embedded", index=0)
+
+    monkeypatch.setattr(D, "resolve_source", fake)
+    d = D.Daemon([env.queue], use_default_queues=False, runner=FakeRunner())
+    d.scan_queue_dirs()
+    req = P.Request(id="r_1", media="/m.mkv", sub_index=1, sub_count=3)
+    assert d.resolver(req) == D.ResolvedSource("embedded", index=0)
+    assert got["sub_count"] == 3 and got["sub_index"] == 1
+    assert Path(env.queue) / P.OUT_DIR in [Path(x) for x in got["exclude_dirs"]]
 
 
 def test_resolve_probe_failure_is_job_error():

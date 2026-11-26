@@ -180,6 +180,42 @@ def test_cmd_sync_vlc_ordinal(tmp_path, monkeypatch):
     assert cli.main(["sync", str(media), "--sub", "5"]) == 2
 
 
+def test_cmd_sync_differently_named_subtitle(tmp_path, monkeypatch, capsys):
+    # the bug report's layout: `--sub 0` used to fail with "Subtitle track 1 not found"
+    import vlcsubsync.sync as sync_mod
+
+    media = tmp_path / "Movie.mp4"
+    media.write_bytes(b"x")
+    (tmp_path / "Subs").mkdir()
+    english = tmp_path / "Subs" / "2_English.srt"
+    english.write_text("", encoding="utf-8")
+    real = D.resolve_source
+
+    def resolve(media, sub_index, sub_path="", **kw):
+        # no embedded tracks, no VLC running; the files near the video are real
+        kw.update(count_embedded=lambda m: 0, open_in_vlc=lambda m, c: None)
+        return real(media, sub_index, sub_path, **kw)
+
+    monkeypatch.setattr(D, "resolve_source", resolve)
+    got = {}
+
+    def fake_sync(media_path, audio_index, subtitle, output_path, config, progress=None, **kw):
+        got["sub"] = subtitle
+        return fake_result(output_path)
+
+    monkeypatch.setattr(sync_mod, "sync_subtitles", fake_sync)
+    assert cli.main(["sync", str(media), "--sub", "0", "-o", str(tmp_path / "out" / "o.srt")]) == 0
+    assert got["sub"].kind == "external" and got["sub"].path == str(english)
+
+    for n in ("3_English.srt", "8_Spanish.srt"):
+        (tmp_path / "Subs" / n).write_text("", encoding="utf-8")
+    capsys.readouterr()
+    assert cli.main(["sync", str(media), "--sub", "0", "-o", str(tmp_path / "out" / "o2.srt")]) == 2
+    err = capsys.readouterr().err
+    assert "Can't tell which file subtitle track 1 is" in err
+    assert "2_English.srt, 3_English.srt, 8_Spanish.srt" in err
+
+
 def test_cmd_sync_missing_media(tmp_path, capsys):
     assert cli.main(["sync", str(tmp_path / "nope.mkv")]) == 2
     assert "not found" in capsys.readouterr().err

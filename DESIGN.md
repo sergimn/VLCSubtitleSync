@@ -54,6 +54,7 @@ src/vlcsubsync/
   config.py                    # Config dataclass, load/save (TOML-ish key=value in <config dir>/config.ini)
   media.py                     # PyAV: probe streams, decode audio track → 16k mono float32, extract embedded text subs
   subtitles.py                 # load/save via pysubs2; sidecar discovery; language guess
+  openfiles.py                 # which subtitle files a running VLC has open (external tracks)
   transcribe.py                # faster-whisper wrapper (Transcriber protocol) + model mgmt
   vad.py                       # speech-activity (faster-whisper's silero VAD) → speech mask / segments
   align.py                     # anchors from words↔cues, robust piecewise-linear fit, VAD fallback
@@ -102,10 +103,33 @@ def sync_subtitles(media_path: str, audio_index: int, subtitle: SubtitleSource,
 ```
 `audio_index` = ordinal among the container's **audio** streams (0-based), which is
 the order VLC lists them. External subs: if VLC's sub ordinal ≥ number of embedded
-text sub streams, the daemon resolves `path` via sidecar discovery
-(`subtitles.find_sidecars(media_path)`: same stem / stem.*.ext in the media dir and
-`Subs/`, `Subtitles/` subdirs; exts srt, ass, ssa, vtt, sub; sorted like VLC:
-exact-stem match first, then alphabetical) and picks `ordinal - n_embedded`.
+sub streams, the track is external track `k = ordinal - n_embedded`. VLC lists the
+sidecars it loaded with the video first, then the files the user added (Subtitle → Add
+Subtitle File, drag and drop) in the order they were added. VLC 3's Lua API can't tell
+which file a track came from (no slave URI, the label has at most a language, the
+`sub-file` variable only holds a command-line file), so `daemon.resolve_source`:
+1. uses sidecar discovery (`subtitles.find_sidecars(media_path)`: same stem /
+   stem.*.ext in the media dir and `Subs/`, `Subtitles/` subdirs; exts srt, ass, ssa,
+   vtt, sub; exact-stem match first, then alphabetical) and picks sidecar `k` when `k`
+   is within them and VLC lists as many external tracks as there are sidecars
+   (`sub_count - n_embedded`; an intf that doesn't send `sub_count` always gets this);
+2. otherwise asks the OS which subtitle files (any of VLC's subtitle extensions) the
+   VLC process playing the video has open (`openfiles.subtitles_open_in_vlc`): VLC
+   keeps every subtitle file it loaded open while the video plays. Linux reads
+   `/proc/<pid>/fd` of processes named `vlc` (snap/Flatpak too), macOS runs `lsof -c
+   VLC`, Windows asks the Restart Manager about each subtitle file near the video
+   (`subtitles.subtitle_files_near`: the media dir, `Subs/`-style dirs and
+   `Subs/<video name>/`, any name). Our synced copies (`<q>/out/`) and the `.sub` half
+   of a VobSub pair don't count. The external tracks are then the sidecars VLC has open
+   (in sidecar order), then the other open files. If the OS can't tell (no VLC with the
+   video open, `lsof` missing, an error), the other files are the subtitle files near
+   the video;
+3. picks one of those other files only if it is the only one and VLC lists exactly
+   one external track beyond the sidecars (unknown `sub_count`: any). Two hand-added
+   files can't be told apart (VLC's open order is not their track order), so the job
+   fails with an error that names the files and says to name the wanted one like the
+   video, keep it next to it and reopen the video. No file at all: "Can't find the
+   file of subtitle track N", with the same advice.
 
 ### File protocol (Lua ↔ daemon) — all files UTF-8 `key=value` lines
 
@@ -121,6 +145,7 @@ audio_index=1                          # ordinal among audio tracks (0-based)
 audio_label=Track 2 - [English]
 sub_index=0                            # ordinal among subtitle tracks VLC lists (0-based, our own synced tracks excluded)
 sub_label=Track 1 - [English]
+sub_count=2                            # subtitle tracks VLC lists (our synced ones excluded), see "External subs"
 sub_path=                              # optional explicit external subtitle path
 force=0                                # 1 = ignore result cache
 mode=exhaustive                        # optional: fast|thorough|exhaustive, overrides config

@@ -411,18 +411,66 @@ def default_find_sidecars(media_path: str) -> list[str]:
     return [str(p) for p in find_sidecars(media_path)]
 
 
+def default_subtitles_near(media_path: str) -> list[str]:
+    from .subtitles import subtitle_files_near
+
+    return subtitle_files_near(media_path)
+
+
+def default_subtitles_open_in_vlc(media_path: str, candidates: Sequence[str]) -> list[str] | None:
+    from .openfiles import subtitles_open_in_vlc
+
+    return subtitles_open_in_vlc(media_path, candidates)
+
+
+def default_output_dirs() -> list[Path]:
+    """The ``out/`` dirs of every default queue dir (VLC has our synced files open)."""
+    return [q / P.OUT_DIR for q in default_queue_dirs()]
+
+
+def _drop_vobsub_halves(paths: list[str]) -> list[str]:
+    """A VobSub track is an ``.idx`` plus a ``.sub`` file, both open in VLC: keep the
+    ``.idx``."""
+    idx = {os.path.normcase(p[:-4]) for p in paths if p.lower().endswith(".idx")}
+    return [
+        p for p in paths if not (p.lower().endswith(".sub") and os.path.normcase(p[:-4]) in idx)
+    ]
+
+
+def _names(paths: Sequence[str], limit: int = 3) -> str:
+    names = ", ".join(os.path.basename(p) for p in paths[:limit])
+    return names + (f" and {len(paths) - limit} more" if len(paths) > limit else "")
+
+
 def resolve_source(
     media: str,
     sub_index: int | None,
     sub_path: str = "",
     *,
+    sub_count: int | None = None,
+    exclude_dirs: Iterable[str | os.PathLike[str]] | None = None,
     count_embedded: Callable[[str], int] = count_embedded_subtitles,
     find_sidecars: Callable[[str], Sequence[Any]] = default_find_sidecars,
+    subtitles_near: Callable[[str], Sequence[str]] = default_subtitles_near,
+    open_in_vlc: Callable[[str, Sequence[str]], Sequence[str] | None] = (
+        default_subtitles_open_in_vlc
+    ),
 ) -> ResolvedSource:
     """Map VLC's subtitle ordinal to a concrete source.
 
-    VLC lists embedded subtitle streams first, then external (sidecar) files.  An
-    explicit ``sub_path`` always wins.
+    VLC lists embedded subtitle streams first, then external files: the sidecars it
+    loaded with the video, then the files the user added (Subtitle > Add Subtitle
+    File, drag and drop). An explicit ``sub_path`` always wins. ``sub_count`` is the
+    number of subtitle tracks VLC lists, our synced ones excluded (None: unknown).
+
+    VLC's Lua API can't tell which file an external track came from. While the
+    ordinal points into ``find_sidecars`` and VLC lists no other external tracks, it
+    picks that sidecar. Otherwise the external tracks are the subtitle files the VLC
+    process playing ``media`` has open (``open_in_vlc``; files in ``exclude_dirs``,
+    our synced copies, don't count): the sidecars among them, then the others. If the
+    OS can't tell, the others are the subtitle files near the video
+    (``subtitles_near``). A file that is not a sidecar is used only when it is the only
+    such file and VLC lists one such track. See DESIGN.md "External subs".
     """
     if sub_path:
         if not os.path.isfile(sub_path):
@@ -438,12 +486,64 @@ def resolve_source(
         return ResolvedSource("embedded", index=sub_index)
     k = sub_index - n_embedded
     sidecars = [str(p) for p in find_sidecars(media)]
-    if k < len(sidecars):
+    n_ext = None if sub_count is None else max(0, sub_count - n_embedded)
+    if k < len(sidecars) and (n_ext is None or n_ext == len(sidecars)):
         return ResolvedSource("external", path=sidecars[k])
-    raise JobError(
-        f"Subtitle track {sub_index + 1} not found "
-        f"({n_embedded} embedded, {len(sidecars)} external files)"
+
+    from .openfiles import same_file_key
+
+    if exclude_dirs is None:
+        exclude_dirs = default_output_dirs()
+    excluded = [same_file_key(str(d)) for d in exclude_dirs]
+
+    def ours(p: str) -> bool:
+        key = same_file_key(p)
+        return any(key.startswith(d.rstrip(os.sep) + os.sep) for d in excluded)
+
+    def keyset(paths: Iterable[str]) -> set[str]:
+        return {same_file_key(p) for p in paths}
+
+    side_keys = keyset(sidecars)
+    nearby = [p for p in subtitles_near(media) if not ours(p)]
+    others_near = [p for p in nearby if same_file_key(p) not in side_keys]
+    opened = open_in_vlc(media, sidecars + others_near)
+    if opened is not None:
+        open_list = [str(p) for p in opened if not ours(str(p))]
+        open_keys = keyset(open_list)
+        known = [s for s in sidecars if same_file_key(s) in open_keys]
+        known_keys = keyset(known)
+        others = _drop_vobsub_halves([p for p in open_list if same_file_key(p) not in known_keys])
+        where = "open in VLC"
+    else:
+        known, others, where = sidecars, others_near, "near the video (VLC's files unknown)"
+    log.info(
+        "subtitle track %d of %s: %d embedded, VLC lists %s external; sidecars %s; "
+        "other subtitle files %s: %s",
+        sub_index + 1,
+        media,
+        n_embedded,
+        "?" if n_ext is None else n_ext,
+        [os.path.basename(s) for s in known],
+        where,
+        [os.path.basename(p) for p in others],
     )
+    if k < len(known):
+        return ResolvedSource("external", path=known[k])
+    other_tracks = None if n_ext is None else n_ext - len(known)
+    if len(others) == 1 and k == len(known) and other_tracks in (None, 1):
+        log.info(
+            "subtitle track %d is %s (%s)",
+            sub_index + 1,
+            others[0],
+            "open in VLC" if opened is not None else "the only other subtitle file near it",
+        )
+        return ResolvedSource("external", path=others[0])
+    hint = f'Name it "{Path(media).stem}.srt", keep it next to the video and reopen the video'
+    if len(others) > 1:
+        raise JobError(
+            f"Can't tell which file subtitle track {sub_index + 1} is ({_names(others)}). {hint}"
+        )
+    raise JobError(f"Can't find the file of subtitle track {sub_index + 1}. {hint}")
 
 
 def effective_mode(request: P.Request, config: Any) -> str:
@@ -609,9 +709,7 @@ class Daemon:
         self.extra_queue_dirs = [Path(q) for q in queue_dirs]
         self.use_default_queues = use_default_queues
         self.runner: JobRunner = runner or EngineRunner()
-        self.resolver: SourceResolver = resolver or (
-            lambda r: resolve_source(r.media, r.sub_index, r.sub_path)
-        )
+        self.resolver: SourceResolver = resolver or self._resolve_source
         self.config_loader = config_loader
         self.cache_dir = Path(cache_dir) if cache_dir else results_cache_dir()
         self.lock = InstanceLock(lock_path or lock_file_path())
@@ -648,6 +746,17 @@ class Daemon:
         self._seen_requests: dict[Path, float] = {}
         self._worker: threading.Thread | None = None
         self.jobs_completed = 0
+
+    def _resolve_source(self, r: P.Request) -> ResolvedSource:
+        # VLC has our synced copies open as well: they are never the source track
+        out_dirs = [q / P.OUT_DIR for q in [*self.queue_dirs, *self.extra_queue_dirs]]
+        return resolve_source(
+            r.media,
+            r.sub_index,
+            r.sub_path,
+            sub_count=r.sub_count,
+            exclude_dirs=[*out_dirs, *default_output_dirs()],
+        )
 
     # ---------------------------------------------------------------- queue dirs
     def scan_queue_dirs(self) -> list[Path]:
@@ -793,11 +902,12 @@ class Daemon:
             )
             return False
         log.info(
-            "request %s: media=%s audio=%s sub=%s%s%s",
+            "request %s: media=%s audio=%s sub=%s%s%s%s",
             request.id,
             request.media,
             request.audio_index,
             request.sub_index,
+            f" of {request.sub_count}" if request.sub_count is not None else "",
             f" sub_path={request.sub_path}" if request.sub_path else "",
             " (cache only)" if request.cache_only else "",
         )

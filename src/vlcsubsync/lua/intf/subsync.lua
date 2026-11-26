@@ -498,9 +498,21 @@ function M.ordinal(ids, labels, id, skip)
     return nil
 end
 
+-- Number of subtitle tracks VLC lists, "Disable" and our synced tracks excluded.
+-- Sent as sub_count: VLC's Lua API can't say which file an external track came
+-- from, so the helper checks this against the files it finds (DESIGN.md "External
+-- subs").
+function M.sub_count(snap)
+    local n = 0
+    for _, v in ipairs(snap.spu_ids) do
+        if v ~= -1 and not S.ours[v] then n = n + 1 end
+    end
+    return n
+end
+
 -- Resolve the current selection into {audio=ordinal, sub=ordinal, ...} or nil.
 function M.selection(snap)
-    local sel = { audio_id = snap.audio, spu_id = snap.spu }
+    local sel = { audio_id = snap.audio, spu_id = snap.spu, sub_count = M.sub_count(snap) }
     if snap.audio ~= -1 then
         sel.audio, sel.audio_label = M.ordinal(snap.audio_ids, snap.audio_labels, snap.audio)
     end
@@ -596,6 +608,7 @@ function M.submit(sel, force, mode, probe)
         { "audio_label", sel.audio_label or "" },
         { "sub_index", sel.sub },
         { "sub_label", sel.sub_label or "" },
+        { "sub_count", sel.sub_count or "" },
         { "sub_path", "" },
         { "force", force and 1 or 0 },
     }
@@ -608,9 +621,9 @@ function M.submit(sel, force, mode, probe)
         M.set_state("error", "cannot write request", nil)
         return nil
     end
-    log_info(string.format("request %s: audio=%d sub=%d mode=%s%s media=%s",
-        id, sel.audio, sel.sub, mode ~= "" and mode or "default",
-        probe and " (cache only)" or "", S.media_path))
+    log_info(string.format("request %s: audio=%d sub=%d of %s mode=%s%s media=%s",
+        id, sel.audio, sel.sub, tostring(sel.sub_count or "?"),
+        mode ~= "" and mode or "default", probe and " (cache only)" or "", S.media_path))
     S.job = {
         id = id, key = sel.key, audio = sel.audio, sub = sel.sub,
         sub_label = sel.sub_label, req_path = path, started = now_us(), mode = mode,
@@ -968,6 +981,7 @@ function M.tick()
                 fsel = {
                     audio = sel.audio, audio_label = sel.audio_label,
                     sub = sel.sub, sub_label = sel.sub_label, key = sel.key,
+                    sub_count = sel.sub_count,
                 }
             end
             if p.explicit then

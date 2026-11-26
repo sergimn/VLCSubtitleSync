@@ -256,6 +256,7 @@ def test_request_written_with_ordinals_labels_and_decoded_path(h):
     assert r["media"] == MOVIE_PATH
     assert r["audio_index"] == "1" and r["audio_label"] == "Track 2 - [English]"
     assert r["sub_index"] == "1" and r["sub_label"] == "Track 2 - [Spanish]"
+    assert r["sub_count"] == "2"
     assert r["force"] == "0" and r["sub_path"] == ""
     assert (h.q / "requests" / f"{r['id']}.req").exists()
     assert not list((h.q / "requests").glob("*.tmp"))
@@ -471,11 +472,29 @@ def test_done_adds_selects_and_memoizes(h):
     h.settle()
     assert h.requests() == []
     assert h.selected("spu-es") == new_id
-    # our track is excluded from ordinals: picking sub 21 is still ordinal 1
+    # our track is excluded from ordinals and the count: picking sub 21 is still
+    # ordinal 1 of 2
     h.select("spu-es", 21)
     h.settle()
     reqs = h.requests()
-    assert len(reqs) == 1 and reqs[0]["sub_index"] == "1"
+    assert len(reqs) == 1 and reqs[0]["sub_index"] == "1" and reqs[0]["sub_count"] == "2"
+
+
+def test_hand_added_subtitle_request_counts_tracks(h):
+    # the bug report: a video without subtitles, then Subtitle > Add Subtitle File. VLC
+    # adds the track and selects it, and can't tell us its file: the request says it
+    # is the only subtitle track VLC lists, so the helper knows which file to look for
+    h.set_input(subs=[], spu_sel=-1)
+    h.settle()
+    assert h.requests() == []
+    h.mock.input.spu[1] = h.lua.table_from({"id": 30, "label": "Track 1"})
+    h.select("spu-es", 30)
+    h.settle()
+    reqs = h.requests()
+    assert len(reqs) == 1
+    r = reqs[0]
+    assert r["sub_index"] == "0" and r["sub_count"] == "1" and r["sub_path"] == ""
+    assert any(f"request {r['id']}: audio=0 sub=0 of 1 " in ln for ln in h.logs())
 
 
 def test_delayed_track_appearance(h):
@@ -506,6 +525,7 @@ def test_audio_change_triggers_resync(h):
     reqs = h.requests()
     assert len(reqs) == 1
     assert reqs[0]["audio_index"] == "1" and reqs[0]["sub_index"] == "0"
+    assert reqs[0]["sub_count"] == "2"  # counted without our synced track
     h.finish(reqs[0]["id"])
     h.tick(3)
     synced_a1 = h.selected("spu-es")

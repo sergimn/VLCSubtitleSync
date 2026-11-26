@@ -269,14 +269,19 @@ def test_files_given_at_startup_can_change_the_order(tmp_path):
     det = VlcSidecars(media, C(), sub_file=None)
     got = det.lists(lambda n: (4 - n,) if n <= 4 else ())
     assert got.exact
-    for order in got.orders:  # the same files, maybe in another order
-        assert sorted(names(tmp_path, [p for p in order if p])) == sorted(
-            names(tmp_path, det.paths)
-        )
-        assert len(order) == 4
+    sidecars = names(tmp_path, det.paths)
+    clobbers = S._free_clobbers() == (True,)
+    for order in got.orders:
+        files = names(tmp_path, [p for p in order if p])
+        assert len(order) == 4 and len(set(files)) == len(files) and set(files) <= set(sidecars)
+        if clobbers:  # the same files, maybe in another order
+            assert sorted(files) == sorted(sidecars)
+    if not clobbers:  # Windows: if the unknown file is a sidecar and VLC deleted it first,
+        # the freed URI may still match the sidecar's copy, which goes too
+        assert any(len([p for p in o if p]) < len(sidecars) for o in got.orders)
     if WINDOWS:  # where the --sub-file sorts among them changes Windows' qsort order
         assert len(got.orders) > 1 and got.why
-    if LINUX:  # glibc's merge sort keeps equal ones in order
+    if LINUX and clobbers:  # glibc's merge sort keeps equal ones in order
         assert {tuple(names(tmp_path, [p for p in o if p])) for o in got.orders} == {
             tuple(names(tmp_path, det.paths))
         }

@@ -1340,7 +1340,8 @@ def test_resolve_a_file_saved_since_the_video_opened_changes_nothing(
     vlc = VlcSidecars(media, vlc_settings()).paths  # VLC's list as the video opened
     opened = [str(root / n) for n in files]
     report_layout(root, late)  # saved next to the video since, not loaded
-    if listing and GLIBC_OR_MACOS:  # it would change the order of the others
+    if listing and sys.platform.startswith("linux") and GLIBC_OR_MACOS:
+        # with glibc's merge sort it would change the order of the others
         now = VlcSidecars(media, vlc_settings()).paths
         assert [p for p in now if Path(p).name != late] != vlc
     picked = 0

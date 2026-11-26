@@ -558,14 +558,14 @@ def _is_snap(vlc: str) -> bool:
 ADD_LATER_LUA = """
 local path = [[@PATH@]]
 local since = nil
-while not vlc.misc.should_die() do
+while true do  -- VLC 3 has no should_die(): mwait raises once VLC closes the intf
     local input = vlc.object.input()
     local state = input and vlc.var.get(input, "state")
-    if state == 3 then
+    if state == 2 then  -- PLAYING_S
         since = since or vlc.misc.mdate()
         if vlc.misc.mdate() - since > 2000000 then
             vlc.msg.info("[subsync-test] adding " .. path)
-            vlc.input.add_subtitle(path)
+            vlc.input.add_subtitle(path, true)  -- VLC 3 selects it only when asked
             return
         end
     end

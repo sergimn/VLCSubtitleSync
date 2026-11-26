@@ -221,7 +221,14 @@ def test_report_layouts(tmp_path, layout, sidecars):
     media.write_bytes(b"")
     for name in layout:
         _touch(tmp_path / name)
-    assert find_sidecars(str(media)) == [str(tmp_path / n) for n in sidecars]
+    got = find_sidecars(str(media))
+    if sys.platform in ("win32", "darwin") and any(n.startswith("Subs/") for n in sidecars):
+        # VLC spells the folder as its setting does (.\\subs on Windows), and macOS
+        # reads ./Subs and ./subs, the same folder there: VLC lists the file twice
+        assert len(got) == (2 if sys.platform == "darwin" else 1)
+        assert all(os.path.samefile(p, tmp_path / sidecars[0]) for p in got)
+    else:
+        assert got == [str(tmp_path / n) for n in sidecars]
     # every one of them is a subtitle file near the video
     assert subtitle_files_near(str(media)) == sorted(
         (str(tmp_path / n) for n in layout), key=lambda p: (p.casefold(), p)

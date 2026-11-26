@@ -1219,11 +1219,14 @@ def test_resolve_vlcs_order_puts_subs_first(tmp_path):
     root = tmp_path / "m"
     media = report_layout(root, "Movie.en.srt", "Subs/Movie.de.srt")
     en, de = str(root / "Movie.en.srt"), str(root / "Subs" / "Movie.de.srt")
-    src, _ = resolve_vlc(media, 0, sub_count=2, sub_added=0, opened=[en, de])
-    if sys.platform == "darwin":  # Subs/ is read twice there: ./Subs and ./subs
-        assert os.path.samefile(src.path, de)
-    else:
-        assert src.path == de
+    # macOS reads Subs/ twice (./Subs and ./subs on a case-insensitive disk): VLC lists
+    # the file twice; Windows' qsort swaps the two (equal) sidecars back
+    count = 3 if sys.platform == "darwin" else 2
+    want = en if sys.platform == "win32" else de
+    src, _ = resolve_vlc(media, 0, sub_count=count, sub_added=0, opened=[en, de])
+    assert os.path.samefile(src.path, want)
+    last, _ = resolve_vlc(media, count - 1, sub_count=count, sub_added=0, opened=[en, de])
+    assert os.path.samefile(last.path, de if sys.platform == "win32" else en)
 
 
 def test_resolve_refuses_a_file_vlcs_rules_load_that_subsync_did_not_find(tmp_path, monkeypatch):

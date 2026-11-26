@@ -145,7 +145,14 @@ than half a second, and smooth from line to line).
 If the subtitle language and the spoken language differ (say English audio with
 Spanish subtitles), there is no text to compare. SubSync then lines up the subtitle
 timing with the moments where people are speaking. That method is less precise but
-still fixes delays and frame-rate drift.
+still fixes delays and frame-rate drift (not cuts).
+
+To tell, SubSync checks the spoken language in up to five samples spread over the
+video. Audio that is only partly in another language (a documentary with archive
+interviews, a film with some foreign dialogue) is still transcribed when most of its
+speech is in the subtitle language. When most of it is in another language but some
+samples are in the subtitle language, those are transcribed first, and the sync goes
+on only if their words match the subtitles.
 
 ## Command line
 
@@ -264,7 +271,8 @@ device.
   multilingual `base` model, downloaded automatically the first time it is needed
   (~150 MB). The subtitle language is guessed from its text.
 - **Subtitle language ≠ audio language**: falls back to voice-activity alignment
-  (see *How it works*).
+  (see *How it works*). Mixed-language audio that is mostly in the subtitle language
+  is transcribed as usual.
 
 Larger models (`small`, `medium`) are more robust on noisy soundtracks but slower; set
 them in `config.ini`.

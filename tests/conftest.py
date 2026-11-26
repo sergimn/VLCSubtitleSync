@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import shutil
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -115,6 +115,12 @@ class SynthFakeTranscriber:
     ``drop``: probability a word is missing; ``noise``: probability a word is replaced
     by a random one; ``jitter``: std-dev (s) of word timestamp noise; ``garbage``: emit
     unrelated words only (simulates wrong language / music).
+
+    ``language`` is the spoken language, except inside the ``other_languages`` spans
+    ``(start, end, language)`` (mixed-language audio). :meth:`detect_language` reports
+    the language of most of the window, and :meth:`transcribe` emits the words of a cue
+    only if it is spoken in the language asked for (or none is asked for): forced to
+    another language, Whisper finds nothing that matches the subtitles.
     """
 
     def __init__(
@@ -126,6 +132,7 @@ class SynthFakeTranscriber:
         jitter: float = 0.03,
         garbage: bool = False,
         seed: int = 2,
+        other_languages: Sequence[tuple[float, float, str]] = (),
     ):
         self.spans = spans
         self.language = language
@@ -133,22 +140,40 @@ class SynthFakeTranscriber:
         self.noise = noise
         self.jitter = jitter
         self.garbage = garbage
+        self.other_languages = list(other_languages)
         self.rng = np.random.default_rng(seed)
         self.calls: list[tuple[float, float]] = []
+        self.call_languages: list[str | None] = []  # the language of each transcribe()
+        self.detect_calls: list[tuple[float, str]] = []
 
-    def detect_language(self, audio, sr):
-        return self.language, 0.95
+    def language_at(self, start: float, end: float) -> str:
+        """The language spoken over most of ``[start, end]`` (a point if equal)."""
+        for lo, hi, lang in self.other_languages:
+            if end <= start and lo <= start < hi:
+                return lang
+            if end > start and min(end, hi) - max(start, lo) > 0.5 * (end - start):
+                return lang
+        return self.language
+
+    def detect_language(self, audio, sr, *, start: float = 0.0):
+        lang = self.language_at(start, start + len(audio) / sr)
+        self.detect_calls.append((start, lang))
+        return lang, 0.95
 
     def transcribe(self, audio, sr, language, *, start: float = 0.0):
         from vlcsubsync.transcribe import Word
 
         end = start + len(audio) / sr
         self.calls.append((start, end))
+        self.call_languages.append(language)
         words = []
         vocab = ["zorp", "blick", "quanta", "mirth", "plover", "snark", "frabjous"]
         for a, b, cue in self.spans:
             if b < start or a > end:
                 continue
+            mid = 0.5 * (a + b)
+            if language is not None and self.language_at(mid, mid) != language:
+                continue  # spoken in another language than asked for
             toks = cue.text.replace("\n", " ").split()
             total = sum(len(t) + 1 for t in toks)
             pos = 0

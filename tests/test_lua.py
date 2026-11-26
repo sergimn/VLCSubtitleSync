@@ -516,7 +516,6 @@ def test_request_counts_tracks_added_after_the_file_opened(h):
     assert r["sub_index"] == "3" and r["sub_count"] == "4" and r["sub_added"] == "1"
 
 
-
 def autodetect_vars(hh, on=True, fuzzy=3, paths="./Subs, ./subs"):
     """VLC's subtitle autodetection settings, as the input object has them."""
     v = hh.mock.input.vars
@@ -566,6 +565,7 @@ def test_request_leaves_out_settings_vlc_does_not_give(h):
     r = h.requests()[0]
     assert not {"sub_autodetect", "sub_fuzzy", "sub_paths"} & r.keys()
 
+
 def test_same_file_playing_again_counts_from_its_new_start(h):
     # VLC starts a new input object; the files added during the first play are now
     # loaded with the video (VLC lists them first)
@@ -583,9 +583,10 @@ def test_same_file_playing_again_counts_from_its_new_start(h):
 
 
 def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_path):
-    # the input was already playing when we first saw it: files may have been added
-    (tmp_path / "late").mkdir()
-    (tmp_path / "old").mkdir()
+    # the input was already playing a minute when the intf first looked (it started
+    # after the video): files may have been added
+    for d in ("late", "old", "resume", "start"):
+        (tmp_path / d).mkdir()
     late = Harness(runtime, tmp_path / "late", INTF)
     late.heartbeat()
     late.init()
@@ -594,6 +595,28 @@ def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_pat
     late.settle()
     r = late.requests()[0]
     assert r["sub_count"] == "2" and r["sub_added"] == ""
+    # a video VLC starts at a resume point: it opens after our first tick, so its
+    # position doesn't matter
+    resume = Harness(runtime, tmp_path / "resume", INTF)
+    resume.heartbeat()
+    resume.init()
+    resume.mock.input = None
+    resume.tick()
+    resume.set_input()
+    resume.mock.input.time = 1_500_000_000
+    resume.settle()
+    r = resume.requests()[0]
+    assert r["sub_count"] == "2" and r["sub_added"] == "0"
+    # --start-time 60 with the video open at our first tick: played from there
+    start = Harness(runtime, tmp_path / "start", INTF)
+    start.heartbeat()
+    start.init()
+    start.set_input()
+    start.mock.input.time = 61_000_000
+    start.mock.input.vars["start-time"] = 60.0
+    start.settle()
+    r = start.requests()[0]
+    assert r["sub_count"] == "2" and r["sub_added"] == "0"
     # no vlc.var.create: a replay of the same item can't be told apart
     old = Harness(runtime, tmp_path / "old", INTF)
     old.heartbeat()
@@ -1103,7 +1126,6 @@ def test_ext_fallback_sync_and_load(ext):
     assert ext.spu_ids()[-1] in [k for k in ext.E.state.ours.keys()]
 
 
-
 def test_ext_fallback_sync_sends_vlcs_subtitle_autodetection_settings(ext):
     write_intf_state(ext, age=600, state="idle")
     ext.heartbeat()
@@ -1114,6 +1136,7 @@ def test_ext_fallback_sync_sends_vlcs_subtitle_autodetection_settings(ext):
     assert r["sub_autodetect"] == "1" and r["sub_fuzzy"] == "-1"
     assert r["sub_paths"] == ".\\subs"
     assert r.get("sub_collate") == this_collate()
+
 
 def test_ext_sync_now_exhaustive_signals_running_intf(ext):
     ext.show_all()

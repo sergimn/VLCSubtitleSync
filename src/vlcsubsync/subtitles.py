@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import os
 import re
+import sys
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable
@@ -181,6 +182,26 @@ def subtitle_files_near(media_path: str | os.PathLike[str]) -> list[str]:
                 out.append(str(f))
     out.sort(key=lambda p: (p.casefold(), p))
     return out[:MAX_NEARBY]
+
+
+def in_vlc_sub_folder(media_path: str | os.PathLike[str], path: str) -> bool:
+    """Whether ``path`` is somewhere VLC 3's default settings look for subtitle files:
+    the video's folder, or its ``./Subtitles``, ``./subtitles``, ``./Subs`` or ``./subs``
+    subfolder (``.\\subtitles``, ``.\\subs`` on Windows). Only Windows and macOS file
+    systems ignore the letter case, so a Linux ``SUBS/`` or any ``Sub/`` doesn't count.
+    """
+    from .openfiles import same_file_key
+
+    media, sub = Path(media_path), Path(path)
+    home = same_file_key(str(media.parent))
+    folder = sub.parent
+    if same_file_key(str(folder)) == home:
+        return True
+    if same_file_key(str(folder.parent)) != home:
+        return False
+    if sys.platform in ("win32", "darwin"):
+        return folder.name.casefold() in ("subtitles", "subs")
+    return folder.name in ("Subtitles", "subtitles", "Subs", "subs")
 
 
 # --------------------------------------------------------------------------------------

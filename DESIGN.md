@@ -114,15 +114,19 @@ URI sorts after the first sidecar it found.) VLC 3's Lua API can't tell which fi
 track came from (no slave URI, the label has at most a language, the `sub-file`
 variable only holds the startup file), so the intf sends `sub_count` (the subtitle
 tracks it lists) and `sub_added` (how many of them showed up after the input reached
-`PLAYING_S`; empty when unknown: the input had already played 5 s when the intf saw it
-open, or `vlc.var.create` is missing, which the intf uses to mark each input object so
-it notices the same item playing again), both without our synced tracks. Then
+`PLAYING_S`; empty when unknown: the input was already open at the intf's first tick
+and had played 5 s past its `start-time` (the intf started after the video; VLC starts
+its interfaces before it plays anything, so any later input is at most a tick old, and
+a resume point says nothing), or `vlc.var.create` is missing, which the intf uses to
+mark each input object so it notices the same item playing again), both without our
+synced tracks. Then
 `daemon.resolve_source`:
 1. uses sidecar discovery (`subtitles.find_sidecars(media_path)`: same stem /
    stem.*.ext in the media dir and `Subs/`, `Subtitles/` subdirs; exts srt, ass, ssa,
    vtt, sub; exact-stem match first, then alphabetical) and picks sidecar `k` when `k`
-   is within them, VLC lists as many external tracks as there are sidecars and none was
-   added later (a request without the counts always gets this);
+   is within them, VLC lists as many external tracks as there are sidecars, none was
+   added later and every sidecar is where VLC looks by itself (a request without the
+   counts always gets this);
 2. otherwise asks the OS which subtitle files (any of VLC's subtitle extensions) the
    VLC process playing the video has open (`openfiles.subtitles_open_in_vlc`): VLC
    keeps every subtitle file it loaded open while the video plays. Linux reads
@@ -130,18 +134,25 @@ it notices the same item playing again), both without our synced tracks. Then
    VLC`, Windows asks the Restart Manager about each subtitle file near the video
    (`subtitles.subtitle_files_near`: the media dir, `Subs/`-style dirs and
    `Subs/<video name>/`, any name), so there a file added from another folder is not
-   found. Our synced copies (`<q>/out/`) don't count, and a VobSub `.idx`/`.sub` pair
-   is one track. The sidecars among the open files are VLC's sidecar group (in sidecar
-   order); the other files were given at startup or added since. If the OS can't tell
-   (no VLC with the video open, `lsof` missing, an error), a request from VLC only gets
-   the sidecar rule (`k` within the sidecars); the CLI and older intfs, which send no
-   counts, also take the one subtitle file near the video beyond the sidecars;
+   found. On Linux an fd of a file that was replaced since VLC opened it (saved again
+   through a rename, `… (deleted)`) counts as that path if it exists again. Our synced
+   copies (`<q>/out/`) don't count, and a VobSub `.idx`/`.sub` pair is one track. The
+   sidecars among the open files are VLC's sidecar group (in sidecar order), except
+   those in a folder VLC doesn't look in by itself (`Sub/`, `Subtitle/`, and on Linux a
+   `SUBS/`: `subtitles.in_vlc_sub_folder`), which VLC loaded only on request; the other
+   files were given at startup or added since. If the OS can't tell (no VLC with the
+   video open, `lsof` missing, an error), a request from VLC only gets the sidecar rule
+   (`k` within the sidecars); the CLI also takes the one subtitle file near the video
+   beyond the sidecars (its own numbering, see README);
 3. picks a file outside the sidecars only where the counts place it for certain
    (`daemon._external_track_file`): it is the only subtitle file VLC has open and VLC
    lists one external track; or VLC lists one track added later, every track listed at
    the start is a sidecar, and it is the only other file; or it is the only other file
    and VLC lists one more track at the start than there are sidecars (it comes first:
-   track `k = 0`, the sidecars follow). Tracks it can't place make it fall back to the
+   track `k = 0`, the sidecars follow). A request without the counts (an older intf)
+   gets only the sidecar rule and the only open file, since VLC lists files given at
+   startup before the sidecars; the CLI numbers the one other file after the sidecars
+   (`assume_sidecars_first`). Tracks it can't place make it fall back to the
    sidecar rule: SubSync's synced copies VLC reloads when the video plays again (the
    intf can't tell they are ours), tracks without a file (closed captions, subtitles
    attached to an MKV), and files VLC may have loaded by itself that `find_sidecars`

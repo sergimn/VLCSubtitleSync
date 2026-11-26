@@ -83,6 +83,47 @@ def test_request_sub_count_optional(tmp_path):
         assert got.sub_count == want and got.sub_added == want, raw
 
 
+def test_request_vlc_autodetect_settings_optional(tmp_path):
+    path = P.write_request(tmp_path, P.Request(id="a1", media="/m.mkv", sub_index=0))
+    kv = P.read_kv(path)
+    assert not {"sub_autodetect", "sub_fuzzy", "sub_paths", "sub_collate"} & kv.keys()
+    got = P.read_request(path)
+    assert (got.sub_autodetect, got.sub_fuzzy, got.sub_paths, got.sub_collate) == (None,) * 4
+    req = P.Request(
+        id="a2",
+        media="/m.mkv",
+        sub_index=0,
+        sub_autodetect=False,
+        sub_fuzzy=-1,
+        sub_paths="",
+        sub_collate="es_ES.UTF-8",
+    )
+    path = P.write_request(tmp_path, req)
+    kv = P.read_kv(path)
+    assert kv["sub_autodetect"] == "0" and kv["sub_fuzzy"] == "-1"
+    assert kv["sub_paths"] == "" and kv["sub_collate"] == "es_ES.UTF-8"
+    got = P.read_request(path)
+    assert got.sub_autodetect is False and got.sub_fuzzy == -1
+    assert got.sub_paths == "" and got.sub_collate == "es_ES.UTF-8"
+    # what the Lua intf and extension write
+    got = P.Request.from_dict(
+        {
+            "id": "a3",
+            "media": "/m.mkv",
+            "sub_autodetect": "1",
+            "sub_fuzzy": "3",
+            "sub_paths": "./Subtitles, ./subtitles, ./Subs, ./subs",
+            "sub_collate": "C",
+        }
+    )
+    assert got.sub_autodetect is True and got.sub_fuzzy == 3 and got.sub_collate == "C"
+    assert got.sub_paths == "./Subtitles, ./subtitles, ./Subs, ./subs"
+    got = P.Request.from_dict(
+        {"id": "a4", "media": "/m.mkv", "sub_autodetect": "", "sub_fuzzy": "x", "sub_collate": ""}
+    )
+    assert got.sub_autodetect is None and got.sub_fuzzy is None and got.sub_collate is None
+
+
 def test_status_roundtrip(tmp_path):
     st = P.Status(
         id="x_1",

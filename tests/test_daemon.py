@@ -861,14 +861,20 @@ def test_resolve_without_vlc_info_takes_only_an_unambiguous_file(tmp_path):
 
     single = report_layout(tmp_path / "one", "English.srt")
     one = str(Path(single).with_name("English.srt"))
-    assert resolve(single, 0, opened=None)[0].path == one  # CLI / older intf
+    # the CLI numbers the one file that isn't a sidecar after them
+    assert resolve(single, 0, opened=None, assume_sidecars_first=True)[0].path == one
+    # an older intf (no counts): VLC's order and files are unknown
+    with pytest.raises(D.JobError, match=r"Can't tell which file subtitle track 1 is \(English"):
+        resolve(single, 0, opened=None)
     # VLC is playing but the OS can't say which files it has open: the only file near
     # the video may not be the one the user added from elsewhere
     with pytest.raises(D.JobError, match=r"Can't tell which file subtitle track 1 is \(English"):
         resolve(single, 0, sub_count=1, opened=None)
     # the CLI: one file beyond the sidecars
     en = str(Path(single).with_name("Movie.en.srt"))
-    assert resolve(single, 1, sidecars=[en], opened=None)[0].path == one
+    assert resolve(single, 1, sidecars=[en], opened=None, assume_sidecars_first=True)[0].path == one
+    with pytest.raises(D.JobError, match="Can't tell which file subtitle track 2 is"):
+        resolve(single, 1, sidecars=[en], opened=None)
     assert resolve(single, 0, sidecars=[en], sub_count=2, opened=None)[0].path == en
     with pytest.raises(D.JobError, match="Can't tell which file subtitle track 2 is"):
         resolve(single, 1, sidecars=[en], sub_count=2, opened=None)
@@ -1104,6 +1110,65 @@ def test_unlink_retry_survives_a_transient_sharing_violation(tmp_path, monkeypat
     assert not target.exists() and len(calls) == 3
 
 
+def test_resolve_without_counts_does_not_guess_vlcs_order(tmp_path):
+    # an older intf sends no counts: a file given when the video opened (Open dialog's
+    # subtitle file) is listed before the sidecar, so "the one other file after the
+    # sidecars" would be wrong; only the CLI numbers them that way
+    media = report_layout(tmp_path, "Movie.srt", "Added.srt")
+    side, added = str(tmp_path / "Movie.srt"), str(tmp_path / "Added.srt")
+    with pytest.raises(D.JobError, match="Can't tell which file subtitle track 2 is"):
+        resolve(media, 1, sidecars=[side], opened=[added, side])
+    assert resolve(media, 0, sidecars=[side], opened=[added, side])[0].path == side  # as before
+    src, _ = resolve(media, 1, sidecars=[side], opened=[added, side], assume_sidecars_first=True)
+    assert src.path == added
+    # with counts the order is known: the startup file first
+    assert (
+        resolve(media, 0, sidecars=[side], opened=[added, side], sub_count=2, sub_added=0)[0].path
+        == added
+    )
+    assert (
+        resolve(media, 1, sidecars=[side], opened=[added, side], sub_count=2, sub_added=0)[0].path
+        == side
+    )
+
+
+def test_resolve_sidecar_vlc_does_not_look_for_is_not_placed_as_one(tmp_path):
+    # find_sidecars also looks in Sub/, VLC (by default) only in Subtitles/ and Subs/:
+    # VLC has Sub/Movie.srt open because the user added it, after the startup file
+    media = report_layout(tmp_path, "Sub/Movie.srt", "English.srt")
+    side, startup = str(tmp_path / "Sub" / "Movie.srt"), str(tmp_path / "English.srt")
+    for k in (0, 1):  # two files VLC loaded on request: which came first is not known
+        with pytest.raises(D.JobError, match=f"Can't tell which file subtitle track {k + 1}"):
+            resolve(media, k, sidecars=[side], opened=[startup, side], sub_count=2, sub_added=1)
+    # the only file VLC has open
+    assert (
+        resolve(media, 0, sidecars=[side], opened=[side], sub_count=1, sub_added=1)[0].path == side
+    )
+    # the fast path doesn't take it for VLC's one track either
+    assert (
+        resolve(media, 0, sidecars=[side], opened=[startup], sub_count=1, sub_added=0)[0].path
+        == startup
+    )
+
+
+def test_in_vlc_sub_folder(tmp_path):
+    from vlcsubsync.subtitles import in_vlc_sub_folder
+
+    media = str(tmp_path / "Movie.mp4")
+    for name, want in (
+        ("Movie.srt", True),
+        ("Subs/Movie.srt", True),
+        ("subtitles/Movie.srt", True),
+        ("Sub/Movie.srt", False),
+        ("Subtitle/Movie.srt", False),
+        ("Subs/deep/Movie.srt", False),
+    ):
+        assert in_vlc_sub_folder(media, str(tmp_path / name)) is want, name
+    # VLC looks for ./Subs and ./subs: on Linux a SUBS/ folder isn't either of them
+    upper = in_vlc_sub_folder(media, str(tmp_path / "SUBS" / "Movie.srt"))
+    assert upper is (sys.platform in ("win32", "darwin"))
+
+
 # ---------------------------------------------------------------- VLC's own sidecar rules
 
 
@@ -1161,9 +1226,7 @@ def test_resolve_vlcs_order_puts_subs_first(tmp_path):
         assert src.path == de
 
 
-def test_resolve_refuses_a_file_vlcs_rules_load_that_subsync_did_not_find(
-    tmp_path, monkeypatch
-):
+def test_resolve_refuses_a_file_vlcs_rules_load_that_subsync_did_not_find(tmp_path, monkeypatch):
     from vlcsubsync import sidecars as S
 
     root = tmp_path / "m"

@@ -115,7 +115,13 @@ def _linux_processes(proc: Path, names: Sequence[str]) -> list[tuple[int, str, l
                 target = os.readlink(pdir / "fd" / fd)
             except OSError:
                 continue
-            if target.startswith("/") and not target.endswith(" (deleted)"):
+            if target.endswith(" (deleted)"):
+                # replaced since VLC opened it (saved again through a rename): the
+                # same subtitle file to VLC, if the path is there again
+                target = target[: -len(" (deleted)")]
+                if not os.path.isfile(target):
+                    continue
+            if target.startswith("/"):
                 paths.append(target)
         out.append((int(entry), name, paths))
     return out

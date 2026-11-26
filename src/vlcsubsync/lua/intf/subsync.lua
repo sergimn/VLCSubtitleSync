@@ -52,8 +52,11 @@ M.START_HOLD_US = 10000000
 M.START_SETTLE_US = 2000000   -- track changes this soon after audio shows up are VLC's
 M.ADD_TIMEOUT_US = 10000000   -- wait at most this long for an added track to appear
 -- The tracks listed once the input has opened (input state PLAYING_S or PAUSE_S) are
--- the ones VLC loaded with it; later ones were added. If the input has already played
--- this long when we first see it open, we may have missed additions: unknown.
+-- the ones VLC loaded with it; later ones were added. We see each new input within a
+-- tick (VLC starts its interfaces before it plays anything), so only one already open
+-- at our first tick may be older: if it has played this long past its start-time, we
+-- may have missed additions (unknown). A playback position alone says nothing: VLC
+-- may start a video at a resume point.
 M.OPENED_MAX_TIME_US = 5000000
 M.PLAYING_S, M.PAUSE_S = 2, 3 -- vlc_input.h input_state_e
 M.MARK_VAR = "subsync-seen"   -- set on each input object we have seen
@@ -565,13 +568,15 @@ function M.autodetect_settings(input)
     }
 end
 
--- Remember the subtitle tracks VLC lists once the input has opened.
-function M.note_opened(input, snap)
+-- Remember the subtitle tracks VLC lists once the input has opened. `first`: this is
+-- our first tick, so the input may have been playing for a while.
+function M.note_opened(input, snap, first)
     if S.opened_spu or S.opened_unknown then return end
     local state = var_get(input, "state")
     if not state or state < M.PLAYING_S or state > M.PAUSE_S then return end
-    local time = var_get(input, "time") or 0
-    if time > M.OPENED_MAX_TIME_US then
+    local time = tonumber(var_get(input, "time")) or 0
+    local start = tonumber(var_get(input, "start-time")) or 0 -- seconds
+    if first and time - start * 1000000 > M.OPENED_MAX_TIME_US then
         S.opened_unknown = true
         log_dbg("input opened a while ago: tracks added later can't be told apart")
         return
@@ -938,6 +943,8 @@ end
 
 function M.tick()
     local t = now_us()
+    local first = not S.ticked
+    S.ticked = true
     M.check_helper()
     local sync_now, sync_mode = M.read_control()
 
@@ -999,7 +1006,7 @@ function M.tick()
         end
     end
 
-    M.note_opened(input, snap)
+    M.note_opened(input, snap, first)
 
     if S.adding and M.check_adding(input, snap) then
         M.write_state()

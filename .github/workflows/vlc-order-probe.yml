@@ -1,0 +1,53 @@
+name: VLC subtitle order
+
+# Plays videos with subtitle files next to them in a real VLC on each OS and checks
+# that SubSync's copy of VLC's subtitle autodetection (src/vlcsubsync/sidecars.py)
+# gives the order VLC loads them in. Run it by hand after a VLC update.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/project-thread-tc0u2o-sidecar-order]
+    paths:
+      - src/vlcsubsync/sidecars.py
+      - scripts/vlc_order_probe.py
+      - .github/workflows/vlc-order-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: VLC order (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+          activate-environment: true
+      - name: Install VLC (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends vlc-bin vlc-plugin-base
+      - name: Install VLC (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask vlc
+          xattr -dr com.apple.quarantine /Applications/VLC.app || true
+      - name: Install VLC (Windows)
+        if: runner.os == 'Windows'
+        run: choco install vlc -y --no-progress
+      - name: Compare with VLC
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            python scripts/vlc_order_probe.py
+          else
+            python scripts/vlc_order_probe.py --locale C --locale en_US.UTF-8
+          fi

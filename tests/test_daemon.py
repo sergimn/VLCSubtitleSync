@@ -1691,21 +1691,32 @@ def test_resolve_a_replay_after_a_synced_hand_added_file(tmp_path):
 
 def test_resolve_a_replay_after_adding_a_subs_file_by_hand(tmp_path):
     # VLC loads Subs/Movie.en.srt, added by hand in play 1, twice in play 2: first as a
-    # file given at startup (URI .../Subs/...), then as a sidecar (.../Subs/./...)
+    # file given at startup (URI .../Subs/...), then as a sidecar (.../Subs/./...).
+    # VLC for Windows only looks in ./subs. VLC for macOS also finds it in ./subs, the
+    # same folder on its file system, as a subs -> Subs symlink does elsewhere
     root = tmp_path / "m"
     media = report_layout(root, "Movie.srt", "Subs/Movie.en.srt")
     side, en = str(root / "Movie.srt"), str(root / "Subs" / "Movie.en.srt")
-    replay = {"sub_count": 3, "sub_added": 0, "sub_earlier": 1, "sub_earlier_min": 0}
-    got = {}
-    for k in (0, 1, 2):
-        try:
-            got[k] = resolve_vlc(media, k, opened=[en, side], open_lists_all=True, **replay)[0].path
-        except D.JobError:
-            got[k] = None
-    truth = {0: en, 1: side, 2: en}  # VLC for Linux; never a wrong file elsewhere
-    assert all(got[k] in (None, truth[k]) for k in got)
-    if sys.platform.startswith("linux"):
-        assert got == {0: None, 1: side, 2: en}
+
+    def tracks(n):
+        replay = {"sub_count": n, "sub_added": 0, "sub_earlier": 1, "sub_earlier_min": 0}
+        got = []
+        for k in range(n):
+            try:
+                src = resolve_vlc(media, k, opened=[en, side], open_lists_all=True, **replay)[0]
+                got.append(src.path)
+            except D.JobError:
+                got.append(None)
+        return got
+
+    if sys.platform != "darwin":  # [Subs/Movie.en.srt, Movie.srt, Subs/Movie.en.srt]
+        got = tracks(3)
+        assert got[:2] == [None, side] and got[2] and os.path.samefile(got[2], en)
+    if sys.platform != "win32":  # [Subs/Movie.en.srt, Movie.srt, Subs/..., subs/...]
+        if not (root / "subs").exists():
+            (root / "subs").symlink_to("Subs", target_is_directory=True)
+        got = tracks(4)
+        assert got[:2] == [None, side] and all(g and os.path.samefile(g, en) for g in got[2:])
 
 
 def test_resolve_a_vobsub_given_at_startup_is_a_track_per_language(tmp_path):

@@ -518,6 +518,50 @@ def test_request_counts_tracks_added_after_the_file_opened(h):
     assert r["sub_index"] == "3" and r["sub_count"] == "4" and r["sub_added"] == "1"
 
 
+def test_request_leaves_closed_captions_out(h):
+    # VLC makes closed-caption tracks from the video as it decodes it: no file to sync,
+    # and counted they would hide where the files VLC loaded are
+    h.control(sync_now=1)  # baseline
+    h.mock.input = None
+    h.set_input()
+    h.mock.input.state = 1
+    h.tick()
+    h.mock.input.state = 2
+    h.mock.add_track(30, "Closed captions 1", False, True)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "0" and r["sub_count"] == "2" and r["sub_added"] == "0"
+    assert r["sub_cc"] == "1"
+    h.finish(r["id"])
+    h.tick(3)  # our synced track shows up
+    # captions VLC finds later in the video don't count as added either
+    h.mock.add_track(31, "Closed captions 2", False, True)
+    h.mock.add_track(32, "Track 3", True)  # Subtitle > Add Subtitle File
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "2" and r["sub_count"] == "3" and r["sub_added"] == "1"
+    assert r["sub_cc"] == "2"
+    h.finish(r["id"])
+    h.tick(3)
+    # closed captions selected: nothing to sync
+    n = len(h.requests())
+    h.select("spu-es", 30)
+    h.settle()
+    assert len(h.requests()) == n
+    h.control(sync_now=2)
+    h.settle()
+    assert len(h.requests()) == n and "SubSync: closed captions can't be synced" in h.osd()
+
+
+def test_request_counts_closed_captions_where_vlc_doesnt_say(h):
+    h.mock.no_info = True  # no track info: counted, and sub_cc not sent
+    h.set_input()
+    h.mock.add_track(30, "Closed captions 1", False, True)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_count"] == "3" and "sub_cc" not in r
+
+
 def autodetect_vars(hh, on=True, fuzzy=3, paths="./Subs, ./subs", sub_file=""):
     """VLC's subtitle autodetection settings and sub-file, as the input object has them."""
     v = hh.mock.input.vars
@@ -1265,6 +1309,20 @@ def test_ext_fallback_loads_on_input_changed(ext):
     out = ext.finish(r["id"])
     ext.lua.eval("input_changed()")
     assert ext.added() == [(out, True)]
+
+
+def test_ext_fallback_leaves_closed_captions_out(ext):
+    write_intf_state(ext, age=600, state="idle")
+    ext.heartbeat()
+    ext.set_input(audio_sel=11, spu_sel=21)
+    ext.mock.add_track(30, "Closed captions 1", False, True)
+    ext.lua.eval("trigger_menu(1)")
+    r = ext.requests()[0]
+    assert r["sub_index"] == "1" and r["sub_count"] == "2" and r["sub_cc"] == "1"
+    ext.select("spu-es", 30)
+    ext.lua.eval("trigger_menu(1)")
+    assert len(ext.requests()) == 1
+    assert "Closed captions can't be synced." in ext.mock.last_dialog.widgets[1].text
 
 
 def test_ext_fallback_requires_subtitle(ext):

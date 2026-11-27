@@ -115,7 +115,9 @@ Subtitle File, drag and drop, VLSub's "Download and load") in the order they wer
 added. Each file is one track, except a VobSub `.idx`: one per `id:` line (language)
 it lists, together (an `.idx` whose `.sub` VLC can't open, as VLC spells the name, is
 read another way: not counted on). (VLC 3 also silently drops a `--sub-file` whose
-URI doesn't sort before every sidecar it found.) VLC 3's Lua API can't tell which file
+URI doesn't sort before every sidecar it found, and drops a file given at startup
+only if its URI is the same as a sidecar's: a `Subs/` file added during an earlier
+play is loaded again as a sidecar, `…/./Subs/…`.) VLC 3's Lua API can't tell which file
 a track came from (no slave URI, the label has at most a language, the `sub-file`
 variable only holds the startup file), so the intf sends `sub_count` (the subtitle
 tracks it lists) and `sub_added` (how many of them showed up after the input reached
@@ -124,7 +126,11 @@ and had played 5 s past its `start-time` (the intf started after the video; VLC 
 its interfaces before it plays anything, so any later input is at most a tick old, and
 a resume point says nothing), or `vlc.var.create` is missing, which the intf uses to
 mark each input object so it notices the same item playing again), both without our
-synced tracks. It also sends VLC's subtitle autodetection settings for the input
+synced tracks and closed captions, and `sub_cc`, the closed-caption tracks it left out
+(VLC names a track's info category `Stream <id>` and gives its codec as `… (c608)` or
+`(c708)`; empty when VLC's info can't be read, and then they are counted): VLC makes
+them from the video as it decodes it, sometimes after the intf saw the input open, and
+there is no file to sync (selecting one syncs nothing). It also sends VLC's subtitle autodetection settings for the input
 (`sub_autodetect`, `sub_fuzzy`, `sub_paths` from `sub-autodetect-file`,
 `sub-autodetect-fuzzy` and `sub-autodetect-path`, which VLC creates on every input),
 VLC's `LC_COLLATE` locale (`sub_collate`, `os.setlocale(nil, "collate")`) and the
@@ -185,12 +191,17 @@ played). Then `daemon.resolve_source`:
    sidecars among the open files are VLC's sidecar group (in VLC's order); the other
    files were given at startup or added since, and every one of those VLC has open
    must be one or the other: VLC's tracks at the start beyond the sidecars are files
-   given at startup (at least `sub_earlier_min`, at most `sub_earlier`, and where the
-   OS lists every file VLC has open, at most the other files and our synced copies it
-   has open) or tracks without a file; every split the counts allow is tried. With
-   VLC's settings known, when no list fits because more sidecars are open than VLC
-   listed at the start, one was saved and added after the video opened: each is tried
-   as the added one. A file VLC has open that its rules would load but
+   given at startup or tracks without a file, and every split the counts allow is
+   tried. Counted in tracks, the files given at startup are at most `sub_earlier`
+   (plus the other languages of an open `.idx` not near the video: the intf counts the
+   `input-slave` option's files) and, where the OS lists every file VLC has open, at
+   most the other files, our synced copies and the sidecars it has open; at least our
+   synced copies (`sub_earlier_min`) plus the other files not added during this play.
+   Tracks without a file are at most the video's attached subtitles
+   (`media.probe(...).attached_srt`) when the intf left closed captions out, else not
+   bounded. With VLC's settings known, each open sidecar is also tried as one saved and
+   added after the video opened (VLSub, drag and drop), and a file is picked only if
+   every list agrees. A file VLC has open that its rules would load but
    the copy didn't find means the copy is wrong for this VLC (another version, a
    playlist item's own options): the job then fails instead of guessing (logged as a
    warning). A file the rules find that VLC hasn't open may have been saved there
@@ -199,11 +210,11 @@ played). Then `daemon.resolve_source`:
    unsure). Without the count of tracks added since the video opened (the extension's
    Sync now, an intf that started after the video) a sidecar added by hand can't be
    told from one VLC found, so a sidecar is picked only if it is the only one VLC has
-   open. If the OS can't tell (no VLC with the video open, `lsof` missing, an error),
+   open and the only file VLC lists. If the OS can't tell (no VLC with the video open, `lsof` missing, an error),
    a request from VLC only gets the sidecar rule (`k` within the sidecars), and with
    VLC's settings known only if VLC listed as many files at the start as there are
-   now and no list lost a sidecar (VLC deleting a `--sub-file` and its copy, which
-   leaves room for a file saved since); the CLI also takes the one subtitle file near
+   now and no list lost a sidecar or the `--sub-file` (VLC deleting a `--sub-file`
+   and maybe its copy, which leaves room for a file saved since); the CLI also takes the one subtitle file near
    the video beyond the sidecars (its own numbering, see README);
 3. picks a file outside the sidecars only where the counts place it for certain
    (`daemon._track_in_list`, `daemon._external_track_file` for `find_sidecars`): it is
@@ -248,6 +259,7 @@ sub_collate=en_US.UTF-8                # optional: VLC's LC_COLLATE locale
 sub_file=                              # optional: VLC's sub-file variable (empty: none)
 sub_earlier=1                          # optional: tracks earlier plays of the playlist item may add at the start
 sub_earlier_min=1                      # optional: how many of those surely (sent with sub_earlier)
+sub_cc=2                               # optional: closed-caption tracks left out of sub_index/sub_count/sub_added
 sub_path=                              # optional explicit external subtitle path
 force=0                                # 1 = ignore result cache
 mode=exhaustive                        # optional: fast|thorough|exhaustive, overrides config

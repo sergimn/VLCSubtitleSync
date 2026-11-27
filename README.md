@@ -274,7 +274,8 @@ them in `config.ini`.
 ## Limitations
 
 - **Text subtitles only.** Image-based subtitles (DVD VobSub, Blu-ray PGS) can't be
-  re-timed. Convert them to SRT first (e.g. with Subtitle Edit).
+  re-timed. Convert them to SRT first (e.g. with Subtitle Edit). Closed captions
+  that VLC reads from the video itself can't be synced either.
 - **Local files only.** Streams, network shares mounted as URLs and DVD/Blu-ray discs
   are not supported.
 - **The first sync of a file takes ~30–90 s on CPU.** The synced track appears when

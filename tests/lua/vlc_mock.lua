@@ -75,9 +75,9 @@ function Mock.new(opts)
         m.adds_pending = {}
     end
     -- tests: a track the user adds (Subtitle > Add Subtitle File...), appended like VLC does
-    function m.add_track(id, label, select)
+    function m.add_track(id, label, select, cc)
         local n = #m.input.spu + 1
-        m.input.spu[n] = { id = id, label = label or ("Track " .. n) }
+        m.input.spu[n] = { id = id, label = label or ("Track " .. n), cc = cc }
         if select then m.input.sel["spu-es"] = id end
     end
     function m.select(var, id)
@@ -124,8 +124,25 @@ function Mock.new(opts)
     vlc.input = {
         item = function()
             if not m.input then return nil end
-            local uri = m.input.uri
-            return { uri = function() return uri end }
+            local input = m.input
+            local uri = input.uri
+            return {
+                uri = function() return uri end,
+                -- one "Stream <id>" category per subtitle track; a track with cc = true
+                -- is closed captions (VLC's codec c608). m.no_info: an older VLC
+                info = function()
+                    if m.no_info then error("no info") end
+                    local t = {}
+                    for _, e in ipairs(input.spu) do
+                        t["Stream " .. e.id] = {
+                            Type = "Subtitle",
+                            Codec = e.cc and "EIA-608 subtitles (c608)"
+                                or "Text subtitles with various tags (subt)",
+                        }
+                    end
+                    return t
+                end,
+            }
         end,
         add_subtitle = function(path, autoselect)
             if not m.input then error("can't add subtitle: no current input") end

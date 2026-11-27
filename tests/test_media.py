@@ -64,6 +64,23 @@ def test_probe(mkv):
     assert info.n_text_subtitles == 2
 
 
+def test_probe_counts_attached_srt_files(tmp_path, synth):
+    # VLC 3 loads an MKV's application/x-srt attachments as subtitle tracks
+    # (and only those: a font attachment is not one).
+    (tmp_path / "extra.srt").write_text(SRT, encoding="utf-8")
+    (tmp_path / "font.ttf").write_bytes(b"\0" * 64)
+    out = tmp_path / "att.mkv"
+    _ffmpeg(
+        synth,
+        "-f", "lavfi", "-i", "sine=f=440:d=2:sample_rate=16000",
+        "-c:a", "aac",
+        "-attach", str(tmp_path / "extra.srt"), "-metadata:s:t:0", "mimetype=application/x-srt",
+        "-attach", str(tmp_path / "font.ttf"), "-metadata:s:t:1", "mimetype=font/ttf",
+        str(out),
+    )  # fmt: skip
+    assert media.probe(str(out)).attached_srt == 1
+
+
 def test_decode_audio_resamples_to_16k_mono(mkv):
     a0 = media.decode_audio(str(mkv), 0)
     a1 = media.decode_audio(str(mkv), 1)

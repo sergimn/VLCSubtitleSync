@@ -225,6 +225,10 @@ class Request:
     # plays that still exist); None: unknown.
     sub_earlier: int | None = None
     sub_earlier_min: int | None = None
+    # How many closed-caption tracks VLC lists (it makes them from the video as it
+    # decodes it); left out of sub_index, sub_count and sub_added. None: not sent, so
+    # they are counted.
+    sub_cc: int | None = None
     audio_label: str = ""
     sub_label: str = ""
     force: bool = False
@@ -266,6 +270,8 @@ class Request:
             out["sub_earlier"] = self.sub_earlier
         if self.sub_earlier_min is not None:
             out["sub_earlier_min"] = self.sub_earlier_min
+        if self.sub_cc is not None:
+            out["sub_cc"] = self.sub_cc
         mode = normalize_mode(self.mode)
         if mode:
             out["mode"] = mode
@@ -306,6 +312,9 @@ class Request:
         earlier_min = _to_int(data.get("sub_earlier_min"), None)
         if earlier is None or earlier < 0 or earlier_min is None or not 0 <= earlier_min <= earlier:
             earlier = earlier_min = None  # both or neither
+        sub_cc = _to_int(data.get("sub_cc"), None)
+        if sub_cc is not None and sub_cc < 0:
+            sub_cc = None
         return cls(
             id=req_id,
             media=media,
@@ -321,6 +330,7 @@ class Request:
             sub_file=data.get("sub_file"),  # "" is a value: no file given at startup
             sub_earlier=earlier,
             sub_earlier_min=earlier_min,
+            sub_cc=sub_cc,
             audio_label=data.get("audio_label") or "",
             sub_label=data.get("sub_label") or "",
             force=_to_bool(data.get("force")),

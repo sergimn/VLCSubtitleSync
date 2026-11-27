@@ -115,8 +115,10 @@ class Harness:
             [self.lua.table_from({"id": i, "label": label}) for i, label in items]
         )
 
-    def set_input(self, uri=MOVIE_URI, audio=AUDIO, subs=SUBS, audio_sel=10, spu_sel=20):
-        self.mock.set_input(uri, self.table(audio), self.table(subs), audio_sel, spu_sel)
+    def set_input(
+        self, uri=MOVIE_URI, audio=AUDIO, subs=SUBS, audio_sel=10, spu_sel=20, item_id=None
+    ):
+        self.mock.set_input(uri, self.table(audio), self.table(subs), audio_sel, spu_sel, item_id)
 
     def select(self, var, es_id):
         self.mock.select(var, es_id)
@@ -516,6 +518,109 @@ def test_request_counts_tracks_added_after_the_file_opened(h):
     assert r["sub_index"] == "3" and r["sub_count"] == "4" and r["sub_added"] == "1"
 
 
+def test_request_leaves_closed_captions_out(h):
+    # VLC makes closed-caption tracks from the video as it decodes it: no file to sync,
+    # and counted they would hide where the files VLC loaded are
+    h.control(sync_now=1)  # baseline
+    h.mock.input = None
+    h.set_input()
+    h.mock.input.state = 1
+    h.tick()
+    h.mock.input.state = 2
+    h.mock.add_track(30, "Closed captions 1", False, True)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "0" and r["sub_count"] == "2" and r["sub_added"] == "0"
+    assert r["sub_cc"] == "1"
+    h.finish(r["id"])
+    h.tick(3)  # our synced track shows up
+    # captions VLC finds later in the video don't count as added either
+    h.mock.add_track(31, "Closed captions 2", False, True)
+    h.mock.add_track(32, "Track 3", True)  # Subtitle > Add Subtitle File
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "2" and r["sub_count"] == "3" and r["sub_added"] == "1"
+    assert r["sub_cc"] == "2"
+    h.finish(r["id"])
+    h.tick(3)
+    # closed captions selected: nothing to sync
+    n = len(h.requests())
+    h.select("spu-es", 30)
+    h.settle()
+    assert len(h.requests()) == n
+    h.control(sync_now=2)
+    h.settle()
+    assert len(h.requests()) == n and "SubSync: closed captions can't be synced" in h.osd()
+
+
+def test_request_counts_closed_captions_where_vlc_doesnt_say(h):
+    h.mock.no_info = True  # no track info: counted, and sub_cc not sent
+    h.set_input()
+    h.mock.add_track(30, "Closed captions 1", False, True)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_count"] == "3" and "sub_cc" not in r
+
+
+def autodetect_vars(hh, on=True, fuzzy=3, paths="./Subs, ./subs", sub_file=""):
+    """VLC's subtitle autodetection settings and sub-file, as the input object has them."""
+    v = hh.mock.input.vars
+    v["sub-autodetect-file"], v["sub-autodetect-fuzzy"], v["sub-autodetect-path"] = (
+        on,
+        fuzzy,
+        paths,
+    )
+    v["sub-file"] = sub_file
+
+
+def this_collate() -> str | None:
+    # Lua's os.setlocale(nil, "collate") reads this process's locale, as VLC's does
+    import locale
+
+    return locale.setlocale(locale.LC_COLLATE) or None
+
+
+def test_request_sends_vlcs_subtitle_autodetection_settings(h):
+    # the helper redoes VLC's subtitle autodetection with them (sidecars.py)
+    h.set_input()
+    autodetect_vars(h)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_autodetect"] == "1" and r["sub_fuzzy"] == "3"
+    assert r["sub_paths"] == "./Subs, ./subs"
+    assert r.get("sub_collate") == this_collate()
+    assert r["sub_file"] == ""  # no --sub-file: sent, so the helper knows
+    h.finish(r["id"])
+    h.tick(3)  # our synced track shows up
+    # read once per video: a change in VLC's preferences counts from the next one
+    autodetect_vars(h, on=False, fuzzy=1, paths="")
+    h.select("spu-es", 21)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "1" and r["sub_autodetect"] == "1"
+    h.finish(r["id"])
+    h.tick(3)
+    h.set_input(uri="file:///media/Other.mkv")
+    autodetect_vars(h, on=False, fuzzy=1, paths="")
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_autodetect"] == "0" and r["sub_fuzzy"] == "1" and r["sub_paths"] == ""
+    h.finish(r["id"])
+    h.tick(3)
+    # the Open dialog's subtitle file (or --sub-file)
+    h.set_input(uri="file:///media/Third.mkv")
+    autodetect_vars(h, sub_file="/media/Third.en.srt")
+    h.settle()
+    assert h.requests()[0]["sub_file"] == "/media/Third.en.srt"
+
+
+def test_request_leaves_out_settings_vlc_does_not_give(h):
+    h.set_input()  # an input without these variables
+    h.settle()
+    r = h.requests()[0]
+    assert not {"sub_autodetect", "sub_fuzzy", "sub_paths", "sub_file"} & r.keys()
+
+
 def test_same_file_playing_again_counts_from_its_new_start(h):
     # VLC starts a new input object; the files added during the first play are now
     # loaded with the video (VLC lists them first)
@@ -532,6 +637,55 @@ def test_same_file_playing_again_counts_from_its_new_start(h):
     assert any("the same file plays again" in ln for ln in h.logs())
 
 
+def test_request_says_what_earlier_plays_of_the_playlist_item_added(h):
+    # VLC keeps the files added during a play with the playlist item and loads them
+    # first when it plays again: the helper must not take them for tracks without a
+    # file (closed captions), which VLC lists after its sidecars
+    h.set_input(item_id=4)
+    h.mock.input.vars["input-slave"] = ""
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_earlier"] == "0" and r["sub_earlier_min"] == "0"  # its first play
+    h.finish(r["id"])
+    h.tick(3)  # our synced track shows up
+    h.mock.add_track(30, "Track 4", True)  # Subtitle > Add Subtitle File
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_added"] == "1" and r["sub_earlier"] == "0"
+    out = h.finish(r["id"])
+    h.tick(3)
+    # it plays again: VLC loads the hand-added file and both synced files first
+    h.set_input(subs=[(40, "Track 1"), (41, "Track 2"), (42, "Track 3"), *SUBS], item_id=4)
+    h.mock.input.vars["input-slave"] = "/media/extra.ass"
+    h.settle()
+    r = h.requests()[-1]
+    # at most: 1 added + 2 synced + 1 input-slave; at least: the synced files that exist
+    assert r["sub_count"] == "5" and r["sub_earlier"] == "4" and r["sub_earlier_min"] == "2"
+    h.finish(r["id"])
+    h.tick(3)
+    os.remove(out)  # a synced file deleted since: VLC can't load it
+    h.set_input(subs=[(50, "Track 1"), *SUBS], item_id=4)
+    h.mock.input.vars["input-slave"] = ""
+    h.settle()
+    r = h.requests()[-1]
+    assert r["sub_earlier"] == "3" and r["sub_earlier_min"] == "2"
+    # another playlist item with the same file has none of them
+    h.finish(r["id"])
+    h.tick(3)
+    h.set_input(subs=[*SUBS, (22, "Track 3")], spu_sel=22, item_id=5)
+    h.mock.input.vars["input-slave"] = ""
+    h.settle()
+    r = h.requests()[-1]
+    assert r["sub_index"] == "2" and r["sub_earlier"] == "0" and r["sub_earlier_min"] == "0"
+
+
+def test_earlier_plays_unknown_without_the_playlist_or_when_seen_late(h):
+    h.set_input()  # no vlc.playlist.current()
+    h.mock.input.vars["input-slave"] = ""
+    h.settle()
+    assert not {"sub_earlier", "sub_earlier_min"} & h.requests()[0].keys()
+
+
 def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_path):
     # the input was already playing a minute when the intf first looked (it started
     # after the video): files may have been added
@@ -540,11 +694,21 @@ def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_pat
     late = Harness(runtime, tmp_path / "late", INTF)
     late.heartbeat()
     late.init()
-    late.set_input()
+    late.set_input(item_id=1)
+    late.mock.input.vars["input-slave"] = ""
     late.mock.input.time = 60_000_000
     late.settle()
     r = late.requests()[0]
     assert r["sub_count"] == "2" and r["sub_added"] == ""
+    # and so may earlier plays: never known again in this VLC
+    assert "sub_earlier" not in r
+    late.finish(r["id"])
+    late.tick(3)
+    late.set_input(uri="file:///media/Other.mkv", item_id=2)
+    late.mock.input.vars["input-slave"] = ""
+    late.settle()
+    r = late.requests()[0]
+    assert r["sub_added"] == "0" and "sub_earlier" not in r
     # a video VLC starts at a resume point: it opens after our first tick, so its
     # position doesn't matter
     resume = Harness(runtime, tmp_path / "resume", INTF)
@@ -561,12 +725,13 @@ def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_pat
     start = Harness(runtime, tmp_path / "start", INTF)
     start.heartbeat()
     start.init()
-    start.set_input()
+    start.set_input(item_id=1)
+    start.mock.input.vars["input-slave"] = ""
     start.mock.input.time = 61_000_000
     start.mock.input.vars["start-time"] = 60.0
     start.settle()
     r = start.requests()[0]
-    assert r["sub_count"] == "2" and r["sub_added"] == "0"
+    assert r["sub_count"] == "2" and r["sub_added"] == "0" and r["sub_earlier"] == "0"
     # no vlc.var.create: a replay of the same item can't be told apart
     old = Harness(runtime, tmp_path / "old", INTF)
     old.heartbeat()
@@ -1076,6 +1241,19 @@ def test_ext_fallback_sync_and_load(ext):
     assert ext.spu_ids()[-1] in [k for k in ext.E.state.ours.keys()]
 
 
+def test_ext_fallback_sync_sends_vlcs_subtitle_autodetection_settings(ext):
+    write_intf_state(ext, age=600, state="idle")
+    ext.heartbeat()
+    ext.set_input(audio_sel=11, spu_sel=21)
+    autodetect_vars(ext, fuzzy=-1, paths=".\\subs", sub_file="C:\\Videos\\Movie.en.srt")
+    ext.lua.eval("trigger_menu(1)")
+    r = ext.requests()[0]
+    assert r["sub_autodetect"] == "1" and r["sub_fuzzy"] == "-1"
+    assert r["sub_paths"] == ".\\subs"
+    assert r.get("sub_collate") == this_collate()
+    assert r["sub_file"] == "C:\\Videos\\Movie.en.srt"
+
+
 def test_ext_sync_now_exhaustive_signals_running_intf(ext):
     ext.show_all()
     write_intf_state(ext)
@@ -1131,6 +1309,20 @@ def test_ext_fallback_loads_on_input_changed(ext):
     out = ext.finish(r["id"])
     ext.lua.eval("input_changed()")
     assert ext.added() == [(out, True)]
+
+
+def test_ext_fallback_leaves_closed_captions_out(ext):
+    write_intf_state(ext, age=600, state="idle")
+    ext.heartbeat()
+    ext.set_input(audio_sel=11, spu_sel=21)
+    ext.mock.add_track(30, "Closed captions 1", False, True)
+    ext.lua.eval("trigger_menu(1)")
+    r = ext.requests()[0]
+    assert r["sub_index"] == "1" and r["sub_count"] == "2" and r["sub_cc"] == "1"
+    ext.select("spu-es", 30)
+    ext.lua.eval("trigger_menu(1)")
+    assert len(ext.requests()) == 1
+    assert "Closed captions can't be synced." in ext.mock.last_dialog.widgets[1].text
 
 
 def test_ext_fallback_requires_subtitle(ext):

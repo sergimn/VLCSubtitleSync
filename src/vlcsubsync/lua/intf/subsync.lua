@@ -483,6 +483,35 @@ local function var_get(input, var)
     return nil
 end
 
+-- The closed-caption tracks among `ids` (a set of ES ids), or nil if VLC doesn't
+-- say. VLC makes them from the video as it decodes it (EIA-608/CEA-708): no file, so
+-- they can't be synced, and they are left out of the ordinals and counts sent to the
+-- helper. VLC names each track's info category "Stream <id>" (translated) and gives
+-- its codec as "<description> (c608)" or "(c708)".
+function M.closed_captions(ids)
+    local ok, info = pcall(function()
+        local item = vlc.input.item()
+        return item and item:info()
+    end)
+    if not ok or type(info) ~= "table" then return nil end
+    local cc = {}
+    for cat, fields in pairs(info) do
+        local id = tonumber(tostring(cat):match("(%d+)%s*$"))
+        if id and type(fields) == "table" then
+            for _, v in pairs(fields) do
+                if type(v) == "string" and (v:find("(c608)", 1, true) or v:find("(c708)", 1, true)) then
+                    cc[id] = true
+                end
+            end
+        end
+    end
+    local set = {}
+    for _, v in ipairs(ids) do
+        if cc[v] then set[v] = true end
+    end
+    return set
+end
+
 -- Snapshot of the current track situation of `input`.
 function M.snapshot(input)
     local snap = {}
@@ -492,7 +521,22 @@ function M.snapshot(input)
     snap.spu = var_get(input, "spu-es") or -1
     snap.spu_set = {}
     for _, id in ipairs(snap.spu_ids) do snap.spu_set[id] = true end
+    snap.cc = M.closed_captions(snap.spu_ids)
     return snap
+end
+
+-- Whether subtitle track `id` is left out of the ordinals and counts: one of our
+-- synced tracks, or closed captions.
+local function skipped(snap, id)
+    return S.ours[id] ~= nil or (snap.cc ~= nil and snap.cc[id] == true)
+end
+
+-- The ids `skipped` leaves out, as a set (for M.ordinal).
+local function skip_set(snap)
+    local set = {}
+    for id in pairs(S.ours) do set[id] = true end
+    for id in pairs(snap.cc or {}) do set[id] = true end
+    return set
 end
 
 -- Ordinal (0-based) of `id` in `ids`, skipping -1 and ids in `skip`.
@@ -507,15 +551,24 @@ function M.ordinal(ids, labels, id, skip)
     return nil
 end
 
--- Number of subtitle tracks VLC lists, "Disable" and our synced tracks excluded.
--- Sent as sub_count: VLC's Lua API can't say which file an external track came
--- from, so the helper checks this against the files it finds (DESIGN.md "External
--- subs").
+-- Number of subtitle tracks VLC lists, "Disable", our synced tracks and closed
+-- captions excluded. Sent as sub_count: VLC's Lua API can't say which file an
+-- external track came from, so the helper checks this against the files it finds
+-- (DESIGN.md "External subs").
 function M.sub_count(snap)
     local n = 0
     for _, v in ipairs(snap.spu_ids) do
-        if v ~= -1 and not S.ours[v] then n = n + 1 end
+        if v ~= -1 and not skipped(snap, v) then n = n + 1 end
     end
+    return n
+end
+
+-- Number of closed-caption tracks VLC lists (left out of the other counts), or nil
+-- if VLC doesn't say. Sent as sub_cc.
+function M.sub_cc(snap)
+    if not snap.cc then return nil end
+    local n = 0
+    for _ in pairs(snap.cc) do n = n + 1 end
     return n
 end
 
@@ -526,7 +579,7 @@ function M.sub_added(snap)
     if not S.opened_spu then return nil end
     local n = 0
     for _, v in ipairs(snap.spu_ids) do
-        if v ~= -1 and not S.ours[v] and not S.opened_spu[v] then n = n + 1 end
+        if v ~= -1 and not skipped(snap, v) and not S.opened_spu[v] then n = n + 1 end
     end
     return n
 end
@@ -548,6 +601,78 @@ function M.new_input_object(input)
     return true
 end
 
+-- VLC's subtitle autodetection settings for `input`, its LC_COLLATE locale and its
+-- sub-file variable (the --sub-file or the Open dialog's subtitle file, "" for none):
+-- with them the helper works out which subtitle files VLC loaded as the video opened
+-- and in which order (sent as sub_autodetect, sub_fuzzy, sub_paths, sub_collate,
+-- sub_file; a nil is not sent).
+function M.autodetect_settings(input)
+    local function get(name)
+        local ok, v = pcall(vlc.var.get, input, name)
+        if ok then return v end
+        return nil
+    end
+    local on = get("sub-autodetect-file")
+    local paths = get("sub-autodetect-path")
+    local sub_file = get("sub-file")
+    local okc, collate = pcall(os.setlocale, nil, "collate")
+    local slave = get("input-slave")
+    local slaves = nil
+    if type(slave) == "string" then
+        slaves = 0
+        for _ in slave:gmatch("[^#]+") do slaves = slaves + 1 end
+    end
+    return {
+        autodetect = (on == true and 1) or (on == false and 0) or nil,
+        fuzzy = tonumber(get("sub-autodetect-fuzzy")),
+        paths = type(paths) == "string" and paths or nil,
+        collate = okc and type(collate) == "string" and collate ~= "" and collate or nil,
+        sub_file = type(sub_file) == "string" and sub_file or nil,
+        slaves = slaves, -- the input-slave option's files (not sent: see M.earlier)
+    }
+end
+
+-- The playlist item playing (VLC keeps the files added during a play with the item
+-- and loads them again, first, when it plays again), or nil if unknown.
+function M.current_item()
+    local pl = vlc.playlist
+    if type(pl) ~= "table" or type(pl.current) ~= "function" then return nil end
+    local ok, id = pcall(pl.current)
+    if ok and type(id) == "number" and id >= 0 then return id end
+    return nil
+end
+
+-- Remember what this play of the playlist item added (called as it ends).
+function M.end_play()
+    local id = S.item_id
+    if id == nil then return end
+    local p = S.plays[id] or { added = 0, ours = {} }
+    S.plays[id] = p
+    if S.opened_unknown then
+        p.unknown = true
+        return
+    end
+    p.added = p.added + (S.play_added or 0)
+    for output in pairs(S.play_ours) do p.ours[output] = true end
+end
+
+-- How many subtitle tracks VLC may load as this play opened besides its sidecars and
+-- the sub-file (at most, at least): the files added during the item's earlier plays
+-- and those of the input-slave option. Our synced files of earlier plays that still
+-- exist surely are among them. nil, nil if unknown. Sent as sub_earlier and
+-- sub_earlier_min.
+function M.earlier()
+    local slaves = S.autodetect and S.autodetect.slaves
+    if S.late or S.item_id == nil or slaves == nil then return nil, nil end
+    local p = S.plays[S.item_id] or { added = 0, ours = {} }
+    if p.unknown then return nil, nil end
+    local ours = 0
+    for output in pairs(p.ours) do
+        if file_exists(output) then ours = ours + 1 end
+    end
+    return p.added + ours + slaves, ours
+end
+
 -- Remember the subtitle tracks VLC lists once the input has opened. `first`: this is
 -- our first tick, so the input may have been playing for a while.
 function M.note_opened(input, snap, first)
@@ -558,6 +683,7 @@ function M.note_opened(input, snap, first)
     local start = tonumber(var_get(input, "start-time")) or 0 -- seconds
     if first and time - start * 1000000 > M.OPENED_MAX_TIME_US then
         S.opened_unknown = true
+        S.late = true -- we started after VLC played: earlier plays are unknown
         log_dbg("input opened a while ago: tracks added later can't be told apart")
         return
     end
@@ -568,7 +694,12 @@ end
 -- Resolve the current selection into {audio=ordinal, sub=ordinal, ...} or nil.
 function M.selection(snap)
     local sel = { audio_id = snap.audio, spu_id = snap.spu, sub_count = M.sub_count(snap),
-                  sub_added = M.sub_added(snap) }
+                  sub_added = M.sub_added(snap), sub_cc = M.sub_cc(snap) }
+    if sel.sub_added and sel.sub_added > (S.play_added or 0) then
+        S.play_added = sel.sub_added
+    elseif sel.sub_added and not S.play_added then
+        S.play_added = 0
+    end
     if snap.audio ~= -1 then
         sel.audio, sel.audio_label = M.ordinal(snap.audio_ids, snap.audio_labels, snap.audio)
     end
@@ -579,7 +710,10 @@ function M.selection(snap)
             sel.sub, sel.sub_label = ours.sub, ours.sub_label
             sel.source_audio = ours.audio
         else
-            sel.sub, sel.sub_label = M.ordinal(snap.spu_ids, snap.spu_labels, snap.spu, S.ours)
+            -- closed captions get no ordinal: they can't be synced
+            sel.is_cc = snap.cc ~= nil and snap.cc[snap.spu] == true
+            sel.sub, sel.sub_label = M.ordinal(snap.spu_ids, snap.spu_labels, snap.spu,
+                skip_set(snap))
         end
     end
     if sel.audio and sel.sub then
@@ -592,7 +726,7 @@ end
 function M.spu_id_for_ordinal(snap, sub)
     local n = 0
     for _, v in ipairs(snap.spu_ids) do
-        if v ~= -1 and not S.ours[v] then
+        if v ~= -1 and not skipped(snap, v) then
             if n == sub then return v end
             n = n + 1
         end
@@ -620,6 +754,8 @@ function M.reset_input()
     S.non_file_logged = nil
     S.hold_until, S.settle_until, S.cache_missed = nil, nil, {}
     S.opened_spu, S.opened_unknown = nil, nil
+    S.autodetect = nil
+    S.item_id, S.play_added, S.play_ours = nil, nil, {}
 end
 
 local function memo_for(uri)
@@ -670,6 +806,14 @@ function M.submit(sel, force, mode, probe)
         { "sub_path", "" },
         { "force", force and 1 or 0 },
     }
+    local ad = S.autodetect or {}
+    local most, least = M.earlier()
+    for _, f in ipairs({ { "sub_autodetect", ad.autodetect }, { "sub_fuzzy", ad.fuzzy },
+                         { "sub_paths", ad.paths }, { "sub_collate", ad.collate },
+                         { "sub_file", ad.sub_file }, { "sub_earlier", most },
+                         { "sub_earlier_min", least }, { "sub_cc", sel.sub_cc } }) do
+        if f[2] ~= nil then kv[#kv + 1] = f end
+    end
     if mode ~= "" then kv[#kv + 1] = { "mode", mode } end
     if probe then kv[#kv + 1] = { "cache_only", 1 } end
     local ok, err = M.write_kv(path, kv)
@@ -752,7 +896,7 @@ function M.check_adding(input, snap)
     local a = S.adding
     local new_ids = {}
     for _, id in ipairs(snap.spu_ids) do
-        if id ~= -1 and not a.before[id] and not S.ours[id] then
+        if id ~= -1 and not a.before[id] and not skipped(snap, id) then
             new_ids[#new_ids + 1] = id
         end
     end
@@ -769,6 +913,7 @@ function M.check_adding(input, snap)
     for _, id in ipairs(new_ids) do
         S.ours[id] = { audio = e.audio, sub = e.sub, sub_label = e.sub_label, output = e.output }
     end
+    if e.output then S.play_ours[e.output] = true end
     local es = new_ids[1]
     e.es = es
     S.adding = nil
@@ -934,7 +1079,10 @@ function M.tick()
     end
     local input = get_input()
     if not input then
-        if S.input_uri then M.reset_input() end
+        if S.input_uri then
+            M.end_play()
+            M.reset_input()
+        end
         M.set_state(S.auto and "idle" or "disabled", "no input", nil)
         M.write_state()
         return
@@ -945,7 +1093,9 @@ function M.tick()
     local fresh = M.new_input_object(input)
     if uri ~= S.input_uri or fresh then
         if uri == S.input_uri then log_dbg("the same file plays again") end
+        M.end_play()
         M.reset_input()
+        S.item_id = M.current_item()
         S.input_uri = uri
         S.media_path = M.uri_to_path(uri)
         if S.media_path then log_dbg("new input: " .. S.media_path) end
@@ -961,7 +1111,11 @@ function M.tick()
         return
     end
 
-    if fresh == nil then S.opened_unknown = true end
+    if fresh == nil then
+        S.opened_unknown = true
+        S.late = true -- replays can't be told apart
+    end
+    if not S.autodetect then S.autodetect = M.autodetect_settings(input) end
 
     local snap = M.snapshot(input)
 
@@ -1032,6 +1186,8 @@ function M.tick()
             -- re-syncing an already synced track: bypass the daemon's cache
             S.pending = { due = t, key = sel.key, force = sel.is_ours and true or false,
                           explicit = true, mode = sync_mode }
+        elseif sel.is_cc then
+            M.osd("SubSync: closed captions can't be synced")
         else
             M.osd("SubSync: select a subtitle track first")
         end
@@ -1047,7 +1203,7 @@ function M.tick()
                 fsel = {
                     audio = sel.audio, audio_label = sel.audio_label,
                     sub = sel.sub, sub_label = sel.sub_label, key = sel.key,
-                    sub_count = sel.sub_count, sub_added = sel.sub_added,
+                    sub_count = sel.sub_count, sub_added = sel.sub_added, sub_cc = sel.sub_cc,
                 }
             end
             if p.explicit then
@@ -1073,7 +1229,7 @@ end
 function M.reset()
     S = {
         counter = 0, auto = true, ours = {}, memo = {}, spawn_count = 0, cache_missed = {},
-        state = "idle", message = "", last_result = "",
+        state = "idle", message = "", last_result = "", plays = {}, play_ours = {},
     }
     S.q = M.queue_dir()
     M.state = S

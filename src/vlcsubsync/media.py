@@ -83,6 +83,9 @@ class MediaInfo:
     duration: float  # seconds (0.0 if unknown)
     audio: list[StreamInfo] = field(default_factory=list)
     subtitles: list[StreamInfo] = field(default_factory=list)
+    # attached files of type application/x-srt (an MKV's): VLC loads each as an
+    # external subtitle track, after the sidecars (src/input/input.c LoadSlaves)
+    attached_srt: int = 0
 
     @property
     def n_text_subtitles(self) -> int:
@@ -150,6 +153,9 @@ def _info_from_container(container, path: str) -> MediaInfo:
             )
             if not duration and s.duration and s.time_base:
                 duration = float(s.duration * s.time_base)
+        elif s.type == "attachment":
+            if (getattr(s, "mimetype", None) or md.get("mimetype")) == "application/x-srt":
+                info.attached_srt += 1
         elif s.type == "subtitle":
             codec = _codec_name(s)
             info.subtitles.append(

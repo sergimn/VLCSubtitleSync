@@ -274,6 +274,32 @@ local function es_list(input, var)
     return ids, (type(labels) == "table") and labels or {}
 end
 
+-- The closed-caption tracks among `ids`, as a set, or nil if VLC doesn't say (see
+-- the intf's M.closed_captions): left out of the ordinals and counts.
+function E.closed_captions(ids)
+    local ok, info = pcall(function()
+        local item = vlc.input.item()
+        return item and item:info()
+    end)
+    if not ok or type(info) ~= "table" then return nil end
+    local cc = {}
+    for cat, fields in pairs(info) do
+        local id = tonumber(tostring(cat):match("(%d+)%s*$"))
+        if id and type(fields) == "table" then
+            for _, v in pairs(fields) do
+                if type(v) == "string" and (v:find("(c608)", 1, true) or v:find("(c708)", 1, true)) then
+                    cc[id] = true
+                end
+            end
+        end
+    end
+    local set = {}
+    for _, v in ipairs(ids) do
+        if cc[v] then set[v] = true end
+    end
+    return set
+end
+
 -- Current selection of the playing input, or nil + reason.
 function E.current_selection()
     local input = vlc.object.input()
@@ -291,17 +317,50 @@ function E.current_selection()
     local spu = tonumber(vlc.var.get(input, "spu-es")) or -1
     if spu == -1 then return nil, "Select a subtitle track first." end
     if ST.ours[spu] then return nil, "The synced track is already selected." end
+    local cc = E.closed_captions(sids)
+    if cc and cc[spu] then return nil, "Closed captions can't be synced." end
+    local skip = {}
+    for id in pairs(ST.ours) do skip[id] = true end
+    local n_cc = nil
+    if cc then
+        n_cc = 0
+        for id in pairs(cc) do skip[id] = true; n_cc = n_cc + 1 end
+    end
     local a, alabel = ordinal(aids, alabels, audio)
-    local s, slabel = ordinal(sids, slabels, spu, ST.ours)
+    local s, slabel = ordinal(sids, slabels, spu, skip)
     if not a then return nil, "No audio track selected." end
     if not s then return nil, "Subtitle track not found." end
-    -- subtitle tracks VLC lists, our synced ones excluded (see the intf's M.sub_count)
+    -- subtitle tracks VLC lists, our synced ones and closed captions excluded (see
+    -- the intf's M.sub_count)
     local count = 0
     for _, v in ipairs(sids) do
-        if v ~= -1 and not ST.ours[v] then count = count + 1 end
+        if v ~= -1 and not skip[v] then count = count + 1 end
     end
     return { media = media, uri = uri, audio = a, audio_label = alabel,
-             sub = s, sub_label = slabel, sub_count = count, spu_ids = sids }
+             sub = s, sub_label = slabel, sub_count = count, sub_cc = n_cc, spu_ids = sids,
+             autodetect = E.autodetect_settings(input) }
+end
+
+-- VLC's subtitle autodetection settings, locale and sub-file variable (see the
+-- intf's M.autodetect_settings), as request key/value pairs; unknown ones are left out.
+function E.autodetect_settings(input)
+    local function get(name)
+        local ok, v = pcall(vlc.var.get, input, name)
+        if ok then return v end
+        return nil
+    end
+    local on = get("sub-autodetect-file")
+    local paths = get("sub-autodetect-path")
+    local okc, collate = pcall(os.setlocale, nil, "collate")
+    local kv = {}
+    local function add(k, v) if v ~= nil then kv[#kv + 1] = { k, v } end end
+    add("sub_autodetect", (on == true and 1) or (on == false and 0) or nil)
+    add("sub_fuzzy", tonumber(get("sub-autodetect-fuzzy")))
+    add("sub_paths", type(paths) == "string" and paths or nil)
+    add("sub_collate", okc and type(collate) == "string" and collate ~= "" and collate or nil)
+    local sub_file = get("sub-file")
+    add("sub_file", type(sub_file) == "string" and sub_file or nil)
+    return kv
 end
 
 function E.fallback_sync(mode)
@@ -322,6 +381,8 @@ function E.fallback_sync(mode)
         { "sub_path", "" },
         { "force", 0 },
     }
+    for _, pair in ipairs(sel.autodetect or {}) do kv[#kv + 1] = pair end
+    if sel.sub_cc then kv[#kv + 1] = { "sub_cc", sel.sub_cc } end
     if mode and mode ~= "" then kv[#kv + 1] = { "mode", mode } end
     local ok, err = E.write_kv(join(join(q, "requests"), id .. ".req"), kv)
     if not ok then return false, "Cannot write request: " .. err end

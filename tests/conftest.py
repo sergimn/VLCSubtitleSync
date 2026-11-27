@@ -280,3 +280,47 @@ def synth() -> type[_SynthKit]:
 def _keep_test_process_priority(monkeypatch):
     """``serve()`` lowers its own priority; in tests it would hit pytest's process."""
     monkeypatch.setenv("VLC_SUBSYNC_PRIORITY", "normal")
+
+
+# --------------------------------------------------------------------------------------
+# the order a folder lists its files in
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def listed_in(monkeypatch) -> Callable[[list[str]], None]:
+    """``listed_in(names)``: make SubSync read folders in this order of names (then the
+    rest).
+
+    VLC and SubSync read a folder in the order the file system gives (readdir). ext4
+    hashes names with a seed of each file system, so that order differs between Linux
+    machines; NTFS keeps names sorted and APFS hashes them the same way everywhere. It
+    only shows where a dropped file (a .sub next to its .idx) sits among equal ones:
+    VLC's sort takes it as equal to every other file, so the sort depends on where
+    each file started."""
+    import os
+
+    from vlcsubsync import sidecars
+
+    real = os.scandir
+
+    class Listing:
+        def __init__(self, entries):
+            self.entries = entries
+
+        def __enter__(self):
+            return iter(self.entries)
+
+        def __exit__(self, *exc):
+            return False
+
+    def set_order(order: list[str]) -> None:
+        def scandir(folder):
+            with real(folder) as it:
+                entries = list(it)
+            rank = {n: i for i, n in enumerate(order)}
+            return Listing(sorted(entries, key=lambda e: rank.get(e.name, len(rank))))
+
+        monkeypatch.setattr(sidecars.os, "scandir", scandir)
+
+    return set_order

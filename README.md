@@ -176,10 +176,11 @@ vlc-subsync uninstall [--purge]
 ```
 
 Track numbers start at 0 and follow VLC's order: audio tracks as listed in **Audio →
-Audio Track**; subtitle tracks are the embedded ones first, then subtitle files next
-to the video (same name, e.g. `movie.srt`, `movie.en.srt`, also in `Subs/` or
-`Subtitles/` folders). A number past those picks a differently named subtitle file
-next to the video or in `Subs/` only if there is just one; use `--sub-file` otherwise.
+Audio Track**; subtitle tracks are the embedded ones first, then the subtitle files
+VLC loads by itself, in VLC's order (names that are the video's or start with it, e.g.
+`movie.srt`, `movie.en.srt`, next to the video or in its `Subs/` or `Subtitles/`
+folder). A number past those picks a differently named subtitle file next to the video
+or in `Subs/` only if there is just one; use `--sub-file` otherwise.
 
 ## Configuration
 
@@ -281,7 +282,8 @@ them in `config.ini`.
 ## Limitations
 
 - **Text subtitles only.** Image-based subtitles (DVD VobSub, Blu-ray PGS) can't be
-  re-timed. Convert them to SRT first (e.g. with Subtitle Edit).
+  re-timed. Convert them to SRT first (e.g. with Subtitle Edit). Closed captions
+  that VLC reads from the video itself can't be synced either.
 - **Local files only.** Streams, network shares mounted as URLs and DVD/Blu-ray discs
   are not supported.
 - **The first sync of a file takes ~30–90 s on CPU.** The synced track appears when
@@ -325,10 +327,15 @@ CUDA. The helper not running is normal while VLC is closed. Things to try:
   track 1 is"**: VLC doesn't tell SubSync which file a subtitle track came from.
   SubSync finds a file you added by hand among the files VLC has open, but not
   always: it can't tell two hand-added files apart, on Windows it only checks files
-  next to the video or in its `Subs/` folder, and it can't check at all if the OS
-  doesn't say which files VLC has open. Give the file the video's name (`Movie.srt`
+  next to the video or in its `Subs/` folder, it can't check at all if the OS
+  doesn't say which files VLC has open, and it stops if VLC loaded a file by itself
+  that SubSync's copy of VLC's rules doesn't expect, if a subtitle file was saved
+  next to the video while it played and that could change VLC's order, or (with
+  **View → SubSync → Sync subtitles now** while the interface isn't running) if several
+  subtitle files are loaded. Give the file the video's name (`Movie.srt`
   or `Movie.en.srt` for `Movie.mkv`), keep it next to the video or in `Subs/`, and
-  reopen the video: VLC then loads it by itself.
+  reopen the video: VLC then loads it by itself. Right after updating SubSync,
+  restart VLC first.
 - **Snap VLC (Ubuntu)**: snap VLC cannot start programs, so it relies on systemd
   starting the helper (`vlc-subsync.path`). This works across snap updates: the
   watch follows `~/snap/vlc/current` to the new revision. If you install the snap

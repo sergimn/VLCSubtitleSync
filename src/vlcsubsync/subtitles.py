@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pysubs2
 
-SIDECAR_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".sub")
 SIDECAR_SUBDIRS = ("subs", "subtitles", "sub", "subtitle")
 
 # Formats we write back as-is; everything else becomes SRT.
@@ -132,41 +131,11 @@ def save_subtitles(
 
 
 def find_sidecars(media_path: str | os.PathLike[str]) -> list[str]:
-    """External subtitle files VLC would auto-load for ``media_path``.
+    """External subtitle files VLC 3 loads by itself for ``media_path``, in the order
+    it lists them, with VLC's default settings (see :mod:`vlcsubsync.sidecars`)."""
+    from .sidecars import vlc_sidecars
 
-    Same stem or ``stem.*.ext`` in the media dir and its ``Subs/``/``Subtitles/``
-    subdirs (case-insensitive). Sorted like VLC: exact-stem match first, then
-    alphabetical.
-    """
-    media = Path(media_path)
-    folder = media.parent
-    stem = media.stem.casefold()
-    dirs: list[tuple[Path, int]] = [(folder, 0)]
-    try:
-        for child in folder.iterdir():
-            if child.is_dir() and child.name.casefold() in SIDECAR_SUBDIRS:
-                dirs.append((child, 1))
-    except OSError:
-        return []
-    found: list[tuple[int, int, str, str]] = []
-    for d, depth in dirs:
-        try:
-            entries = list(d.iterdir())
-        except OSError:
-            continue
-        for f in entries:
-            if f.suffix.lower() not in SIDECAR_EXTS or not f.is_file():
-                continue
-            fstem = f.stem.casefold()
-            if fstem == stem:
-                exact = 0
-            elif fstem.startswith(stem + "."):
-                exact = 1
-            else:
-                continue
-            found.append((exact, depth, f.name.casefold(), str(f)))
-    found.sort()
-    return [x[3] for x in found]
+    return vlc_sidecars(media_path)
 
 
 MAX_NEARBY = 200
@@ -215,11 +184,6 @@ def subtitle_files_near(media_path: str | os.PathLike[str]) -> list[str]:
     return out[:MAX_NEARBY]
 
 
-# Where VLC 3 looks for subtitle files by itself (src/input/subtitles.c): the video's
-# folder and, by default (sub-autodetect-path), these subfolders.
-VLC_SUB_DIRS = ("subtitles", "subs")
-
-
 def in_vlc_sub_folder(media_path: str | os.PathLike[str], path: str) -> bool:
     """Whether ``path`` is somewhere VLC 3's default settings look for subtitle files:
     the video's folder, or its ``./Subtitles``, ``./subtitles``, ``./Subs`` or ``./subs``
@@ -236,35 +200,8 @@ def in_vlc_sub_folder(media_path: str | os.PathLike[str], path: str) -> bool:
     if same_file_key(str(folder.parent)) != home:
         return False
     if sys.platform in ("win32", "darwin"):
-        return folder.name.casefold() in VLC_SUB_DIRS
+        return folder.name.casefold() in ("subtitles", "subs")
     return folder.name in ("Subtitles", "subtitles", "Subs", "subs")
-
-
-def vlc_trim(name: str) -> str:
-    """``name`` the way VLC 3 compares subtitle and video names (``strcpy_trim``):
-    its ASCII letters and digits, lowercased, as words separated by single spaces."""
-    return " ".join(w.lower() for w in re.findall(r"[A-Za-z0-9]+", name))
-
-
-def may_be_vlc_autoloaded(media_path: str | os.PathLike[str], path: str) -> bool:
-    """Whether VLC 3 may have loaded subtitle file ``path`` by itself for the video.
-
-    True when the file is in the video's folder or a ``Subs/``-style subfolder of it
-    and its name contains the video's (as :func:`vlc_trim` gives them). VLC's default
-    settings load the names that are the video's or start with it ("Movie - English",
-    "Movie_en"), lower ``sub-autodetect-fuzzy`` settings load more. Such a file sits
-    among VLC's sidecars, wherever :func:`find_sidecars` would put it.
-    """
-    from .openfiles import same_file_key
-
-    media, sub = Path(media_path), Path(path)
-    home = same_file_key(str(media.parent))
-    folder = sub.parent
-    if same_file_key(str(folder)) != home and not (
-        folder.name.casefold() in VLC_SUB_DIRS and same_file_key(str(folder.parent)) == home
-    ):
-        return False
-    return vlc_trim(media.stem) in vlc_trim(sub.stem)
 
 
 # --------------------------------------------------------------------------------------

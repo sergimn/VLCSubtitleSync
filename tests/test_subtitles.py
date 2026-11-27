@@ -11,10 +11,13 @@ from vlcsubsync.subtitles import (
     find_sidecars,
     guess_language,
     load_subtitles,
+    may_be_vlc_autoloaded,
     output_format,
     plain_text,
     save_subtitles,
+    subtitle_files_near,
     tokenize,
+    vlc_trim,
 )
 
 SRT = (
@@ -192,3 +195,73 @@ def test_find_sidecars_ordering(tmp_path):
 
 def test_find_sidecars_missing_dir(tmp_path):
     assert find_sidecars(str(tmp_path / "nope" / "x.mkv")) == []
+
+
+@pytest.mark.parametrize(
+    "layout, sidecars",
+    [
+        # the bug report's table: find_sidecars doesn't know these names
+        (["Subs/2_English.srt", "Subs/3_English.srt", "Subs/8_Spanish.srt"], []),
+        (["English.srt"], []),
+        (["Subs/Movie.srt"], ["Subs/Movie.srt"]),
+        (["Movie.en.srt"], ["Movie.en.srt"]),
+    ],
+)
+def test_report_layouts(tmp_path, layout, sidecars):
+    media = tmp_path / "Movie.mp4"
+    media.write_bytes(b"")
+    for name in layout:
+        _touch(tmp_path / name)
+    assert find_sidecars(str(media)) == [str(tmp_path / n) for n in sidecars]
+    # every one of them is a subtitle file near the video
+    assert subtitle_files_near(str(media)) == sorted(
+        (str(tmp_path / n) for n in layout), key=lambda p: (p.casefold(), p)
+    )
+
+
+def test_subtitle_files_near(tmp_path):
+    media = tmp_path / "Show.S01E02.mkv"
+    media.write_bytes(b"")
+    want = [
+        _touch(tmp_path / "English.srt"),
+        _touch(tmp_path / "Show.S01E02.ass"),
+        _touch(tmp_path / "subtitles" / "fr.vtt"),
+        _touch(tmp_path / "Subs" / "Show.S01E02" / "2_English.srt"),  # TV release packs
+        _touch(tmp_path / "Subs" / "Show.S01E02" / "3_English.idx"),  # any VLC extension
+    ]
+    _touch(tmp_path / "Subs" / "Show.S01E03" / "2_English.srt")  # another episode
+    _touch(tmp_path / "Extras" / "commentary.srt")  # not a subtitle folder
+    _touch(tmp_path / "._English.srt")  # macOS metadata file
+    _touch(tmp_path / "notes.txt")
+    (tmp_path / "Subs" / "dir.srt").mkdir()
+    got = subtitle_files_near(str(media))
+    assert sorted(got) == sorted(str(p) for p in want)
+    assert got == sorted(got, key=lambda p: (p.casefold(), p))
+    assert subtitle_files_near(str(tmp_path / "nope" / "x.mkv")) == []
+
+
+def test_vlc_trim_is_vlcs_strcpy_trim():
+    assert vlc_trim("The.Matrix (1999)") == "the matrix 1999"
+    assert vlc_trim("Movie - Spanish") == "movie spanish"
+    assert vlc_trim("Am\u00e9lie_EN") == "am lie en"  # VLC compares ASCII letters only
+    assert vlc_trim("\u0130stanbul") == "stanbul"  # no ASCII from lower() of others
+    assert vlc_trim("...") == ""
+
+
+def test_may_be_vlc_autoloaded(tmp_path):
+    media = str(tmp_path / "The.Matrix.mkv")
+    yes = [
+        "The Matrix - Spanish.srt",
+        "the_matrix_en.smi",
+        "Subs/The.Matrix.fr.srt",
+        "subtitles/THE MATRIX.ass",
+        "Best of The Matrix.srt",  # VLC loads it with a lower sub-autodetect-fuzzy
+    ]
+    no = ["Subs/2_English.srt", "English.srt", "Sub/The.Matrix.srt", "Extras/The.Matrix.srt"]
+    for name in yes:
+        assert may_be_vlc_autoloaded(media, str(tmp_path / name)), name
+    for name in no:
+        assert not may_be_vlc_autoloaded(media, str(tmp_path / name)), name
+    assert not may_be_vlc_autoloaded(media, str(tmp_path.parent / "The.Matrix.srt"))
+    # a name without ASCII letters: VLC matches every subtitle file
+    assert may_be_vlc_autoloaded(str(tmp_path / "\u65e5\u672c.mkv"), str(tmp_path / "x.srt"))

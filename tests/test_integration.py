@@ -21,6 +21,7 @@ Environment knobs:
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -550,11 +552,14 @@ def _is_snap(vlc: str) -> bool:
     return os.path.realpath(vlc).startswith("/snap/") or vlc.startswith("/snap/")
 
 
-@pytest.mark.slow
-@pytest.mark.vlc
-def test_vlc_end_to_end(tmp_path: Path):
-    """Headless VLC + our Lua intf + daemon: playing a file with a subtitle track
-    selected must end with the synced subtitle loaded as a new track.
+@contextlib.contextmanager
+def vlc_with_subsync(tmp_path: Path, place: dict[str, str], vlc_args: list[str]):
+    """Headless VLC with our Lua intf, and the daemon, until the synced subtitle is
+    loaded as a new track (or VLC exits, or 10 minutes pass).
+
+    ``place`` maps paths under the media dir to fixture names; ``vlc_args`` go before
+    the media (``{media}`` is replaced by the media dir). Yields the VLC log text, the
+    queue dir and the daemon log path; the caller asserts on them.
 
     Isolation: the Lua scripts are found through ``VLC_DATA_PATH`` (VLC searches
     ``$VLC_DATA_PATH/lua/intf``); the interface is enabled on the command line
@@ -601,7 +606,9 @@ def test_vlc_end_to_end(tmp_path: Path):
         (q / d).mkdir(parents=True, exist_ok=True)
 
     media_dir = base / "media"
-    copy_fixtures(media_dir, "multi_audio.mkv", "multi_audio.en.srt")
+    for dest, name in place.items():
+        (media_dir / dest).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(FIX / name, media_dir / dest)
 
     env = isolated_env(base / "subsync")
     env.update(
@@ -614,7 +621,8 @@ def test_vlc_end_to_end(tmp_path: Path):
     # the daemon must use the real HOME for the HF model cache
     denv = dict(env, HOME=os.environ.get("HOME", str(home)))
     denv.pop("XDG_CACHE_HOME")
-    dlog = (base / "daemon.log").open("w", encoding="utf-8")
+    dlog_path = base / "daemon.log"
+    dlog = dlog_path.open("w", encoding="utf-8")
     daemon_proc = subprocess.Popen(
         cli("serve", "--queue-dir", str(q), "--no-default-queues", "-v"),
         env=denv,
@@ -627,9 +635,8 @@ def test_vlc_end_to_end(tmp_path: Path):
         vlc, "-I", "dummy", "--extraintf", "luaintf", "--lua-intf", "subsync",
         "-vv", "--no-metadata-network-access",
         "--vout", "dummy", "--aout", "dummy",
-        "--audio-track", "1", "--sub-track", "0",
         "--play-and-exit",
-        str(media_dir / "multi_audio.mkv"),
+        *(a.replace("{media}", str(media_dir)) for a in vlc_args),
     ]  # fmt: skip
     vlc_proc = None
     try:
@@ -643,28 +650,92 @@ def test_vlc_end_to_end(tmp_path: Path):
         text = ""
         while time.monotonic() < deadline:
             text = vlog_path.read_text(encoding="utf-8", errors="replace")
-            if "[subsync] synced track es=" in text:
+            if "[subsync] synced track es=" in text or "[subsync] job " in text:
                 break
             if vlc_proc.poll() is not None:
                 break
             time.sleep(0.5)
         print("\n".join(ln for ln in text.splitlines() if "subsync" in ln.lower())[-6000:])
-        assert "[subsync] started, queue dir" in text, "Lua intf did not start (see log)"
-        assert "[subsync] request " in text, "Lua intf never submitted a request"
-        assert "[subsync] synced track es=" in text, "synced subtitle was not added"
-        outs = sorted((q / "out").glob("*.srt"), key=lambda p: p.stat().st_mtime)
-        assert outs, "daemon produced no output"
-        assert any(o.name in text for o in outs), "VLC log never mentions the synced file"
-        assert_accurate(score(outs[-1], FIX / "en_dialogue.truth.srt"))
+        yield SimpleNamespace(text=text, q=q, daemon_log=dlog_path)
     finally:
         if vlc_proc is not None:
             stop(vlc_proc)
         stop(daemon_proc)
         vlog.close()
         dlog.close()
-        print((base / "daemon.log").read_text(encoding="utf-8")[-3000:])
+        print(dlog_path.read_text(encoding="utf-8")[-3000:])
         if snap:
             for sub in ("requests", "jobs", "out"):
                 for p in (q / sub).glob("*"):
                     p.unlink(missing_ok=True)
             shutil.rmtree(base, ignore_errors=True)
+
+
+def assert_synced(run: SimpleNamespace) -> None:
+    text = run.text
+    assert "[subsync] started, queue dir" in text, "Lua intf did not start (see log)"
+    assert "[subsync] request " in text, "Lua intf never submitted a request"
+    assert "[subsync] synced track es=" in text, "synced subtitle was not added"
+    outs = sorted((run.q / "out").glob("*.srt"), key=lambda p: p.stat().st_mtime)
+    assert outs, "daemon produced no output"
+    assert any(o.name in text for o in outs), "VLC log never mentions the synced file"
+    assert_accurate(score(outs[-1], FIX / "en_dialogue.truth.srt"))
+
+
+@pytest.mark.slow
+@pytest.mark.vlc
+def test_vlc_end_to_end(tmp_path: Path):
+    """Playing a file with a subtitle track selected must end with the synced
+    subtitle loaded as a new track."""
+    place = {"multi_audio.mkv": "multi_audio.mkv", "multi_audio.en.srt": "multi_audio.en.srt"}
+    args = ["--audio-track", "1", "--sub-track", "0", "{media}/multi_audio.mkv"]
+    with vlc_with_subsync(tmp_path, place, args) as run:
+        assert_synced(run)
+
+
+@pytest.mark.slow
+@pytest.mark.vlc
+def test_vlc_subtitle_not_named_like_the_video(tmp_path: Path):
+    """The bug report: a release-pack subtitle (``Subs/2_English.srt``) that VLC
+    loaded although its name doesn't match the video used to fail with "Subtitle
+    track 1 not found (0 embedded, 0 external files)". The helper must find it among
+    the files VLC has open, not one of the other files in ``Subs/``.
+
+    ``--sub-file`` stands in for **Subtitle → Add Subtitle File…**: VLC selects the
+    file and the Lua API can't tell the helper its path. (VLC lists a startup file
+    before its sidecars and a file added later after them; with no sidecar the order
+    doesn't matter.)
+    """
+    place = {
+        "Movie.mkv": "en_dialogue.mkv",
+        "Subs/2_English.srt": "en_dialogue.offset_plus_3_2.srt",
+        "Subs/3_English.srt": "en_dialogue.es_text.offset_plus_3_2.srt",
+        "Subs/8_Spanish.srt": "es_dialogue.offset_plus_3_2.srt",
+    }
+    args = ["--sub-file", "{media}/Subs/2_English.srt", "{media}/Movie.mkv"]
+    with vlc_with_subsync(tmp_path, place, args) as run:
+        assert " sub=0 of 1 " in run.text, "the request must count VLC's subtitle tracks"
+        daemon_log = run.daemon_log.read_text(encoding="utf-8")
+        assert "not found" not in daemon_log
+        assert "2_English.srt (open in VLC)" in daemon_log, "picked the wrong file"
+        assert_synced(run)
+
+
+@pytest.mark.slow
+@pytest.mark.vlc
+def test_vlc_startup_subtitle_next_to_a_sidecar(tmp_path: Path):
+    """A file given when the video opens (``--sub-file``, the Open dialog's subtitle
+    file, or one added during an earlier play) is listed before the sidecar VLC found
+    itself, and VLC selects it: the helper must not sync the sidecar instead."""
+    place = {
+        "Movie.mkv": "en_dialogue.mkv",
+        "Movie.srt": "es_dialogue.offset_plus_3_2.srt",  # the sidecar: another film
+        "English.srt": "en_dialogue.offset_plus_3_2.srt",
+    }
+    # (VLC 3 drops a --sub-file that sorts after the sidecar: "English" < "Movie")
+    args = ["--sub-file", "{media}/English.srt", "{media}/Movie.mkv"]
+    with vlc_with_subsync(tmp_path, place, args) as run:
+        assert " sub=0 of 2 (0 added) " in run.text, "the request must count VLC's tracks"
+        daemon_log = run.daemon_log.read_text(encoding="utf-8")
+        assert "English.srt (open in VLC)" in daemon_log, "picked the wrong file"
+        assert_synced(run)

@@ -295,8 +295,13 @@ function E.current_selection()
     local s, slabel = ordinal(sids, slabels, spu, ST.ours)
     if not a then return nil, "No audio track selected." end
     if not s then return nil, "Subtitle track not found." end
+    -- subtitle tracks VLC lists, our synced ones excluded (see the intf's M.sub_count)
+    local count = 0
+    for _, v in ipairs(sids) do
+        if v ~= -1 and not ST.ours[v] then count = count + 1 end
+    end
     return { media = media, uri = uri, audio = a, audio_label = alabel,
-             sub = s, sub_label = slabel, spu_ids = sids }
+             sub = s, sub_label = slabel, sub_count = count, spu_ids = sids }
 end
 
 function E.fallback_sync(mode)
@@ -313,6 +318,7 @@ function E.fallback_sync(mode)
         { "audio_label", sel.audio_label },
         { "sub_index", sel.sub },
         { "sub_label", sel.sub_label },
+        { "sub_count", sel.sub_count },
         { "sub_path", "" },
         { "force", 0 },
     }

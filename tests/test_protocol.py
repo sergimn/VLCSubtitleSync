@@ -65,6 +65,24 @@ def test_request_cache_only_optional(tmp_path):
     assert P.read_request(path).cache_only is True
 
 
+def test_request_sub_count_optional(tmp_path):
+    path = P.write_request(tmp_path, P.Request(id="s1", media="/m.mkv", sub_index=0))
+    assert "sub_count" not in P.read_kv(path) and "sub_added" not in P.read_kv(path)
+    assert P.read_request(path).sub_count is None
+    assert P.read_request(path).sub_added is None
+    req = P.Request(id="s2", media="/m.mkv", sub_index=1, sub_count=3, sub_added=1)
+    path = P.write_request(tmp_path, req)
+    assert P.read_kv(path)["sub_count"] == "3" and P.read_kv(path)["sub_added"] == "1"
+    assert P.read_request(path).sub_count == 3
+    assert P.read_request(path).sub_added == 1
+    # what the Lua intf writes, including an empty or bad value
+    for raw, want in (("2", 2), ("0", 0), ("", None), ("x", None), ("-1", None)):
+        got = P.Request.from_dict(
+            {"id": "s3", "media": "/m.mkv", "sub_count": raw, "sub_added": raw}
+        )
+        assert got.sub_count == want and got.sub_added == want, raw
+
+
 def test_status_roundtrip(tmp_path):
     st = P.Status(
         id="x_1",

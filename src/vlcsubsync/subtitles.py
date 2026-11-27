@@ -5,6 +5,7 @@ from __future__ import annotations
 import codecs
 import os
 import re
+import sys
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable
@@ -166,6 +167,104 @@ def find_sidecars(media_path: str | os.PathLike[str]) -> list[str]:
             found.append((exact, depth, f.name.casefold(), str(f)))
     found.sort()
     return [x[3] for x in found]
+
+
+MAX_NEARBY = 200
+
+
+def subtitle_files_near(media_path: str | os.PathLike[str]) -> list[str]:
+    """Subtitle files near ``media_path`` whatever their names: in the media dir, its
+    ``Subs/``-style subdirs and a ``Subs/<media stem>/`` dir (TV release packs).
+
+    Any extension VLC loads as a subtitle counts; hidden files (``._x.srt``) don't.
+    Sorted by path, at most ``MAX_NEARBY``. Used to find a subtitle the user added to
+    VLC by hand, which :func:`find_sidecars` does not know.
+    """
+    from .openfiles import is_subtitle_file
+
+    media = Path(media_path)
+    folder = media.parent
+    stem = media.stem.casefold()
+    dirs = [folder]
+    try:
+        for child in sorted(folder.iterdir()):
+            if child.is_dir() and child.name.casefold() in SIDECAR_SUBDIRS:
+                dirs.append(child)
+                try:
+                    dirs += [
+                        g
+                        for g in sorted(child.iterdir())
+                        if g.is_dir() and g.name.casefold() == stem
+                    ]
+                except OSError:
+                    pass
+    except OSError:
+        return []
+    out: list[str] = []
+    for d in dirs:
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for f in entries:
+            if f.name.startswith(".") or not is_subtitle_file(f.name) or f == media:
+                continue
+            if f.is_file():
+                out.append(str(f))
+    out.sort(key=lambda p: (p.casefold(), p))
+    return out[:MAX_NEARBY]
+
+
+# Where VLC 3 looks for subtitle files by itself (src/input/subtitles.c): the video's
+# folder and, by default (sub-autodetect-path), these subfolders.
+VLC_SUB_DIRS = ("subtitles", "subs")
+
+
+def in_vlc_sub_folder(media_path: str | os.PathLike[str], path: str) -> bool:
+    """Whether ``path`` is somewhere VLC 3's default settings look for subtitle files:
+    the video's folder, or its ``./Subtitles``, ``./subtitles``, ``./Subs`` or ``./subs``
+    subfolder (``.\\subtitles``, ``.\\subs`` on Windows). Only Windows and macOS file
+    systems ignore the letter case, so a Linux ``SUBS/`` or any ``Sub/`` doesn't count.
+    """
+    from .openfiles import same_file_key
+
+    media, sub = Path(media_path), Path(path)
+    home = same_file_key(str(media.parent))
+    folder = sub.parent
+    if same_file_key(str(folder)) == home:
+        return True
+    if same_file_key(str(folder.parent)) != home:
+        return False
+    if sys.platform in ("win32", "darwin"):
+        return folder.name.casefold() in VLC_SUB_DIRS
+    return folder.name in ("Subtitles", "subtitles", "Subs", "subs")
+
+
+def vlc_trim(name: str) -> str:
+    """``name`` the way VLC 3 compares subtitle and video names (``strcpy_trim``):
+    its ASCII letters and digits, lowercased, as words separated by single spaces."""
+    return " ".join(w.lower() for w in re.findall(r"[A-Za-z0-9]+", name))
+
+
+def may_be_vlc_autoloaded(media_path: str | os.PathLike[str], path: str) -> bool:
+    """Whether VLC 3 may have loaded subtitle file ``path`` by itself for the video.
+
+    True when the file is in the video's folder or a ``Subs/``-style subfolder of it
+    and its name contains the video's (as :func:`vlc_trim` gives them). VLC's default
+    settings load the names that are the video's or start with it ("Movie - English",
+    "Movie_en"), lower ``sub-autodetect-fuzzy`` settings load more. Such a file sits
+    among VLC's sidecars, wherever :func:`find_sidecars` would put it.
+    """
+    from .openfiles import same_file_key
+
+    media, sub = Path(media_path), Path(path)
+    home = same_file_key(str(media.parent))
+    folder = sub.parent
+    if same_file_key(str(folder)) != home and not (
+        folder.name.casefold() in VLC_SUB_DIRS and same_file_key(str(folder.parent)) == home
+    ):
+        return False
+    return vlc_trim(media.stem) in vlc_trim(sub.stem)
 
 
 # --------------------------------------------------------------------------------------

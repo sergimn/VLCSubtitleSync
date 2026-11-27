@@ -256,6 +256,7 @@ def test_request_written_with_ordinals_labels_and_decoded_path(h):
     assert r["media"] == MOVIE_PATH
     assert r["audio_index"] == "1" and r["audio_label"] == "Track 2 - [English]"
     assert r["sub_index"] == "1" and r["sub_label"] == "Track 2 - [Spanish]"
+    assert r["sub_count"] == "2"
     assert r["force"] == "0" and r["sub_path"] == ""
     assert (h.q / "requests" / f"{r['id']}.req").exists()
     assert not list((h.q / "requests").glob("*.tmp"))
@@ -471,11 +472,112 @@ def test_done_adds_selects_and_memoizes(h):
     h.settle()
     assert h.requests() == []
     assert h.selected("spu-es") == new_id
-    # our track is excluded from ordinals: picking sub 21 is still ordinal 1
+    # our track is excluded from ordinals and the count: picking sub 21 is still
+    # ordinal 1 of 2
     h.select("spu-es", 21)
     h.settle()
     reqs = h.requests()
-    assert len(reqs) == 1 and reqs[0]["sub_index"] == "1"
+    assert len(reqs) == 1 and reqs[0]["sub_index"] == "1" and reqs[0]["sub_count"] == "2"
+
+
+def test_hand_added_subtitle_request_counts_tracks(h):
+    # the bug report: a video without subtitles, then Subtitle > Add Subtitle File. VLC
+    # adds the track and selects it, and can't tell us its file: the request says it
+    # is the only subtitle track VLC lists, so the helper knows which file to look for
+    h.set_input(subs=[], spu_sel=-1)
+    h.settle()
+    assert h.requests() == []
+    h.mock.input.spu[1] = h.lua.table_from({"id": 30, "label": "Track 1"})
+    h.select("spu-es", 30)
+    h.settle()
+    reqs = h.requests()
+    assert len(reqs) == 1
+    r = reqs[0]
+    assert r["sub_index"] == "0" and r["sub_count"] == "1" and r["sub_path"] == ""
+    assert r["sub_added"] == "1"  # VLC lists it after the files it loaded with the video
+    assert any(f"request {r['id']}: audio=0 sub=0 of 1 (1 added) " in ln for ln in h.logs())
+
+
+def test_request_counts_tracks_added_after_the_file_opened(h):
+    h.mock.input = None
+    h.set_input()
+    h.mock.input.state = 1  # OPENING_S: VLC is still loading the sidecars
+    h.tick()
+    h.mock.input.state = 2
+    h.mock.add_track(22, "Track 3")  # loaded with the video
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "0" and r["sub_count"] == "3" and r["sub_added"] == "0"
+    h.finish(r["id"])
+    h.tick(3)  # our synced track shows up: not counted
+    h.mock.add_track(23, "Track 5", True)  # Subtitle > Add Subtitle File
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "3" and r["sub_count"] == "4" and r["sub_added"] == "1"
+
+
+def test_same_file_playing_again_counts_from_its_new_start(h):
+    # VLC starts a new input object; the files added during the first play are now
+    # loaded with the video (VLC lists them first)
+    h.set_input()
+    h.tick()
+    h.mock.add_track(30, "Track 3", True)
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_index"] == "2" and r["sub_added"] == "1"
+    h.set_input(subs=[(31, "Track 1"), *SUBS], spu_sel=31)  # same uri, new object
+    h.settle()
+    r = h.requests()[-1]
+    assert r["sub_index"] == "0" and r["sub_count"] == "3" and r["sub_added"] == "0"
+    assert any("the same file plays again" in ln for ln in h.logs())
+
+
+def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_path):
+    # the input was already playing a minute when the intf first looked (it started
+    # after the video): files may have been added
+    for d in ("late", "old", "resume", "start"):
+        (tmp_path / d).mkdir()
+    late = Harness(runtime, tmp_path / "late", INTF)
+    late.heartbeat()
+    late.init()
+    late.set_input()
+    late.mock.input.time = 60_000_000
+    late.settle()
+    r = late.requests()[0]
+    assert r["sub_count"] == "2" and r["sub_added"] == ""
+    # a video VLC starts at a resume point: it opens after our first tick, so its
+    # position doesn't matter
+    resume = Harness(runtime, tmp_path / "resume", INTF)
+    resume.heartbeat()
+    resume.init()
+    resume.mock.input = None
+    resume.tick()
+    resume.set_input()
+    resume.mock.input.time = 1_500_000_000
+    resume.settle()
+    r = resume.requests()[0]
+    assert r["sub_count"] == "2" and r["sub_added"] == "0"
+    # --start-time 60 with the video open at our first tick: played from there
+    start = Harness(runtime, tmp_path / "start", INTF)
+    start.heartbeat()
+    start.init()
+    start.set_input()
+    start.mock.input.time = 61_000_000
+    start.mock.input.vars["start-time"] = 60.0
+    start.settle()
+    r = start.requests()[0]
+    assert r["sub_count"] == "2" and r["sub_added"] == "0"
+    # no vlc.var.create: a replay of the same item can't be told apart
+    old = Harness(runtime, tmp_path / "old", INTF)
+    old.heartbeat()
+    old.init()
+    old.mock.no_var_create = True
+    old.set_input()
+    old.settle()
+    r = old.requests()[0]
+    assert r["sub_count"] == "2" and r["sub_added"] == ""
+    old.tick(10)
+    assert len(old.requests()) == 1  # and nothing restarts every tick
 
 
 def test_delayed_track_appearance(h):
@@ -506,6 +608,7 @@ def test_audio_change_triggers_resync(h):
     reqs = h.requests()
     assert len(reqs) == 1
     assert reqs[0]["audio_index"] == "1" and reqs[0]["sub_index"] == "0"
+    assert reqs[0]["sub_count"] == "2"  # counted without our synced track
     h.finish(reqs[0]["id"])
     h.tick(3)
     synced_a1 = h.selected("spu-es")
@@ -956,6 +1059,7 @@ def test_ext_fallback_sync_and_load(ext):
     assert len(reqs) == 1
     r = reqs[0]
     assert r["media"] == MOVIE_PATH and r["audio_index"] == "1" and r["sub_index"] == "1"
+    assert r["sub_count"] == "2" and "sub_added" not in r
     dlg = ext.mock.last_dialog
     assert dlg.shown and "Load synced result" in [w.text for w in dlg.widgets.values()]
     assert dict(ext.lua.eval("menu()").items())[5] == "Load synced result"

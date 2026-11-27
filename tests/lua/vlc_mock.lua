@@ -29,6 +29,7 @@ function Mock.new(opts)
         var_sets = {},
         dialogs = {},
         input = nil,
+        no_var_create = false,  -- tests: VLC without vlc.var.create
     }
 
     local function log(level)
@@ -66,8 +67,17 @@ function Mock.new(opts)
             audio = audio or {},
             spu = spu or {},
             sel = { ["audio-es"] = audio_sel or -1, ["spu-es"] = spu_sel or -1 },
+            state = 2,          -- PLAYING_S
+            time = 0,           -- microseconds played
+            vars = {},          -- created with vlc.var.create
         }
         m.adds_pending = {}
+    end
+    -- tests: a track the user adds (Subtitle > Add Subtitle File...), appended like VLC does
+    function m.add_track(id, label, select)
+        local n = #m.input.spu + 1
+        m.input.spu[n] = { id = id, label = label or ("Track " .. n) }
+        if select then m.input.sel["spu-es"] = id end
     end
     function m.select(var, id)
         m.input.sel[var] = id
@@ -128,7 +138,17 @@ function Mock.new(opts)
         get = function(obj, name)
             assert(obj and obj._input, "get on non-input object")
             process_adds()
-            return m.input.sel[name]
+            if name == "state" then return m.input.state end
+            if name == "time" then return m.input.time end
+            local v = m.input.sel[name]
+            if v == nil then v = m.input.vars[name] end
+            return v
+        end,
+        create = function(obj, name, value)
+            assert(obj and obj._input, "create on non-input object")
+            if m.no_var_create then error("no var.create") end
+            if m.input.vars[name] == nil then m.input.vars[name] = value end
+            return 0
         end,
         set = function(obj, name, value)
             assert(obj and obj._input, "set on non-input object")

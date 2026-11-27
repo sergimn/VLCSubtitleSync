@@ -37,6 +37,9 @@ with, so on glibc and macOS nothing else matches after that). The files added du
 an earlier play of the same playlist item come after the URI sort. Where they all
 sit can change the order of equal sidecars: :meth:`VlcSidecars.lists` works it out
 for a known ``--sub-file`` and tries every place an unknown one can be.
+
+Each file is one track, except a VobSub ``.idx``: one track per language (``id:``
+line) it lists, together at its place (:func:`vobsub_tracks`).
 """
 
 from __future__ import annotations
@@ -166,6 +169,7 @@ class Entry:
     uri: str
     priority: int
     dropped: bool = False  # VLC drops it after the scan (the .sub of a VobSub pair, .cdg)
+    tracks: int | None = 1  # how many tracks VLC makes of it (None: can't tell)
 
 
 def scan(media_path: str, settings: Autodetect, windows: bool) -> list[Entry]:
@@ -202,8 +206,35 @@ def _found(media_path: str, settings: Autodetect, windows: bool) -> list[Entry]:
             path = folder + name if folder.endswith(sep) else folder + sep + name
             if path == media_path or not os.path.isfile(path):
                 continue
-            found.append(Entry(path, path_to_uri(path, windows), prio))
+            found.append(Entry(path, path_to_uri(path, windows), prio, tracks=file_tracks(path)))
     return found
+
+
+_VOBSUB_ID = re.compile(r"id:\s*(?:[^ ,]{1,32})?,\s*index:\s*[+-]?\d")
+
+
+def vobsub_tracks(idx_path: str) -> int | None:
+    """How many tracks VLC 3's VobSub reader makes of an ``.idx``: one per ``id:`` line
+    it can read. One if it isn't VobSub (no "# VobSub index file" first line: another
+    reader takes it, as any subtitle file). None if VLC can't open the ``.sub`` (the
+    name with ``.sub`` for the last four characters, as VLC spells it): then it's
+    unclear what VLC makes of it."""
+    try:
+        with open(idx_path, "rb") as f:
+            text = f.read(4 << 20).decode("latin-1")
+    except OSError:
+        return None
+    lines = text.split("\n")
+    if "# vobsub index file" not in lines[0].lower():
+        return 1
+    if not os.path.isfile(idx_path[:-4] + ".sub"):
+        return None
+    return sum(1 for line in lines if line.startswith("id:") and _VOBSUB_ID.match(line))
+
+
+def file_tracks(path: str) -> int | None:
+    """How many subtitle tracks VLC makes of a subtitle file (see :func:`vobsub_tracks`)."""
+    return vobsub_tracks(path) if _ext(path) == "idx" else 1
 
 
 def _mark_dropped(found: Sequence[Entry]) -> list[Entry]:
@@ -216,7 +247,7 @@ def _mark_dropped(found: Sequence[Entry]) -> list[Entry]:
         if ext == "sub":
             stem = e.uri[:-3].lower()
             drop = any(o.uri.lower().startswith(stem) and _ext(o.uri) == "idx" for o in found)
-        out.append(Entry(e.path, e.uri, e.priority, dropped=drop))
+        out.append(Entry(e.path, e.uri, e.priority, dropped=drop, tracks=e.tracks))
     return out
 
 
@@ -439,10 +470,13 @@ def _order(
             break  # VLC stops at the first deleted one
         if x is _TAIL or (x is _HEAD and head is not None and head.unseen):
             out.append(None)
-        elif x is _HEAD and head is not None:
-            out.append(os.path.normpath(head.path or entries[head.same].path))
+            continue
+        if x is _HEAD and head is not None:
+            path = head.path or entries[head.same].path
+            n = file_tracks(path) if head.path else entries[head.same].tracks
         else:
-            out.append(os.path.normpath(entries[x].path))
+            path, n = entries[x].path, entries[x].tracks
+        out += [os.path.normpath(path)] * (1 if n is None else n)  # an .idx: one per language
     return tuple(out)
 
 
@@ -482,7 +516,9 @@ class VlcSidecars:
         # where SubSync can't tell what VLC made of it: an unknown or relative --sub-file
         self.sub_file_known = sub_file is not None and (not sub_file or self.startup is not None)
         first = self.lists(first_only=True).orders
-        self.paths: list[str] = [p for p in first[0] if p is not None] if first else []
+        self.paths: list[str] = (
+            list(dict.fromkeys(p for p in first[0] if p is not None)) if first else []
+        )
         live = [os.path.normpath(e.path) for e in self.entries if not e.dropped]
         startup = [os.path.normpath(self.startup[0])] if self.startup else []
         # every file that can be in VLC's list, and every file the scan found
@@ -506,18 +542,26 @@ class VlcSidecars:
         *,
         maybe_absent: Sequence[Iterable[str]] = (),
         is_open: Callable[[str], bool] | None = None,
+        gone: Iterable[str] = (),
         first_only: bool = False,
     ) -> Orders:
-        """Every list VLC may have made of the files it loaded as the video opened.
+        """Every list VLC may have made of the files it loaded as the video opened, one
+        path per track (an ``.idx`` once per language), None for a file SubSync can't
+        see.
 
         ``tails(n)``: how many other files may have been given at startup (files added
-        during an earlier play of the same playlist item), when VLC listed ``n`` files
+        during an earlier play of the same playlist item), when VLC listed ``n`` tracks
         besides them. ``maybe_absent``: the paths of files (one group each) that may
         have appeared after the video opened (VLC hasn't them open); both are tried.
-        ``is_open``: whether VLC has a file open; the others are left out of the lists
-        (VLC couldn't load them)."""
+        ``gone``: files that weren't there when the video opened. ``is_open``: whether
+        VLC has a file open; the others are left out of the lists (VLC couldn't load
+        them)."""
         sort, exact = _sorter()
         why = [] if exact or len(self.entries) < 2 else ["can't sort like VLC's C library"]
+        startup_tracks = file_tracks(self.startup[0]) if self.startup else 1
+        if startup_tracks is None or any(e.tracks is None for e in self.entries if not e.dropped):
+            exact = False
+            why.append("VLC may not read a VobSub .idx as SubSync does")
         live_prios = [e.priority for e in self.entries if not e.dropped]
         collate = self.settings.collate
         if not _VLC_USES_STRCOLL:
@@ -535,6 +579,7 @@ class VlcSidecars:
                 exact = False
                 why.append("VLC's locale isn't known")
         groups = [g for g in (frozenset(map(os.path.normpath, g)) for g in maybe_absent) if g]
+        gone_set = frozenset(map(os.path.normpath, gone))
         if first_only:
             subsets: list[frozenset[str]] = [frozenset()]
         elif len(groups) <= MAX_ABSENT:
@@ -548,7 +593,7 @@ class VlcSidecars:
             exact = False
             why.append(f"VLC hasn't {len(groups)} of the subtitle files open")
         out: list[tuple[str | None, ...]] = []
-        for absent in subsets:
+        for absent in (a | gone_set for a in subsets):
             entries = (
                 self.entries
                 if not absent

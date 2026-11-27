@@ -342,6 +342,12 @@ def _windows_subtitles(
 # --------------------------------------------------------------------------- entry point
 
 
+def lists_every_file(platform: str | None = None) -> bool:
+    """Whether :func:`subtitles_open_in_vlc` lists every subtitle file VLC has open
+    (Linux, macOS), not only the candidates (Windows)."""
+    return (platform or sys.platform) != "win32"
+
+
 def subtitles_open_in_vlc(
     media: str,
     candidates: Iterable[str] = (),

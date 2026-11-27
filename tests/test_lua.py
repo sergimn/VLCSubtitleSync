@@ -115,8 +115,10 @@ class Harness:
             [self.lua.table_from({"id": i, "label": label}) for i, label in items]
         )
 
-    def set_input(self, uri=MOVIE_URI, audio=AUDIO, subs=SUBS, audio_sel=10, spu_sel=20):
-        self.mock.set_input(uri, self.table(audio), self.table(subs), audio_sel, spu_sel)
+    def set_input(
+        self, uri=MOVIE_URI, audio=AUDIO, subs=SUBS, audio_sel=10, spu_sel=20, item_id=None
+    ):
+        self.mock.set_input(uri, self.table(audio), self.table(subs), audio_sel, spu_sel, item_id)
 
     def select(self, var, es_id):
         self.mock.select(var, es_id)
@@ -591,6 +593,55 @@ def test_same_file_playing_again_counts_from_its_new_start(h):
     assert any("the same file plays again" in ln for ln in h.logs())
 
 
+def test_request_says_what_earlier_plays_of_the_playlist_item_added(h):
+    # VLC keeps the files added during a play with the playlist item and loads them
+    # first when it plays again: the helper must not take them for tracks without a
+    # file (closed captions), which VLC lists after its sidecars
+    h.set_input(item_id=4)
+    h.mock.input.vars["input-slave"] = ""
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_earlier"] == "0" and r["sub_earlier_min"] == "0"  # its first play
+    h.finish(r["id"])
+    h.tick(3)  # our synced track shows up
+    h.mock.add_track(30, "Track 4", True)  # Subtitle > Add Subtitle File
+    h.settle()
+    r = h.requests()[0]
+    assert r["sub_added"] == "1" and r["sub_earlier"] == "0"
+    out = h.finish(r["id"])
+    h.tick(3)
+    # it plays again: VLC loads the hand-added file and both synced files first
+    h.set_input(subs=[(40, "Track 1"), (41, "Track 2"), (42, "Track 3"), *SUBS], item_id=4)
+    h.mock.input.vars["input-slave"] = "/media/extra.ass"
+    h.settle()
+    r = h.requests()[-1]
+    # at most: 1 added + 2 synced + 1 input-slave; at least: the synced files that exist
+    assert r["sub_count"] == "5" and r["sub_earlier"] == "4" and r["sub_earlier_min"] == "2"
+    h.finish(r["id"])
+    h.tick(3)
+    os.remove(out)  # a synced file deleted since: VLC can't load it
+    h.set_input(subs=[(50, "Track 1"), *SUBS], item_id=4)
+    h.mock.input.vars["input-slave"] = ""
+    h.settle()
+    r = h.requests()[-1]
+    assert r["sub_earlier"] == "3" and r["sub_earlier_min"] == "2"
+    # another playlist item with the same file has none of them
+    h.finish(r["id"])
+    h.tick(3)
+    h.set_input(subs=[*SUBS, (22, "Track 3")], spu_sel=22, item_id=5)
+    h.mock.input.vars["input-slave"] = ""
+    h.settle()
+    r = h.requests()[-1]
+    assert r["sub_index"] == "2" and r["sub_earlier"] == "0" and r["sub_earlier_min"] == "0"
+
+
+def test_earlier_plays_unknown_without_the_playlist_or_when_seen_late(h):
+    h.set_input()  # no vlc.playlist.current()
+    h.mock.input.vars["input-slave"] = ""
+    h.settle()
+    assert not {"sub_earlier", "sub_earlier_min"} & h.requests()[0].keys()
+
+
 def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_path):
     # the input was already playing a minute when the intf first looked (it started
     # after the video): files may have been added
@@ -599,11 +650,21 @@ def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_pat
     late = Harness(runtime, tmp_path / "late", INTF)
     late.heartbeat()
     late.init()
-    late.set_input()
+    late.set_input(item_id=1)
+    late.mock.input.vars["input-slave"] = ""
     late.mock.input.time = 60_000_000
     late.settle()
     r = late.requests()[0]
     assert r["sub_count"] == "2" and r["sub_added"] == ""
+    # and so may earlier plays: never known again in this VLC
+    assert "sub_earlier" not in r
+    late.finish(r["id"])
+    late.tick(3)
+    late.set_input(uri="file:///media/Other.mkv", item_id=2)
+    late.mock.input.vars["input-slave"] = ""
+    late.settle()
+    r = late.requests()[0]
+    assert r["sub_added"] == "0" and "sub_earlier" not in r
     # a video VLC starts at a resume point: it opens after our first tick, so its
     # position doesn't matter
     resume = Harness(runtime, tmp_path / "resume", INTF)
@@ -620,12 +681,13 @@ def test_tracks_added_unknown_when_seen_late_or_vlc_cannot_tell(runtime, tmp_pat
     start = Harness(runtime, tmp_path / "start", INTF)
     start.heartbeat()
     start.init()
-    start.set_input()
+    start.set_input(item_id=1)
+    start.mock.input.vars["input-slave"] = ""
     start.mock.input.time = 61_000_000
     start.mock.input.vars["start-time"] = 60.0
     start.settle()
     r = start.requests()[0]
-    assert r["sub_count"] == "2" and r["sub_added"] == "0"
+    assert r["sub_count"] == "2" and r["sub_added"] == "0" and r["sub_earlier"] == "0"
     # no vlc.var.create: a replay of the same item can't be told apart
     old = Harness(runtime, tmp_path / "old", INTF)
     old.heartbeat()

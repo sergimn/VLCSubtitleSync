@@ -556,7 +556,7 @@ def _is_snap(vlc: str) -> bool:
 # A Lua intf that adds a subtitle file to the video 2 s after it starts playing, the
 # way Subtitle -> Add Subtitle File... does (vlc.input.add_subtitle selects it).
 ADD_LATER_LUA = """
-local path = [[@PATH@]]
+local path, from = [[@PATH@]], [[@FROM@]]
 local since = nil
 while true do  -- VLC 3 has no should_die(): mwait raises once VLC closes the intf
     local input = vlc.object.input()
@@ -564,6 +564,7 @@ while true do  -- VLC 3 has no should_die(): mwait raises once VLC closes the in
     if state == 2 then  -- PLAYING_S
         since = since or vlc.misc.mdate()
         if vlc.misc.mdate() - since > 2000000 then
+            if from ~= "" then assert(os.rename(from, path)) end -- saved while it plays
             vlc.msg.info("[subsync-test] adding " .. path)
             vlc.input.add_subtitle(path, true)  -- VLC 3 selects it only when asked
             return
@@ -581,6 +582,7 @@ def vlc_with_subsync(
     vlc_args: list[str],
     vlc_env: dict[str, str] | None = None,
     add_later: str | None = None,
+    saved_later: bool = False,
 ):
     """Headless VLC with our Lua intf, and the daemon, until the synced subtitle is
     loaded as a new track (or VLC exits, or 10 minutes pass).
@@ -588,7 +590,8 @@ def vlc_with_subsync(
     ``place`` maps paths under the media dir to fixture names; ``vlc_args`` go before
     the media (``{media}`` is replaced by the media dir). ``add_later``: a path under
     the media dir that a second Lua intf adds to the video once it plays, as
-    **Subtitle → Add Subtitle File…** does (VLC selects it). Yields the VLC log text,
+    **Subtitle → Add Subtitle File…** does (VLC selects it); ``saved_later``: it is only
+    moved there then, as VLSub's "Download and load" saves it. Yields the VLC log text,
     the queue dir and the daemon log path; the caller asserts on them.
 
     Isolation: the Lua scripts are found through ``VLC_DATA_PATH`` (VLC searches
@@ -626,10 +629,12 @@ def vlc_with_subsync(
     shutil.copy2(pkg_lua / "intf" / "subsync.lua", lua_root / "lua" / "intf")
     shutil.copy2(pkg_lua / "extensions" / "subsync_ext.lua", lua_root / "lua" / "extensions")
     intfs = "luaintf"
+    pending = base / "pending"  # not next to the video
     if add_later:
+        lua = ADD_LATER_LUA.replace("@PATH@", str(base / "media" / add_later))
+        lua = lua.replace("@FROM@", str(pending / add_later) if saved_later else "")
         (lua_root / "lua" / "intf" / "subsync_test_add.lua").write_text(
-            ADD_LATER_LUA.replace("@PATH@", str(base / "media" / add_later).replace("\\", "/")),
-            encoding="utf-8",
+            lua.replace("\\", "/"), encoding="utf-8"
         )
         intfs += ":luaintf{intf=subsync_test_add}"
 
@@ -644,8 +649,11 @@ def vlc_with_subsync(
 
     media_dir = base / "media"
     for dest, name in place.items():
-        (media_dir / dest).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(FIX / name, media_dir / dest)
+        to = (pending if saved_later and dest == add_later else media_dir) / dest
+        to.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(FIX / name, to)
+    if saved_later:
+        (media_dir / add_later).parent.mkdir(parents=True, exist_ok=True)
 
     env = isolated_env(base / "subsync")
     env.update(
@@ -752,6 +760,26 @@ def test_vlc_subtitle_not_named_like_the_video(tmp_path: Path):
         daemon_log = run.daemon_log.read_text(encoding="utf-8")
         assert "not found" not in daemon_log
         assert "2_English.srt (open in VLC)" in daemon_log, "picked the wrong file"
+        assert_synced(run)
+
+
+@pytest.mark.slow
+@pytest.mark.vlc
+def test_vlc_subtitle_downloaded_while_the_video_plays(tmp_path: Path):
+    """VLSub's "Download and load" (or a downloaded file saved next to the video and
+    dragged into VLC): the file is named like the video, but VLC didn't load it as the
+    video opened. It is the only subtitle file VLC has open: the helper syncs it."""
+    place = {
+        "Movie.mkv": "en_dialogue.mkv",
+        "Movie.srt": "en_dialogue.offset_plus_3_2.srt",
+    }
+    args = ["{media}/Movie.mkv"]
+    with vlc_with_subsync(tmp_path, place, args, add_later="Movie.srt", saved_later=True) as run:
+        assert "[subsync-test] adding " in run.text, "the test intf did not add the file"
+        assert " sub=0 of 1 (1 added) " in run.text
+        daemon_log = run.daemon_log.read_text(encoding="utf-8")
+        assert "(1 added later, 0 from earlier plays)" in daemon_log, "the intf's counts"
+        assert "Movie.srt (open in VLC)" in daemon_log
         assert_synced(run)
 
 

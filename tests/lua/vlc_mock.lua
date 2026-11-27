@@ -60,9 +60,10 @@ function Mock.new(opts)
     m.process_adds = process_adds
 
     -- tests: set the playing input
-    function m.set_input(uri, audio, spu, audio_sel, spu_sel)
+    function m.set_input(uri, audio, spu, audio_sel, spu_sel, item_id)
         m.input = {
             uri = uri,
+            item_id = item_id,  -- the playlist item's id (nil: no vlc.playlist.current)
             obj = { _input = true },
             audio = audio or {},
             spu = spu or {},
@@ -113,6 +114,12 @@ function Mock.new(opts)
     }
     vlc.object = {
         input = function() return m.input and m.input.obj or nil end,
+    }
+    vlc.playlist = {
+        current = function()
+            if not (m.input and m.input.item_id) then error("no playlist") end
+            return m.input.item_id
+        end,
     }
     vlc.input = {
         item = function()

@@ -563,13 +563,61 @@ function M.autodetect_settings(input)
     local paths = get("sub-autodetect-path")
     local sub_file = get("sub-file")
     local okc, collate = pcall(os.setlocale, nil, "collate")
+    local slave = get("input-slave")
+    local slaves = nil
+    if type(slave) == "string" then
+        slaves = 0
+        for _ in slave:gmatch("[^#]+") do slaves = slaves + 1 end
+    end
     return {
         autodetect = (on == true and 1) or (on == false and 0) or nil,
         fuzzy = tonumber(get("sub-autodetect-fuzzy")),
         paths = type(paths) == "string" and paths or nil,
         collate = okc and type(collate) == "string" and collate ~= "" and collate or nil,
         sub_file = type(sub_file) == "string" and sub_file or nil,
+        slaves = slaves, -- the input-slave option's files (not sent: see M.earlier)
     }
+end
+
+-- The playlist item playing (VLC keeps the files added during a play with the item
+-- and loads them again, first, when it plays again), or nil if unknown.
+function M.current_item()
+    local pl = vlc.playlist
+    if type(pl) ~= "table" or type(pl.current) ~= "function" then return nil end
+    local ok, id = pcall(pl.current)
+    if ok and type(id) == "number" and id >= 0 then return id end
+    return nil
+end
+
+-- Remember what this play of the playlist item added (called as it ends).
+function M.end_play()
+    local id = S.item_id
+    if id == nil then return end
+    local p = S.plays[id] or { added = 0, ours = {} }
+    S.plays[id] = p
+    if S.opened_unknown then
+        p.unknown = true
+        return
+    end
+    p.added = p.added + (S.play_added or 0)
+    for output in pairs(S.play_ours) do p.ours[output] = true end
+end
+
+-- How many subtitle tracks VLC may load as this play opened besides its sidecars and
+-- the sub-file (at most, at least): the files added during the item's earlier plays
+-- and those of the input-slave option. Our synced files of earlier plays that still
+-- exist surely are among them. nil, nil if unknown. Sent as sub_earlier and
+-- sub_earlier_min.
+function M.earlier()
+    local slaves = S.autodetect and S.autodetect.slaves
+    if S.late or S.item_id == nil or slaves == nil then return nil, nil end
+    local p = S.plays[S.item_id] or { added = 0, ours = {} }
+    if p.unknown then return nil, nil end
+    local ours = 0
+    for output in pairs(p.ours) do
+        if file_exists(output) then ours = ours + 1 end
+    end
+    return p.added + ours + slaves, ours
 end
 
 -- Remember the subtitle tracks VLC lists once the input has opened. `first`: this is
@@ -582,6 +630,7 @@ function M.note_opened(input, snap, first)
     local start = tonumber(var_get(input, "start-time")) or 0 -- seconds
     if first and time - start * 1000000 > M.OPENED_MAX_TIME_US then
         S.opened_unknown = true
+        S.late = true -- we started after VLC played: earlier plays are unknown
         log_dbg("input opened a while ago: tracks added later can't be told apart")
         return
     end
@@ -593,6 +642,11 @@ end
 function M.selection(snap)
     local sel = { audio_id = snap.audio, spu_id = snap.spu, sub_count = M.sub_count(snap),
                   sub_added = M.sub_added(snap) }
+    if sel.sub_added and sel.sub_added > (S.play_added or 0) then
+        S.play_added = sel.sub_added
+    elseif sel.sub_added and not S.play_added then
+        S.play_added = 0
+    end
     if snap.audio ~= -1 then
         sel.audio, sel.audio_label = M.ordinal(snap.audio_ids, snap.audio_labels, snap.audio)
     end
@@ -645,6 +699,7 @@ function M.reset_input()
     S.hold_until, S.settle_until, S.cache_missed = nil, nil, {}
     S.opened_spu, S.opened_unknown = nil, nil
     S.autodetect = nil
+    S.item_id, S.play_added, S.play_ours = nil, nil, {}
 end
 
 local function memo_for(uri)
@@ -696,9 +751,11 @@ function M.submit(sel, force, mode, probe)
         { "force", force and 1 or 0 },
     }
     local ad = S.autodetect or {}
+    local most, least = M.earlier()
     for _, f in ipairs({ { "sub_autodetect", ad.autodetect }, { "sub_fuzzy", ad.fuzzy },
                          { "sub_paths", ad.paths }, { "sub_collate", ad.collate },
-                         { "sub_file", ad.sub_file } }) do
+                         { "sub_file", ad.sub_file }, { "sub_earlier", most },
+                         { "sub_earlier_min", least } }) do
         if f[2] ~= nil then kv[#kv + 1] = f end
     end
     if mode ~= "" then kv[#kv + 1] = { "mode", mode } end
@@ -800,6 +857,7 @@ function M.check_adding(input, snap)
     for _, id in ipairs(new_ids) do
         S.ours[id] = { audio = e.audio, sub = e.sub, sub_label = e.sub_label, output = e.output }
     end
+    if e.output then S.play_ours[e.output] = true end
     local es = new_ids[1]
     e.es = es
     S.adding = nil
@@ -965,7 +1023,10 @@ function M.tick()
     end
     local input = get_input()
     if not input then
-        if S.input_uri then M.reset_input() end
+        if S.input_uri then
+            M.end_play()
+            M.reset_input()
+        end
         M.set_state(S.auto and "idle" or "disabled", "no input", nil)
         M.write_state()
         return
@@ -976,7 +1037,9 @@ function M.tick()
     local fresh = M.new_input_object(input)
     if uri ~= S.input_uri or fresh then
         if uri == S.input_uri then log_dbg("the same file plays again") end
+        M.end_play()
         M.reset_input()
+        S.item_id = M.current_item()
         S.input_uri = uri
         S.media_path = M.uri_to_path(uri)
         if S.media_path then log_dbg("new input: " .. S.media_path) end
@@ -992,7 +1055,10 @@ function M.tick()
         return
     end
 
-    if fresh == nil then S.opened_unknown = true end
+    if fresh == nil then
+        S.opened_unknown = true
+        S.late = true -- replays can't be told apart
+    end
     if not S.autodetect then S.autodetect = M.autodetect_settings(input) end
 
     local snap = M.snapshot(input)
@@ -1105,7 +1171,7 @@ end
 function M.reset()
     S = {
         counter = 0, auto = true, ours = {}, memo = {}, spawn_count = 0, cache_missed = {},
-        state = "idle", message = "", last_result = "",
+        state = "idle", message = "", last_result = "", plays = {}, play_ours = {},
     }
     S.q = M.queue_dir()
     M.state = S

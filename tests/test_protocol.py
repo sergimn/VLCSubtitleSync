@@ -292,3 +292,18 @@ def test_heartbeat_roundtrip(tmp_path):
     assert (tmp_path / "heartbeat").read_text() == "time=1000\npid=42\nversion=0.1.0\n"
     hb = P.read_heartbeat(tmp_path)
     assert hb.pid == 42 and hb.age(now=1005) == 5
+
+
+def test_request_earlier_plays_round_trip(tmp_path):
+    path = P.write_request(tmp_path, P.Request(id="e1", media="/m.mkv", sub_index=0))
+    assert not {"sub_earlier", "sub_earlier_min"} & P.read_kv(path).keys()
+    got = P.read_request(path)
+    assert got.sub_earlier is None and got.sub_earlier_min is None
+    req = P.Request(id="e2", media="/m.mkv", sub_index=0, sub_earlier=3, sub_earlier_min=1)
+    got = P.read_request(P.write_request(tmp_path, req))
+    assert (got.sub_earlier, got.sub_earlier_min) == (3, 1)
+    # both or neither, and at least never more than at most
+    for raw in ({"sub_earlier": "2"}, {"sub_earlier": "1", "sub_earlier_min": "2"},
+                {"sub_earlier": "-1", "sub_earlier_min": "0"}, {"sub_earlier": "x"}):  # fmt: skip
+        got = P.Request.from_dict({"id": "e3", "media": "/m.mkv", **raw})
+        assert got.sub_earlier is None and got.sub_earlier_min is None, raw

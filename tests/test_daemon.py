@@ -1191,12 +1191,12 @@ def resolve_vlc(media, sub_index, *, opened, n_embedded=0, **kw):
 
     kw.setdefault("autodetect", vlc_settings())
     kw.setdefault("sub_file", "")  # the intf sends VLC's sub-file variable
+    kw.setdefault("exclude_dirs", ())
     src = D.resolve_source(
         media,
         sub_index,
         count_embedded=lambda m: n_embedded,
         open_in_vlc=open_in_vlc,
-        exclude_dirs=(),
         **kw,
     )
     return src, calls
@@ -1438,3 +1438,176 @@ def test_resolve_without_vlcs_files_refuses_a_sidecar_vlc_did_not_list(tmp_path)
         for k in range(count):
             with pytest.raises(D.JobError, match="Can't tell which file"):
                 resolve_vlc(media, k, sub_count=count, sub_added=added, opened=None)
+
+
+IDX_2 = "# VobSub index file, v7\nsize: 720x480\nid: en, index: 0\nid: fr, index: 1\n"
+
+
+def test_resolve_tracks_without_a_file_come_after_the_sidecars(tmp_path):
+    # closed captions in the video, an MKV's attached subtitles: VLC lists them after
+    # the files it loaded, so they don't move the sidecars
+    root = tmp_path / "m"
+    media = report_layout(root, "Movie.srt", "Movie.en.srt")
+    side, en = str(root / "Movie.srt"), str(root / "Movie.en.srt")
+    first_play = {"sub_earlier": 0, "sub_earlier_min": 0}
+    for lists_all in (True, False):
+        for k, want in ((0, side), (1, en)):
+            src, _ = resolve_vlc(
+                media, k, sub_count=4, sub_added=0, opened=[side, en], open_lists_all=lists_all,
+                **first_play,
+            )  # fmt: skip
+            assert src.path == want
+        for k in (2, 3):
+            with pytest.raises(D.JobError, match=f"subtitle track {k + 1}"):
+                resolve_vlc(
+                    media, k, sub_count=4, sub_added=0, opened=[side, en],
+                    open_lists_all=lists_all, **first_play,
+                )  # fmt: skip
+    # earlier plays unknown (an older intf): where the OS lists every file VLC has
+    # open, none of them can be a file given at startup
+    src, _ = resolve_vlc(media, 1, sub_count=4, sub_added=0, opened=[side, en], open_lists_all=True)
+    assert src.path == en
+    # elsewhere (Windows) they could, and then they'd come first
+    with pytest.raises(D.JobError, match="Can't tell which file subtitle track 1"):
+        resolve_vlc(media, 0, sub_count=4, sub_added=0, opened=[side, en], open_lists_all=False)
+
+
+def test_resolve_a_replay_lists_the_earlier_plays_files_first(tmp_path):
+    # the playlist item plays again after a sync: VLC loads our synced file first
+    root = tmp_path / "m"
+    media = report_layout(root, "Movie.srt")
+    side = str(root / "Movie.srt")
+    out = tmp_path / "q" / "out"
+    out.mkdir(parents=True)
+    synced = out / "123_1.srt"
+    synced.write_text("1\n00:00:01,000 --> 00:00:02,000\nx\n", encoding="utf-8")
+    for lists_all in (True, False):
+        opened = [str(synced), side] if lists_all else [side]  # Windows: candidates only
+        src, _ = resolve_vlc(
+            media, 1, sub_count=2, sub_added=0, opened=opened, exclude_dirs=[out],
+            sub_earlier=1, sub_earlier_min=1, open_lists_all=lists_all,
+        )  # fmt: skip
+        assert src.path == side
+        with pytest.raises(D.JobError, match="subtitle track 1"):  # our own copy
+            resolve_vlc(
+                media, 0, sub_count=2, sub_added=0, opened=opened, exclude_dirs=[out],
+                sub_earlier=1, sub_earlier_min=1, open_lists_all=lists_all,
+            )  # fmt: skip
+    # it may be a track without a file instead (closed captions): can't tell
+    with pytest.raises(D.JobError, match="Can't tell which file subtitle track 2"):
+        resolve_vlc(
+            media, 1, sub_count=2, sub_added=0, opened=[str(synced), side], exclude_dirs=[out],
+            sub_earlier=1, sub_earlier_min=0, open_lists_all=True,
+        )  # fmt: skip
+    # a file added by hand during the earlier play: open in VLC, so given at startup
+    other = tmp_path / "Downloads" / "Other.srt"
+    report_layout(other.parent, other.name)
+    for k, want in ((0, str(other)), (1, side)):
+        src, _ = resolve_vlc(
+            media, k, sub_count=2, sub_added=0, opened=[str(other), side],
+            sub_earlier=1, sub_earlier_min=0, open_lists_all=True,
+        )  # fmt: skip
+        assert src.path == want
+
+
+@pytest.mark.parametrize("name", ["Movie.srt", "Movie.en.srt", "Subs/Movie.srt"])
+def test_resolve_a_sidecar_saved_and_added_while_the_video_plays(tmp_path, name):
+    # VLSub's "Download and load", or a downloaded subtitle saved next to the video and
+    # dragged into VLC: VLC didn't load it as the video opened, it lists it as added
+    root = tmp_path / "m"
+    media = report_layout(root, name)
+    path = str(root / name)
+    src, _ = resolve_vlc(
+        media, 0, sub_count=1, sub_added=1, opened=[path], sub_earlier=0, sub_earlier_min=0
+    )
+    assert os.path.samefile(src.path, path)
+    # with a sidecar VLC loaded as the video opened, either can be the added one
+    report_layout(root, "Movie.fr.srt")
+    fr = str(root / "Movie.fr.srt")
+    for k in (0, 1):
+        with pytest.raises(D.JobError, match=f"Can't tell which file subtitle track {k + 1}"):
+            resolve_vlc(media, k, sub_count=2, sub_added=1, opened=[fr, path])
+
+
+def test_resolve_a_sidecar_saved_and_added_on_a_replay_is_not_guessed(tmp_path):
+    # an earlier play's synced file first, then Movie.srt; Movie.en.srt saved and added
+    # during this play: VLC lists [synced, Movie.srt, Movie.en.srt], and Movie.en.srt
+    # could as well have been there as the video opened, with Movie.srt added
+    root = tmp_path / "m"
+    media = report_layout(root, "Movie.srt", "Movie.en.srt")
+    side, en = str(root / "Movie.srt"), str(root / "Movie.en.srt")
+    out = tmp_path / "q" / "out"
+    out.mkdir(parents=True)
+    synced = out / "123_1.srt"
+    synced.write_text("1\n00:00:01,000 --> 00:00:02,000\nx\n", encoding="utf-8")
+    for k in (1, 2):
+        with pytest.raises(D.JobError, match=f"Can't tell which file subtitle track {k + 1}"):
+            resolve_vlc(
+                media, k, sub_count=3, sub_added=1, opened=[str(synced), side, en],
+                exclude_dirs=[out], sub_earlier=1, sub_earlier_min=1,
+            )  # fmt: skip
+
+
+def test_resolve_a_hand_added_file_with_a_sidecar_still_works(tmp_path):
+    # the bug report with a sidecar as well, on the first play
+    root = tmp_path / "m"
+    media = report_layout(root, "Movie.srt", "Subs/2_English.srt")
+    side, hand = str(root / "Movie.srt"), str(root / "Subs" / "2_English.srt")
+    for k, want in ((0, side), (1, hand)):
+        src, _ = resolve_vlc(
+            media, k, sub_count=2, sub_added=1, opened=[side, hand],
+            sub_earlier=0, sub_earlier_min=0,
+        )  # fmt: skip
+        assert src.path == want
+    # Windows, a file from elsewhere: the OS doesn't list it, the sidecar is still sure
+    src, _ = resolve_vlc(
+        media, 0, sub_count=2, sub_added=1, opened=[side], open_lists_all=False,
+        sub_earlier=0, sub_earlier_min=0,
+    )  # fmt: skip
+    assert src.path == side
+
+
+def test_resolve_a_vobsub_with_two_languages_is_two_tracks(tmp_path):
+    from vlcsubsync.sidecars import VlcSidecars
+
+    root = tmp_path / "m"
+    media = report_layout(root, "Movie.en.srt", "Movie.es.srt", "Movie.vob.sub")
+    (root / "Movie.vob.idx").write_text(IDX_2, encoding="utf-8")
+    files = [str(root / n) for n in ("Movie.en.srt", "Movie.es.srt", "Movie.vob.idx")]
+    got = VlcSidecars(media, vlc_settings()).lists()
+    assert got.exact and len(got.orders) == 1
+    order = got.orders[0]  # VLC's order on this OS, the .idx once per language
+    assert len(order) == 4 and order.count(os.path.normpath(files[2])) == 2
+    opened = [*files, str(root / "Movie.vob.sub")]
+    for k, want in enumerate(order):
+        src, _ = resolve_vlc(media, k, sub_count=4, sub_added=0, opened=opened)
+        assert os.path.samefile(src.path, want), k
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="a case-sensitive file system")
+def test_resolve_a_vobsub_vlc_cannot_read_is_not_counted_on(tmp_path):
+    # VLC looks for "Movie.sub": with Movie.SUB it doesn't read the .IDX as VobSub
+    root = tmp_path / "m"
+    media = report_layout(root, "Movie.srt", "Movie.en.srt", "Movie.SUB")
+    (root / "Movie.IDX").write_text(IDX_2.replace("id: fr, index: 1\n", ""), encoding="utf-8")
+    opened = [str(root / n) for n in ("Movie.srt", "Movie.en.srt", "Movie.IDX", "Movie.SUB")]
+    for k in (0, 1):
+        with pytest.raises(D.JobError, match=f"Can't tell which file subtitle track {k + 1}"):
+            resolve_vlc(media, k, sub_count=4, sub_added=0, opened=opened)
+
+
+def test_resolve_without_vlcs_files_doubts_a_list_that_lost_a_sidecar(tmp_path, monkeypatch):
+    # Windows' qsort can put a --sub-file that is a sidecar after its copy: VLC deletes
+    # both, and a subtitle saved since could take their place in SubSync's lists
+    from vlcsubsync import sidecars as S
+
+    root = tmp_path / "m"
+    media = report_layout(root, "Movie.srt", "Movie.en.srt", "Movie.fr.srt", "Movie.ar.srt")
+    side, fr, ar = (str(root / n) for n in ("Movie.srt", "Movie.fr.srt", "Movie.ar.srt"))
+    monkeypatch.setattr(
+        S.VlcSidecars, "lists", lambda self, *a, **kw: S.Orders([(side, fr, ar)], True)
+    )
+    with pytest.raises(D.JobError, match="Can't tell which file subtitle track 3"):
+        resolve_vlc(
+            media, 2, sub_count=3, sub_added=0, opened=None, sub_file=str(root / "Movie.en.srt")
+        )

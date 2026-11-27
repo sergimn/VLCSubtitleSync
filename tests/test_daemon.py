@@ -1524,6 +1524,14 @@ def test_resolve_a_sidecar_saved_and_added_while_the_video_plays(tmp_path, name)
     # with a sidecar VLC loaded as the video opened, either can be the added one
     report_layout(root, "Movie.fr.srt")
     fr = str(root / "Movie.fr.srt")
+    subs = root / "subs"
+    if name.startswith("Subs/") and subs.exists() and os.path.samefile(subs, root / "Subs"):
+        # VLC for macOS finds a Subs/ file as subs/ too: there as the video opened it
+        # would have been two tracks, so it is the one added
+        for k, want in ((0, fr), (1, path)):
+            src, _ = resolve_vlc(media, k, sub_count=2, sub_added=1, opened=[fr, path])
+            assert os.path.samefile(src.path, want)
+        return
     for k in (0, 1):
         with pytest.raises(D.JobError, match=f"Can't tell which file subtitle track {k + 1}"):
             resolve_vlc(media, k, sub_count=2, sub_added=1, opened=[fr, path])
@@ -1543,6 +1551,13 @@ def test_resolve_a_subs_file_found_twice_saved_and_added(tmp_path):
         media, 0, sub_count=1, sub_added=1, opened=[path], sub_earlier=0, sub_earlier_min=0
     )
     assert os.path.samefile(src.path, path)
+    # with Movie.fr.srt loaded as the video opened: there then, the Subs/ file would
+    # have been two tracks, so it is the one added
+    report_layout(root, "Movie.fr.srt")
+    fr = str(root / "Movie.fr.srt")
+    for k, want in ((0, fr), (1, path)):
+        src, _ = resolve_vlc(media, k, sub_count=2, sub_added=1, opened=[fr, path])
+        assert os.path.samefile(src.path, want)
 
 
 def test_resolve_a_sidecar_saved_and_added_on_a_replay_is_not_guessed(tmp_path):

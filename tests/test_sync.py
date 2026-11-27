@@ -16,13 +16,16 @@ from vlcsubsync import transcribe as tr
 from vlcsubsync import vad
 from vlcsubsync.config import Config
 from vlcsubsync.sync import (
+    LANG_CHECK_WINDOWS,
     SubtitleSource,
     SyncError,
     SyncResult,
     exhaustive_windows,
+    language_check_windows,
     plan_windows,
     resolve_subtitle_source,
     sync_subtitles,
+    vote_language,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -44,6 +47,20 @@ def _case(tmp_path, synth, transform, duration, seed=5, audio_seed=None, **fake_
     srt = tmp_path / "movie.srt"
     srt.write_text(synth.srt(script), encoding="utf-8")
     fake = synth.FakeTranscriber(spans, **fake_kw)
+    return script, wav, srt, fake
+
+
+def _mixed_case(tmp_path, synth, transform, duration, other, **fake_kw):
+    """Like :func:`_case`, with the audio inside the ``other`` spans ``(start, end,
+    language)`` in another language and full of speech (an interview, archive footage),
+    so the windows there are the most talkative ones."""
+    script = synth.script(duration - 40, seed=5)
+    spans = synth.speech_spans(script, transform)
+    filler = [(lo, hi) for lo, hi, _lang in other]
+    wav = synth.write_wav(tmp_path / "movie.wav", synth.audio(spans + filler, duration))
+    srt = tmp_path / "movie.srt"
+    srt.write_text(synth.srt(script), encoding="utf-8")
+    fake = synth.FakeTranscriber(spans, other_languages=other, **fake_kw)
     return script, wav, srt, fake
 
 
@@ -229,7 +246,7 @@ def test_english_only_model_uses_multilingual_detector(tmp_path, synth, energy_v
     class Detector:
         multilingual = True
 
-        def detect_language(self, audio, sr):
+        def detect_language(self, audio, sr, *, start=0.0):
             return "fr", 0.95
 
     used = []
@@ -242,6 +259,152 @@ def test_english_only_model_uses_multilingual_detector(tmp_path, synth, energy_v
     assert used == [Config().model_multi]
     assert fake.calls == []  # mismatch detected: no English transcription of French audio
     assert r.method == "vad"
+
+
+def test_foreign_part_does_not_turn_off_transcription(tmp_path, synth, energy_vad):
+    """Mostly English audio with a dialogue-dense French part, English subtitles with a
+    cut. The French window has the most speech of all (it used to decide the language
+    alone, and VAD cannot fix a cut), but most of the speech is English."""
+
+    def f(t):
+        return t + 3.0 if t < 1200 else t + 33.0
+
+    other = [(430.0, 480.0, "fr")]
+    script, wav, srt, fake = _mixed_case(tmp_path, synth, f, 25 * 60, other, drop=0.15, noise=0.1)
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(srt)), str(tmp_path / "o.srt"),
+        Config(), transcriber=fake,
+    )  # fmt: skip
+    langs = [lang for _st, lang in fake.detect_calls]
+    assert "fr" in langs and len(langs) <= LANG_CHECK_WINDOWS
+    assert set(fake.call_languages) == {"en"}  # the subtitle language, also on French
+    assert r.applied and r.method == "whisper" and r.segments == 2
+    _check(_errors(synth, r.output_path, script, f))
+
+
+def test_mostly_foreign_audio_confirms_with_matching_windows(tmp_path, synth, energy_vad):
+    """Mostly French audio with English parts, English subtitles with a cut: the vote
+    says French, so the English windows are transcribed first; they match the
+    subtitles, so the sync goes on as usual."""
+
+    def f(t):
+        return t + 2.0 if t < 400 else t + 12.0
+
+    other = [(75.0, 150.0, "fr"), (225.0, 375.0, "fr")]
+    script, wav, srt, fake = _mixed_case(tmp_path, synth, f, 10 * 60, other, drop=0.1)
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(srt)), str(tmp_path / "o.srt"),
+        Config(), transcriber=fake,
+    )  # fmt: skip
+    agreeing = [st for st, lang in fake.detect_calls if lang == "en"]
+    assert 0 < len(agreeing) < len(fake.detect_calls) - len(agreeing)
+    starts = [a for a, _b in fake.calls]
+    assert starts[: len(agreeing)] == agreeing  # confirmation first...
+    assert len(starts) == len(set(starts))  # ...and not transcribed again
+    assert set(fake.call_languages) == {"en"}  # in the subtitle language, not French
+    assert r.applied and r.method == "whisper" and r.segments == 2
+    _check(_errors(synth, r.output_path, script, f))
+
+
+@pytest.mark.parametrize("related_audio", [True, False])
+def test_foreign_audio_with_one_matching_window(tmp_path, synth, energy_vad, related_audio):
+    """A Spanish dub where one checked window sounds English (a song, say) that does
+    not match the English subtitles (``garbage``): only that window is transcribed,
+    then VAD."""
+
+    def f(t):
+        return t + 4.0
+
+    script, wav, srt, fake = _case(
+        tmp_path, synth, f, 10 * 60, language="es", garbage=True,
+        audio_seed=None if related_audio else 77, other_languages=[(450.0, 600.0, "en")],
+    )  # fmt: skip
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(srt)), str(tmp_path / "o.srt"),
+        Config(), transcriber=fake,
+    )  # fmt: skip
+    agreeing = [st for st, lang in fake.detect_calls if lang == "en"]
+    assert len(agreeing) == 1
+    assert [a for a, _b in fake.calls] == agreeing  # the confirmation window only
+    if related_audio:
+        assert r.applied and r.method == "vad"
+        assert r.offset == pytest.approx(4.0, abs=0.15)
+    else:  # speech unrelated to the subtitles: VAD cannot sync either
+        assert not r.applied
+        assert "audio language is mostly 'es', subtitles are 'en'" in r.message
+
+
+def test_audio_split_between_other_languages_message(tmp_path, synth, energy_vad):
+    """Spanish and French audio with one English window, English subtitles that do not
+    match it, and speech unrelated to the subtitles (VAD fails too): the message must
+    not call a 40% language "mostly"."""
+
+    def f(t):
+        return t + 4.0
+
+    script, wav, srt, fake = _case(
+        tmp_path, synth, f, 10 * 60, language="es", garbage=True, audio_seed=77,
+        other_languages=[(75.0, 300.0, "fr"), (450.0, 600.0, "en")],
+    )  # fmt: skip
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(srt)), str(tmp_path / "o.srt"),
+        Config(), transcriber=fake,
+    )  # fmt: skip
+    assert sorted(lang for _st, lang in fake.detect_calls) == ["en", "es", "es", "fr", "fr"]
+    assert not r.applied
+    assert "audio language is mostly not 'en' (" in r.message and "mostly '" not in r.message
+
+
+def test_language_check_windows_spread_over_file():
+    speech = np.zeros(600)
+    speech[80:110] = 1.0  # the second group's most talkative window
+    speech[160:170] = 1.0
+    windows = [0.0, 75.0, 150.0, 225.0, 300.0, 375.0, 450.0, 525.0]
+    picks = language_check_windows(windows, speech)
+    # groups [0], [75, 150], [225], [300, 375], [450, 525]
+    assert picks == [0.0, 75.0, 225.0, 300.0, 450.0]
+    assert language_check_windows([30.0, 0.0], speech) == [0.0, 30.0]
+    assert language_check_windows([], speech) == []
+
+
+def test_vote_language_counts_speech_and_stops_early():
+    speech = np.zeros(300)
+    speech[0:30] = 1.0  # 30 s of speech in the French window
+    speech[60:70] = speech[120:130] = 1.0  # 10 s each in the English ones
+    speech[180:210] = 1.0
+    starts = [0.0, 60.0, 120.0, 180.0]
+    langs = {0.0: ("fr", 0.95), 60.0: ("en", 0.9), 120.0: ("en", 0.99), 180.0: ("en", 0.3)}
+    calls = []
+
+    def detect(st):
+        calls.append(st)
+        return langs[st]
+
+    vote = vote_language(detect, starts, speech, "en")
+    # 2 English windows out of 3 confident ones, but 30 s of French speech vs 20 s
+    assert vote.other("en") > vote.matching("en")
+    assert vote.agreeing == [60.0, 120.0] and vote.top() == "fr" and vote.checked == 4
+    assert vote.summary() == "fr 60%, en 40%"
+
+    # Stops once the remaining windows cannot overturn the subtitle language's lead.
+    langs.update({0.0: ("en", 0.9)})
+    calls.clear()
+    vote = vote_language(detect, starts, speech, "en")
+    assert calls == [0.0, 60.0] and vote.top() == "en" and vote.checked == 2  # 40 s vs 40 s
+
+    # Without a subtitle language every window is checked; an error ends the check.
+    calls.clear()
+    assert vote_language(detect, starts, speech, None).checked == 4
+
+    def broken(st):
+        calls.append(st)
+        if st > 0:
+            raise RuntimeError("no model")
+        return "en", 0.9
+
+    calls.clear()
+    vote = vote_language(broken, starts, speech, "fr")
+    assert calls == [0.0, 60.0] and vote.checked == 1 and vote.speech == {"en": 30.0}
 
 
 def test_too_few_anchors_not_applied(tmp_path, synth, energy_vad):
@@ -508,6 +671,34 @@ def test_real_whisper_on_fixtures(tmp_path, media, variant, truth, method):
     assert r.method == method
     out = pysubs2.load(r.output_path)
     ref = pysubs2.load(str(FIXTURES / truth))
+    err = np.abs(np.array([e.start for e in out]) - np.array([e.start for e in ref])) / 1000
+    assert np.median(err) < 0.15, np.median(err)
+    assert np.percentile(err, 95) < 0.4, np.percentile(err, 95)
+
+
+@pytest.mark.slow
+def test_real_whisper_on_mixed_language_audio(tmp_path, synth):
+    """English dialogue followed by 45 s of Spanish (~78% English) with cut English
+    subtitles: the most talkative window is Spanish, but most of the speech is English,
+    so the transcript anchors fix the cut, as on the English audio alone."""
+    from vlcsubsync.media import read_media
+
+    en, es = FIXTURES / "en_dialogue.mkv", FIXTURES / "es_dialogue.mkv"
+    if not (en.exists() and es.exists()):
+        pytest.skip("speech fixtures not available")
+    a_en, _subs, _info = read_media(str(en))
+    a_es, _subs, _info = read_media(str(es))
+    assert a_en is not None and a_es is not None
+    wav = synth.write_wav(tmp_path / "mixed.wav", np.concatenate([a_en, a_es[: 45 * synth.SR]]))
+    cfg = Config(model_en="tiny.en", model_multi="tiny", device="cpu")
+    r = sync_subtitles(
+        str(wav), 0, SubtitleSource("external", path=str(FIXTURES / "en_dialogue.cut.srt")),
+        str(tmp_path / "out.srt"), cfg,
+    )  # fmt: skip
+    assert r.applied, r.message
+    assert r.method == "whisper" and r.segments == 2
+    out = pysubs2.load(r.output_path)
+    ref = pysubs2.load(str(FIXTURES / "en_dialogue.truth.srt"))
     err = np.abs(np.array([e.start for e in out]) - np.array([e.start for e in ref])) / 1000
     assert np.median(err) < 0.15, np.median(err)
     assert np.percentile(err, 95) < 0.4, np.percentile(err, 95)

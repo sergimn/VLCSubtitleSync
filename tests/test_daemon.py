@@ -1524,8 +1524,7 @@ def test_resolve_a_sidecar_saved_and_added_while_the_video_plays(tmp_path, name)
     # with a sidecar VLC loaded as the video opened, either can be the added one
     report_layout(root, "Movie.fr.srt")
     fr = str(root / "Movie.fr.srt")
-    subs = root / "subs"
-    if name.startswith("Subs/") and subs.exists() and os.path.samefile(subs, root / "Subs"):
+    if name.startswith("Subs/") and sys.platform == "darwin":
         # VLC for macOS finds a Subs/ file as subs/ too: there as the video opened it
         # would have been two tracks, so it is the one added
         for k, want in ((0, fr), (1, path)):

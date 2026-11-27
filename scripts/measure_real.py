@@ -160,8 +160,8 @@ class CountingTranscriber:
         self.calls += 1
         return self.inner.transcribe(audio, sr, language, start=start)
 
-    def detect_language(self, audio, sr):
-        return self.inner.detect_language(audio, sr)
+    def detect_language(self, audio, sr, *, start=0.0):
+        return self.inner.detect_language(audio, sr, start=start)
 
 
 def run_sync(args, out: Path) -> dict:

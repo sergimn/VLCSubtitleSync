@@ -7,7 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -44,6 +44,9 @@ WINDOW_SECONDS = 30.0
 MIN_SPEECH_SECONDS = 0.5
 MIN_WHISPER_ANCHORS = 6
 LANG_PROB_MIN = 0.5
+# Planned windows whose spoken language is detected, spread over the file. The audio
+# counts as another language than the subtitles only if most of their speech is.
+LANG_CHECK_WINDOWS = 5
 
 ProgressFn = Callable[[float, str], None]
 
@@ -198,6 +201,89 @@ def plan_windows(speech_sec: np.ndarray, duration: float, config: Config) -> lis
 
 
 # --------------------------------------------------------------------------------------
+# Spoken language
+# --------------------------------------------------------------------------------------
+
+
+def _window_speech(speech_sec: np.ndarray, start: float) -> float:
+    return float(speech_sec[int(start) : int(start + WINDOW_SECONDS)].sum())
+
+
+def language_check_windows(
+    windows: list[float], speech_sec: np.ndarray, n: int = LANG_CHECK_WINDOWS
+) -> list[float]:
+    """Up to ``n`` of the planned ``windows`` for the language check, in time order and
+    spread over the file: the window with the most speech in each of ``n`` consecutive
+    groups of them."""
+    ws = sorted(windows)
+    if len(ws) <= n:
+        return ws
+    groups = [ws[len(ws) * i // n : len(ws) * (i + 1) // n] for i in range(n)]
+    return [max(g, key=lambda s: _window_speech(speech_sec, s)) for g in groups]
+
+
+@dataclass
+class LanguageVote:
+    """Spoken language of the language-check windows."""
+
+    speech: dict[str, float] = field(default_factory=dict)  # language → speech (s)
+    agreeing: list[float] = field(default_factory=list)  # windows in the subtitle language
+    checked: int = 0  # windows whose language was detected
+
+    def matching(self, sub_lang: str | None) -> float:
+        return self.speech.get(sub_lang, 0.0) if sub_lang else 0.0
+
+    def other(self, sub_lang: str | None) -> float:
+        return sum(v for k, v in self.speech.items() if k != sub_lang)
+
+    def top(self, exclude: str | None = None) -> str | None:
+        """The language with the most speech (ties: alphabetical), or None."""
+        ranked = sorted((-v, k) for k, v in self.speech.items() if k != exclude)
+        return ranked[0][1] if ranked else None
+
+    def summary(self) -> str:
+        total = sum(self.speech.values())
+        if not total:
+            return "unknown"
+        ranked = sorted(self.speech.items(), key=lambda kv: (-kv[1], kv[0]))
+        return ", ".join(f"{k} {v / total:.0%}" for k, v in ranked)
+
+
+def vote_language(
+    detect: Callable[[float], tuple[str | None, float]],
+    starts: list[float],
+    speech_sec: np.ndarray,
+    sub_lang: str | None,
+) -> LanguageVote:
+    """Detect the spoken language of each window in ``starts`` (``detect(start)`` →
+    ``(language, probability)``) and add up the windows' speech per language, counting
+    only detections with probability >= ``LANG_PROB_MIN``.
+
+    Stops early once the subtitle language has a lead the remaining windows cannot
+    overturn, and at the first detection error (the model is then likely unusable).
+    """
+    vote = LanguageVote()
+    weights = [max(_window_speech(speech_sec, st), 0.01) for st in starts]
+    remaining = sum(weights)
+    for st, w in zip(starts, weights, strict=True):
+        remaining -= w
+        try:
+            lang, prob = detect(st)
+        except Exception as e:
+            log.warning("language detection failed: %s", e)
+            break
+        vote.checked += 1
+        log.debug("language @%.0fs: %s (%.2f), %.1fs of speech", st, lang, prob, w)
+        if lang is not None and prob >= LANG_PROB_MIN:
+            vote.speech[lang] = vote.speech.get(lang, 0.0) + w
+            if lang == sub_lang:
+                vote.agreeing.append(st)
+        if sub_lang and vote.matching(sub_lang) >= vote.other(sub_lang) + remaining:
+            break  # the subtitle language keeps the majority whatever the rest say
+    return vote
+
+
+# --------------------------------------------------------------------------------------
 # Main entry point
 # --------------------------------------------------------------------------------------
 
@@ -293,58 +379,79 @@ def sync_subtitles(
     # Language check / model selection.
     prog(0.37, "Detecting language")
     t = transcriber or get_transcriber(config, sub_lang)
-    lang = sub_lang
-    audio_lang, lang_prob = None, 0.0
+    vote = LanguageVote()
     if windows:
-        best_w = max(windows, key=lambda s: speech_sec[int(s) : int(s + WINDOW_SECONDS)].sum())
-        a, b = int(best_w * SAMPLE_RATE), int((best_w + WINDOW_SECONDS) * SAMPLE_RATE)
         # English-only models can't identify the audio language (they always say
         # "en"), so foreign audio with English subtitles would go undetected; ask the
         # multilingual model instead.
         detector = t
         if transcriber is None and not getattr(t, "multilingual", True):
             detector = get_model(config, config.model_multi)
-        try:
-            audio_lang, lang_prob = detector.detect_language(audio[a:b], SAMPLE_RATE)
-        except Exception as e:
-            log.warning("language detection failed: %s", e)
-    mismatch = (
-        sub_lang is not None
-        and audio_lang is not None
-        and lang_prob >= LANG_PROB_MIN
-        and audio_lang != sub_lang
-    )
-    if sub_lang is None and audio_lang is not None and lang_prob >= LANG_PROB_MIN:
-        lang = audio_lang
-    log.info("audio language: %s (%.2f); mismatch=%s", audio_lang, lang_prob, mismatch)
+
+        def detect(st: float) -> tuple[str | None, float]:
+            a, b = int(st * SAMPLE_RATE), int((st + WINDOW_SECONDS) * SAMPLE_RATE)
+            return detector.detect_language(audio[a:b], SAMPLE_RATE, start=st)
+
+        # Several windows, not one: mixed-language audio (a documentary with archive
+        # interviews, a film with some foreign dialogue) must not be judged by its most
+        # talkative window, which is often the foreign part.
+        check = language_check_windows(windows, speech_sec)
+        vote = vote_language(detect, check, speech_sec, sub_lang)
+    audio_lang = vote.top()
+    other_lang = vote.top(exclude=sub_lang)
+    mismatch = sub_lang is not None and vote.other(sub_lang) > vote.matching(sub_lang)
+    lang = sub_lang or audio_lang
+    log.info(
+        "audio language: %s (%s of the speech in %d windows); mismatch=%s",
+        audio_lang, vote.summary(), vote.checked, mismatch,
+    )  # fmt: skip
+
+    sub_tok = subtitle_tokens(cues)
+    transcribed: list[tuple[float, list[Word]]] = []
+    # Exhaustive mode already covers every window with speech: nothing to add.
+    budget_extra = 0 if exhaustive else max(4, k // 2)
+    planned = len(windows)
+
+    def run_windows(starts: list[float]) -> None:
+        for st in starts:
+            n_done = len(transcribed)
+            frac = n_done / max(planned, 1)
+            label = f"Transcribing {n_done + 1}/{planned}"
+            if exhaustive:
+                label += " (exhaustive)"
+            prog(0.38 + 0.54 * frac, label)
+            a = int(st * SAMPLE_RATE)
+            b = min(audio.shape[0], int((st + WINDOW_SECONDS) * SAMPLE_RATE))
+            try:
+                words = t.transcribe(audio[a:b], SAMPLE_RATE, lang, start=st)
+            except Exception as e:
+                log.warning("transcription of window @%.0fs failed: %s", st, e)
+                words = []
+            transcribed.append((st, list(words)))
+
+    if mismatch and vote.agreeing:
+        # Mostly another language, but some windows are in the subtitle language:
+        # transcribe those first and go on only if they match the subtitles. Audio
+        # that really is in another language (a dub) costs a window or two this way.
+        run_windows(vote.agreeing)
+        anchors = find_anchors(sub_tok, transcribed)
+        check_fit = fit_mapping(anchors, cues, speech, vad.RESOLUTION, len(transcribed))
+        log.info(
+            "language confirmation: %d windows in '%s', %d anchors",
+            len(transcribed), sub_lang, check_fit.anchors,
+        )  # fmt: skip
+        if check_fit.anchors >= MIN_WHISPER_ANCHORS:
+            mismatch = False
+        elif other_lang and vote.speech[other_lang] > 0.5 * sum(vote.speech.values()):
+            reason = f"audio language is mostly '{other_lang}', subtitles are '{sub_lang}'"
+        else:  # split between several other languages
+            reason = f"audio language is mostly not '{sub_lang}' ({vote.summary()})"
 
     if mismatch:
-        reason = f"audio language '{audio_lang}' differs from subtitles '{sub_lang}'"
+        reason = reason or f"audio language '{other_lang}' differs from subtitles '{sub_lang}'"
     elif windows:
-        sub_tok = subtitle_tokens(cues)
-        transcribed: list[tuple[float, list[Word]]] = []
-        # Exhaustive mode already covers every window with speech: nothing to add.
-        budget_extra = 0 if exhaustive else max(4, k // 2)
-        planned = len(windows)
-
-        def run_windows(starts: list[float]) -> None:
-            for st in starts:
-                n_done = len(transcribed)
-                frac = n_done / max(planned, 1)
-                label = f"Transcribing {n_done + 1}/{planned}"
-                if exhaustive:
-                    label += " (exhaustive)"
-                prog(0.38 + 0.54 * frac, label)
-                a = int(st * SAMPLE_RATE)
-                b = min(audio.shape[0], int((st + WINDOW_SECONDS) * SAMPLE_RATE))
-                try:
-                    words = t.transcribe(audio[a:b], SAMPLE_RATE, lang, start=st)
-                except Exception as e:
-                    log.warning("transcription of window @%.0fs failed: %s", st, e)
-                    words = []
-                transcribed.append((st, list(words)))
-
-        run_windows(windows)
+        done = {st for st, _w in transcribed}
+        run_windows([st for st in windows if st not in done])
         anchors = find_anchors(sub_tok, transcribed)
         fit = fit_mapping(anchors, cues, speech, vad.RESOLUTION, len(transcribed))
         log.info(
@@ -498,8 +605,10 @@ def sync_subtitles(
 
 
 __all__ = [
+    "LanguageVote",
     "Mapping",
     "exhaustive_windows",
+    "language_check_windows",
     "plan_windows",
     "SubtitleSource",
     "SyncError",
@@ -507,4 +616,5 @@ __all__ = [
     "pick_windows",
     "resolve_subtitle_source",
     "sync_subtitles",
+    "vote_language",
 ]

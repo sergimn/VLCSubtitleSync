@@ -404,8 +404,19 @@ everything, as 1.0.2 and earlier did. The intf picks the value up on its next ti
    count and the later verification budget depend on the sync mode (see "Sync
    modes"); exhaustive mode transcribes consecutive windows instead.
    Language: guess from subtitle text (stopword heuristic); English → `*.en` model,
-   else multilingual model with `language=<guess>`; if audio language (whisper
-   detect) ≠ subtitle language → skip to VAD fallback.
+   else multilingual model with `language=<guess>` (transcription always uses the
+   subtitle language when it is known). Audio language: whisper detect (the
+   multilingual model, also for `*.en`) on up to `LANG_CHECK_WINDOWS` = 5 planned
+   windows, the most speech-dense one of each of 5 consecutive groups; each
+   detection with probability ≥ 0.5 votes with the window's speech seconds. It stops
+   early once the subtitle language leads by at least the unchecked windows' speech.
+   Not a mismatch while the subtitle language has at least as much speech as all
+   others together (mixed audio: documentaries, archive footage, some foreign
+   dialogue; the most talkative window is often the foreign part, so a single-window
+   check would veto those). A mismatch with no window in the subtitle language →
+   skip to VAD fallback, transcribing nothing. A mismatch with some → transcribe
+   those windows first (confirmation); go on with the rest of the plan only if they
+   give ≥ 6 inlier anchors, else VAD fallback ("audio language is mostly 'xx'").
 4. Anchors: normalize words (lowercase, strip punctuation, numbers→digits); subtitle
    tokens get times inside each cue: `cue start + min(lead / scale, cap)`, where
    `lead` = characters before the token at a nominal 15 chars/s and `cap` = the same

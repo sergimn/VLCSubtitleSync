@@ -47,8 +47,14 @@ class Transcriber(Protocol):
         """
         ...
 
-    def detect_language(self, audio: np.ndarray, sr: int) -> tuple[str | None, float]:
-        """``(ISO 639-1 code or None, probability)`` of the spoken language."""
+    def detect_language(
+        self, audio: np.ndarray, sr: int, *, start: float = 0.0
+    ) -> tuple[str | None, float]:
+        """``(ISO 639-1 code or None, probability)`` of the spoken language.
+
+        ``start`` is the absolute position of ``audio`` in the media, as for
+        :meth:`transcribe`.
+        """
         ...
 
 
@@ -208,7 +214,9 @@ class WhisperTranscriber:
 
         return self._run(run)
 
-    def detect_language(self, audio: np.ndarray, sr: int) -> tuple[str | None, float]:
+    def detect_language(
+        self, audio: np.ndarray, sr: int, *, start: float = 0.0
+    ) -> tuple[str | None, float]:
         if not self.multilingual:
             return "en", 1.0
         audio = np.ascontiguousarray(audio, dtype=np.float32)

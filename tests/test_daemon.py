@@ -1529,6 +1529,22 @@ def test_resolve_a_sidecar_saved_and_added_while_the_video_plays(tmp_path, name)
             resolve_vlc(media, k, sub_count=2, sub_added=1, opened=[fr, path])
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="needs a symlink")
+def test_resolve_a_subs_file_found_twice_saved_and_added(tmp_path):
+    # VLC for macOS scans ./Subs and ./subs, the same folder on its file system, so a
+    # Subs/ file is two of its sidecars. Saved and added during playback it is one
+    # track; a subs -> Subs symlink gives the same two paths elsewhere
+    root = tmp_path / "m"
+    media = report_layout(root, "Subs/Movie.srt")
+    if not (root / "subs").exists():
+        (root / "subs").symlink_to("Subs", target_is_directory=True)
+    path = str(root / "Subs" / "Movie.srt")
+    src, _ = resolve_vlc(
+        media, 0, sub_count=1, sub_added=1, opened=[path], sub_earlier=0, sub_earlier_min=0
+    )
+    assert os.path.samefile(src.path, path)
+
+
 def test_resolve_a_sidecar_saved_and_added_on_a_replay_is_not_guessed(tmp_path):
     # an earlier play's synced file first, then Movie.srt; Movie.en.srt saved and added
     # during this play: VLC lists [synced, Movie.srt, Movie.en.srt], and Movie.en.srt

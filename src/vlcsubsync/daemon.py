@@ -639,15 +639,24 @@ def _place_in_lists(
     sure, why = got.exact, [got.why] if got.why else []
     if not variants and exact and vlc_files and n_ext is not None and n_added:
         # a sidecar saved and added while the video plays (VLSub's Download and load,
-        # drag and drop): VLC lists it with the tracks added during this play
+        # drag and drop): VLC lists it with the tracks added during this play. Every
+        # path of the file goes (VLC for macOS finds a Subs/ file as subs/ too), and
+        # added by hand it is its tracks once
+        tried = set()
         for e in detected.entries:
             path = os.path.normpath(e.path)
             if e.dropped or is_open is None or not is_open(path) or e.tracks is None:
                 continue
-            if not 0 < e.tracks <= n_added:
+            if not 0 < e.tracks <= n_added or _file_id(path) in tried:
                 continue
+            tried.add(_file_id(path))
+            group = [
+                os.path.normpath(x.path)
+                for x in detected.entries
+                if _file_id(os.path.normpath(x.path)) == _file_id(path)
+            ]
             partner = _vobsub_partner(path)
-            group = [path] + ([partner] if partner and path.lower().endswith(".idx") else [])
+            group += [partner] if partner and path.lower().endswith(".idx") else []
             g, more = fits(group, e.tracks, path)
             variants += more
             sure = sure and g.exact
